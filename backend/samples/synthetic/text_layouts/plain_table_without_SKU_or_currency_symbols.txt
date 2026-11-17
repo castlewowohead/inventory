@@ -1,0 +1,11 @@
+Supplier: Market Pantry
+Invoice ID MP/2041
+Issue date: 2026/10/04
+Description Qty Unit Price Amount
+Fresh onions 2 12.50 25.00
+Brown rice (5 kg bag) 3 20.00 60.00
+Net amount 85.00
+Sales tax: 6.80
+Freight: 5.00
+Invoice total 96.80
+Amount due 46.80

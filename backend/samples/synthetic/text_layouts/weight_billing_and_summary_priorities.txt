@@ -1,0 +1,12 @@
+Supplier: Harvest Foodservice
+Inv. No: HF-209
+Invoice Date: Oct 4th, 2026
+BEEF-2 Beef 2 cases / 19.25 kg 12.00/kg 231.00
+Subtotal 231.00
+GST 11.55
+Tax total 11.55
+Shipping 8.00
+Fuel surcharge 2.00
+Grand total 252.55
+Total due 102.55
+Please include invoice number with your payment.

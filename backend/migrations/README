@@ -1,0 +1,26 @@
+本项目自己的 Alembic 迁移环境（步骤 02 建立）。
+
+目录
+    env.py            运行环境：连接串来源、target_metadata、SQLite 批处理模式
+    script.py.mako    新修订的模板（含本项目的编写约定）
+    versions/         修订脚本，文件名带日期前缀，按时间排序
+
+常用命令（在 backend/ 目录下执行）
+    python -m alembic upgrade head          升到最新
+    python -m alembic current               查看当前版本
+    python -m alembic history               查看修订链
+    python -m alembic downgrade -1          回退一个修订
+    python -m alembic revision -m "说明"    新增空白修订（手写结构变更）
+    python -m alembic revision --autogenerate -m "说明"
+                                            按 src/models.py 与当前库的差异生成
+
+连接串不写在 alembic.ini 里，由 env.py 从 DATABASE_URL（.env 或进程环境变量）读取；
+临时指定用 `-x db_url=...`。详见 env.py 的模块说明与 backend/README.md。
+
+约定
+- 业务表随对应 Feature 步骤加入，不提前设计全部表：食材/分类/别名在步骤 03，
+  采购记录在步骤 04，发票与行项目草稿在步骤 05。
+- `--autogenerate` 的结果必须人工复核后再提交：它看不出数据迁移意图，
+  也可能漏掉 SQLite 下的类型差异。
+- 结构变更一律走迁移，不用 `Base.metadata.create_all()` 建正式库；
+  否则「迁移能不能跑」就失去了验证。

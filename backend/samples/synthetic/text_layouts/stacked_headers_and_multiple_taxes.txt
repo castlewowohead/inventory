@@ -1,0 +1,12 @@
+Supplier: Northern Produce
+Invoice #
+NP-091
+Date: 04/10/2026
+Currency: CAD
+Description | Qty | Unit | Price | Amount
+Lemons | 5 | kg | 6.00 | 30.00
+Subtotal
+30.00
+GST (5%): 1.50
+PST (7%): 2.10
+Grand Total: 33.60

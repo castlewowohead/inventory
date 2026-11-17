@@ -1,0 +1,207 @@
+/**
+ * Turning stored bytes into something a page can show — isolated from the
+ * invoice components.
+ *
+ * Why an adapter: every call below is a browser API (`URL.createObjectURL`,
+ * `Image`, `<canvas>`, and pdf.js, which itself needs a Worker and a canvas).
+ * None of it exists on App, so the review screen must not reach for it
+ * directly. The business components only ever see `RenderedPage` and
+ * `PdfDocument`.
+ *
+ * ### H5-only, and where the App work sits
+ *
+ * | Capability | H5 | App |
+ * | --- | --- | --- |
+ * | image preview | object URL + `<image>` | needs a local temp file written by `uni.saveFile`, then `src` is that path |
+ * | HEIC | only when the browser itself decodes it — probed, never assumed | iOS decodes HEIC natively; Android webviews usually do not |
+ * | PDF page rendering | pdf.js renders into a `<canvas>` | pdf.js has no canvas there; use the platform PDF viewer or a native plugin |
+ * | page count | pdf.js | same as above |
+ *
+ * So the App task is not "port this file" but "answer the same four questions
+ * with platform APIs". The non-H5 branches below therefore throw a message that
+ * names the missing capability instead of silently showing nothing.
+ *
+ * ### Browser baseline
+ *
+ * pdf.js 4.10 is built for current browsers (it uses `Promise.withResolvers`,
+ * Chrome 119+ / Safari 17.4+). This is a local-demo front end, so that baseline
+ * is acceptable; a wider one means switching to `pdfjs-dist/legacy`.
+ */
+
+// ⚠️ pdf.js is imported **statically**, not with `await import(...)`, and that is
+// not a style choice. `uni build -p h5` (vite-plugin-uni 3.0.0-alpha-5030620261106001)
+// turns a dynamic import of a node_modules package into the bare specifier
+// `import("..-node_modules-pdfjs-dist-build-pdf.<hash>.js")` and never emits that
+// chunk, so the built page dies with "Failed to resolve module specifier" while
+// `npm run dev:h5` works fine. Verified on this project's build; the two
+// conditional-compilation blocks keep pdf.js out of non-H5 builds, which is what
+// the dynamic import was for.
+// #ifdef H5
+import * as pdfjs from 'pdfjs-dist'
+import pdfWorkerUrl from 'pdfjs-dist/build/pdf.worker.min.mjs?url'
+// #endif
+
+export type DocumentKind = 'image' | 'pdf' | 'unknown'
+
+export class PreviewUnavailableError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'PreviewUnavailableError'
+  }
+}
+
+/** Something the page can point an `<image>` at, plus its natural size. */
+export interface RenderedPage {
+  url: string
+  width: number
+  height: number
+  /** Frees the object URL. Always call it before dropping the reference. */
+  release: () => void
+}
+
+export interface PdfDocument {
+  pageCount: number
+  /**
+   * Renders one page at roughly `targetWidth` device pixels wide. The caller
+   * scales the result with CSS, so this only decides how sharp it is.
+   */
+  renderPage: (pageNumber: number, targetWidth: number) => Promise<RenderedPage>
+  close: () => void
+}
+
+const IMAGE_EXTENSIONS = ['.jpg', '.jpeg', '.png', '.heic']
+
+function extensionOf(name: string): string {
+  const dot = name.lastIndexOf('.')
+  return dot >= 0 ? name.slice(dot).toLowerCase() : ''
+}
+
+/**
+ * What kind of document this file is.
+ *
+ * The media type the server stored wins; a browser that handed over no type at
+ * all (HEIC from a desktop file input is stored as
+ * `application/octet-stream`) leaves only the extension to go on.
+ */
+export function classifyDocument(name: string, mediaType: string): DocumentKind {
+  const type = (mediaType || '').split(';')[0].trim().toLowerCase()
+  if (type === 'application/pdf') return 'pdf'
+  if (type.startsWith('image/')) return 'image'
+  const extension = extensionOf(name)
+  if (extension === '.pdf') return 'pdf'
+  if (IMAGE_EXTENSIONS.includes(extension)) return 'image'
+  return 'unknown'
+}
+
+/** True when this extension is one the browser is expected to struggle with. */
+export function isHeic(name: string, mediaType: string): boolean {
+  const type = (mediaType || '').split(';')[0].trim().toLowerCase()
+  return extensionOf(name) === '.heic' || type === 'image/heic' || type === 'image/heif'
+}
+
+// #ifdef H5
+function objectUrl(bytes: ArrayBuffer, mediaType: string): string {
+  return URL.createObjectURL(new Blob([bytes], { type: mediaType || 'application/octet-stream' }))
+}
+
+/**
+ * Waits for the browser to actually decode the image.
+ *
+ * ⚠️ This is the only honest way to answer "can this browser preview a HEIC?".
+ * Chrome on Windows cannot, Safari can, and the file extension says nothing
+ * about the browser in front of us — so the page asks the browser rather than
+ * promising on its behalf.
+ */
+function decodeImage(url: string): Promise<{ width: number; height: number }> {
+  return new Promise((resolve, reject) => {
+    const image = new Image()
+    image.onload = () => resolve({
+      width: image.naturalWidth || 0,
+      height: image.naturalHeight || 0
+    })
+    image.onerror = () => reject(new Error('decode failed'))
+    image.src = url
+  })
+}
+
+function canvasToUrl(canvas: HTMLCanvasElement): Promise<string> {
+  return new Promise((resolve, reject) => {
+    canvas.toBlob((blob) => {
+      if (blob) resolve(URL.createObjectURL(blob))
+      else reject(new PreviewUnavailableError('浏览器没能把这一页转成图片。'))
+    }, 'image/png')
+  })
+}
+// #endif
+
+/**
+ * An image file, ready to show.
+ *
+ * Throws `PreviewUnavailableError` when the browser refuses to decode it; the
+ * stored original is untouched either way, which is what the message says.
+ */
+export async function renderImage(
+  bytes: ArrayBuffer,
+  mediaType: string,
+  name: string
+): Promise<RenderedPage> {
+  // #ifdef H5
+  const url = objectUrl(bytes, mediaType)
+  try {
+    const size = await decodeImage(url)
+    return { url, width: size.width, height: size.height, release: () => URL.revokeObjectURL(url) }
+  } catch {
+    URL.revokeObjectURL(url)
+    throw new PreviewUnavailableError(
+      isHeic(name, mediaType)
+        ? `这个浏览器解不开 HEIC（${name}）。原件已经完整保存在服务端，不受影响；`
+          + '要在屏幕上核对，请用支持 HEIC 的浏览器/设备打开，或改传 JPG / PNG。'
+        : `这个浏览器解不开 ${name}。原件已经完整保存在服务端，不受影响。`
+    )
+  }
+  // #endif
+  throw new PreviewUnavailableError(
+    'App 端还没有图片预览适配器：需要先把字节写成本地临时文件再交给 image 组件。'
+  )
+}
+
+/** Opens a PDF and keeps it open so page switching does not re-parse the file. */
+export async function openPdf(bytes: ArrayBuffer): Promise<PdfDocument> {
+  // #ifdef H5
+  pdfjs.GlobalWorkerOptions.workerSrc = pdfWorkerUrl
+  // ⚠️ pdf.js takes ownership of the buffer it is given (it ends up detached),
+  // so hand it a copy — the caller caches the original bytes and would
+  // otherwise find them emptied the next time it wants this file.
+  const document = await pdfjs.getDocument({
+    data: new Uint8Array(bytes.slice(0)),
+    isEvalSupported: false
+  }).promise
+  return {
+    pageCount: document.numPages,
+    renderPage: async (pageNumber: number, targetWidth: number) => {
+      const page = await document.getPage(pageNumber)
+      const base = page.getViewport({ scale: 1 })
+      const scale = base.width > 0 ? Math.max(0.2, targetWidth / base.width) : 1
+      const viewport = page.getViewport({ scale })
+      const canvas = window.document.createElement('canvas')
+      canvas.width = Math.max(1, Math.floor(viewport.width))
+      canvas.height = Math.max(1, Math.floor(viewport.height))
+      const context = canvas.getContext('2d')
+      if (!context) throw new PreviewUnavailableError('浏览器没有可用的 canvas 2d 上下文。')
+      await page.render({ canvasContext: context, viewport }).promise
+      const url = await canvasToUrl(canvas)
+      page.cleanup()
+      return {
+        url,
+        width: canvas.width,
+        height: canvas.height,
+        release: () => URL.revokeObjectURL(url)
+      }
+    },
+    close: () => { void document.destroy() }
+  }
+  // #endif
+  throw new PreviewUnavailableError(
+    'App 端还没有 PDF 预览适配器：pdf.js 在那里没有 canvas，要改用平台的 PDF 组件或原生插件。'
+  )
+}

@@ -1,0 +1,10 @@
+/.claude/
+/.vscode/
+/kitchen-ledger/
+/restaurant-erp/
+/frontend/f20-edge-profile/
+/frontend/docs/
+/backend/frontend/
+/backend/docs/*
+!/backend/docs/struct.md
+!/backend/docs/deploy.md

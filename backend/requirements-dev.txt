@@ -1,0 +1,6 @@
+# 开发与测试依赖。开发环境只需安装本文件：
+#   python -m pip install -r requirements-dev.txt
+
+-r requirements.txt
+
+pytest==9.2.0

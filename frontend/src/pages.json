@@ -1,0 +1,16 @@
+{
+  "pages": [
+    {
+      "path": "pages/workspace/index",
+      "style": {
+        "navigationBarTitleText": "单据工作台",
+        "navigationStyle": "custom"
+      }
+    }
+  ],
+  "globalStyle": {
+    "navigationBarTitleText": "单据工作台",
+    "navigationBarBackgroundColor": "#F7F4EC",
+    "navigationBarTextStyle": "black"
+  }
+}

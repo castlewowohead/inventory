@@ -1,0 +1,12 @@
+# 评测工具的依赖（tools/ 目录专用）。
+#
+# **与运行依赖分开**：tools/ 下的脚本是评测工具，不被 src/ 导入，也不参与 pytest。
+# 交付的后端不装这个文件也能启动、迁移、跑测试。
+#
+# 安装：python -m pip install -r requirements-tools.txt
+#
+# 步骤 08 之后，Pillow 与 pypdf **已经移进 requirements.txt**：墨迹/格线检测与
+# 数字 PDF 文字层进入了 src/，成为运行依赖。本文件因此只剩下对运行依赖的引用——
+# 评测脚本用的就是运行时那一套，不另装一份。
+
+-r requirements.txt

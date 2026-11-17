@@ -1,0 +1,10 @@
+From: Mediterranean Foods
+Bill No: ME-007
+Invoice date: 13/10/2026
+SKU | Description | Qty | Unit Price | Line Total
+00128 | Organic extra virgin | 2 | 11.50 | 23.00
+olive oil (1 L bottle)
+Subtotal:$23.00
+Tax: $0.00
+Delivery charge: $2.00
+Grand total: $25.00

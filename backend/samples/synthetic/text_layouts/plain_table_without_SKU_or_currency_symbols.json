@@ -1,0 +1,90 @@
+{
+  "schema": "gt/1",
+  "image": "plain_table_without_SKU_or_currency_symbols.txt",
+  "doc_class": "digital_pdf",
+  "annotator": "dev（改写自 kitchen-ledger 的英文合成 fixture）",
+  "annotated_on": "2026-11-10",
+  "notes": [
+    "改写自 kitchen-ledger/tests/fixtures/invoice-layouts.json。",
+    "英文合成文本，**不是图像**，不经过 OCR：用于步骤 08「数字 PDF 直接抽文字层」那条路径的解析回归，不作为中文手写性能证据。",
+    "旧 fixture 的 baseQuantity（换算后的基础数量）已丢弃——换算属步骤 09，GT 不存派生值。"
+  ],
+  "document": {
+    "supplier": {
+      "status": "recognized",
+      "raw_text": "Market Pantry"
+    },
+    "invoice_date": {
+      "status": "recognized",
+      "raw_text": "2026-10-04"
+    },
+    "invoice_number": {
+      "status": "recognized",
+      "raw_text": "MP/2041"
+    },
+    "invoice_total": {
+      "status": "recognized",
+      "raw_text": "96.8"
+    },
+    "currency": {
+      "status": "missing",
+      "raw_text": null
+    }
+  },
+  "lines": [
+    {
+      "index": 1,
+      "item_description": {
+        "status": "recognized",
+        "raw_text": "Fresh onions"
+      },
+      "quantity": {
+        "status": "recognized",
+        "raw_text": "2"
+      },
+      "unit": {
+        "status": "missing",
+        "raw_text": null
+      },
+      "unit_price": {
+        "status": "recognized",
+        "raw_text": "12.5"
+      },
+      "line_amount": {
+        "status": "recognized",
+        "raw_text": "25"
+      },
+      "pack_spec": {
+        "status": "missing",
+        "raw_text": null
+      }
+    },
+    {
+      "index": 2,
+      "item_description": {
+        "status": "recognized",
+        "raw_text": "Brown rice (5 kg bag)"
+      },
+      "quantity": {
+        "status": "recognized",
+        "raw_text": "3"
+      },
+      "unit": {
+        "status": "missing",
+        "raw_text": null
+      },
+      "unit_price": {
+        "status": "recognized",
+        "raw_text": "20"
+      },
+      "line_amount": {
+        "status": "recognized",
+        "raw_text": "60"
+      },
+      "pack_spec": {
+        "status": "missing",
+        "raw_text": null
+      }
+    }
+  ]
+}

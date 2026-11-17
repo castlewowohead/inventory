@@ -1,0 +1,10 @@
+Vendor: Euro Foods
+Invoice ID EU-004
+Invoice Date: 14.10.2026
+Currency: EUR
+Qty | Description | UOM | Unit Price | Total
+2 | Lemons | kg | €1.234,56 | €2.469,12
+Subtotal: €2.469,12
+VAT (0%): €0,00
+Delivery fee: €5,00
+Grand Total: €2.474,12

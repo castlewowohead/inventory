@@ -1,0 +1,36 @@
+# 虚拟环境与 Python 缓存
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# 本机配置与密钥：只交付 .env.example
+.env
+.env.*
+!.env.example
+
+# 运行期数据：SQLite 数据库、上传文件、导出文件
+var/*
+!var/.gitkeep
+*.db
+*.sqlite
+*.sqlite3
+*.db-journal
+
+# 真实单据与人工标注（含客户数据，不进入源码交付）
+samples/real/
+samples/**/*ground_truth_real*
+
+# 误放在 backend/ 根目录的单据或表格（合成样本放 samples/synthetic/，随项目交付）
+/*.jpg
+/*.jpeg
+/*.png
+/*.pdf
+/*.xlsx
+/*.xls
+/*.csv
+
+# 编辑器与系统文件
+.vscode/
+.idea/
+Thumbs.db

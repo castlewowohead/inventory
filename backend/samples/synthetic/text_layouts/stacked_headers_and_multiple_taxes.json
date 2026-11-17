@@ -1,0 +1,63 @@
+{
+  "schema": "gt/1",
+  "image": "stacked_headers_and_multiple_taxes.txt",
+  "doc_class": "digital_pdf",
+  "annotator": "dev（改写自 kitchen-ledger 的英文合成 fixture）",
+  "annotated_on": "2026-11-10",
+  "notes": [
+    "改写自 kitchen-ledger/tests/fixtures/invoice-layouts.json。",
+    "英文合成文本，**不是图像**，不经过 OCR：用于步骤 08「数字 PDF 直接抽文字层」那条路径的解析回归，不作为中文手写性能证据。",
+    "旧 fixture 的 baseQuantity（换算后的基础数量）已丢弃——换算属步骤 09，GT 不存派生值。"
+  ],
+  "document": {
+    "supplier": {
+      "status": "missing",
+      "raw_text": null
+    },
+    "invoice_date": {
+      "status": "missing",
+      "raw_text": null
+    },
+    "invoice_number": {
+      "status": "recognized",
+      "raw_text": "NP-091"
+    },
+    "invoice_total": {
+      "status": "recognized",
+      "raw_text": "33.6"
+    },
+    "currency": {
+      "status": "missing",
+      "raw_text": null
+    }
+  },
+  "lines": [
+    {
+      "index": 1,
+      "item_description": {
+        "status": "recognized",
+        "raw_text": "Lemons"
+      },
+      "quantity": {
+        "status": "recognized",
+        "raw_text": "5"
+      },
+      "unit": {
+        "status": "missing",
+        "raw_text": null
+      },
+      "unit_price": {
+        "status": "recognized",
+        "raw_text": "6"
+      },
+      "line_amount": {
+        "status": "recognized",
+        "raw_text": "30"
+      },
+      "pack_spec": {
+        "status": "missing",
+        "raw_text": null
+      }
+    }
+  ]
+}

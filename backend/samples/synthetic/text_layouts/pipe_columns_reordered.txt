@@ -1,0 +1,9 @@
+Vendor: Lakeview Produce
+Invoice No. LP-9981
+Date issued: 14 October 2026
+Payment due: 23 Oct 2026
+Qty | Description | UOM | Rate | Amount
+6 | Lemons | kg | 6.00 | 36.00
+Subtotal 36.00
+Tax 0.00
+Total 36.00

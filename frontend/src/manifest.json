@@ -1,0 +1,10 @@
+{
+  "name": "单据工作台",
+  "appid": "__UNI__INVENTORY_LOCAL",
+  "description": "本地食材与单据工作台",
+  "versionName": "0.1.0",
+  "versionCode": "100",
+  "h5": {
+    "title": "单据工作台"
+  }
+}
