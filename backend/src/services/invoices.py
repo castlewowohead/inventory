@@ -82,6 +82,7 @@ from src.models import (
     Invoice,
     InvoiceFile,
     InvoiceLine,
+    PurchaseRevision,
     utcnow,
 )
 from src.repositories.invoices import (
@@ -90,8 +91,10 @@ from src.repositories.invoices import (
     InvoiceRepository,
 )
 from src.repositories.extraction import ExtractionJobRepository
+from src.repositories.intake_reviews import IntakeReviewRepository
+from src.normalization import normalize_date_text
 from src.repositories.ingredients import FoodItemRepository
-from src.repositories.purchases import PurchaseRepository
+from src.repositories.purchases import PurchaseRepository, PurchaseRevisionRepository
 from src.services import matching
 from src.services.ingredients import (
     DEFAULT_LIMIT,
@@ -109,6 +112,7 @@ from src.services.purchases import (
     ENTRY_SOURCE_IMPORT,
     LINE_KINDS,
     PurchaseService,
+    REVISION_ACTION_UPDATE,
     parse_decimal,
     parse_purchase_date,
     normalize_purchase_unit,
@@ -409,6 +413,7 @@ class InvoiceView:
     recognition_is_fake: bool | None
     recognized_at: datetime | None
     raw_document_fields: dict[str, Any] | None
+    header_reviewed_fields: tuple[str, ...]
     completed_at: datetime | None
     voided_at: datetime | None
     uploaded_at: datetime
@@ -419,6 +424,7 @@ class InvoiceView:
     possible_duplicate_invoice_ids: tuple[int, ...]
     entry_source: str
     import_metadata: dict[str, Any] | None
+    intake_sources: tuple[dict[str, Any], ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -698,8 +704,7 @@ def _category_totals(
     )
     if adjustment_total is not None:
         notes.append(
-            "运费 / 折让等调整**单列一桶，没有加进任何分类**：它们不是某一类食材的"
-            "成本（与步骤 09 的价格统计同一条口径）。"
+            "运费和折让已单独列出，不计入食材分类金额。"
         )
     rows = [
         CategoryTotal(
@@ -717,8 +722,12 @@ def _category_totals(
     return tuple(rows), adjustment_total, tuple(notes)
 
 
-def _extension(original_name: str) -> str:
-    """取小写扩展名。没有扩展名就返回空串，由调用方按白名单拒绝。"""
+def upload_extension(original_name: str) -> str:
+    """取小写扩展名。没有扩展名就返回空串，由调用方按白名单拒绝。
+
+    公开给整理批次的摄入通路复用（`services/intake_ingest.py`）：
+    白名单与"扩展名怎么算"必须只有一份，否则会出现「单张上传拦住、批次上传放过」。
+    """
     _, _, suffix = original_name.rpartition(".")
     return suffix.strip().lower() if suffix and suffix != original_name else ""
 
@@ -744,10 +753,32 @@ def _try_date(raw: str | None) -> date | None:
     """把识别出来的原文试着解析成日历日；解析不了就返回 None（不编造日期）。"""
     if raw is None:
         return None
+    normalized = normalize_date_text(raw, allow_short_year=True)
+    if not normalized.ok:
+        return None
     try:
-        return parse_purchase_date(raw)
+        return parse_purchase_date(normalized.text)
     except ValidationError:
         return None
+
+
+def _invoice_date_input(value: Any) -> date | None:
+    """接受单据上可明确读出的常见日期写法，保存前统一为日历日。"""
+    if isinstance(value, str) and value.strip():
+        normalized = normalize_date_text(value, allow_short_year=True)
+        if not normalized.ok:
+            raise ValidationError(
+                "日期写法无法确定，请核对后填写完整日期，例如 2026-06-29。",
+                details={"field": "invoice_date"},
+            )
+        value = normalized.text
+    try:
+        return parse_purchase_date(value)
+    except ValidationError as exc:
+        raise ValidationError(
+            "单据日期无效，请核对后填写真实日期。",
+            details={"field": "invoice_date"},
+        ) from exc
 
 
 def _field_payload(recognized: RecognizedField) -> dict[str, Any]:
@@ -872,8 +903,7 @@ class InvoiceService:
         """
         if not uploads:
             raise ValidationError(
-                "上传发票至少需要一个文件。没有单据的零散采购请用 "
-                "POST /api/purchases 单条录入。",
+                "请先选择要上传的单据文件。没有单据的零散采购可以单独录入。",
                 details={"field": "files"},
             )
         self._check_file_count(0, len(uploads))
@@ -1148,12 +1178,23 @@ class InvoiceService:
     ) -> InvoiceView:
         """修改单据头。未出现的字段保持原值，显式传 null 表示清空。
 
-        改单据头**不动已经确认的采购记录**（继承只发生在确认那一刻），也不改行状态；
-        它会影响对账结果，而对账本来就只是提示。
+        单据头修正会同步仍沿用旧单据头值的已确认采购，并留下修改日志。
+        行内覆盖值及后来单独修正过的采购值不受影响。
         """
         with self._database.unit_of_work() as session:
             invoice = self._load_invoice(session, invoice_id)
             self._require_not_voided(invoice)
+            if (source_name is not UNSET or invoice_date is not UNSET) and \
+                    IntakeReviewRepository(session).links_for_invoice(invoice_id):
+                raise ConflictError(
+                    "整理批次送审后的日期/商家须明确按整张草稿修改，请使用批次审核分类接口。",
+                    details={"invoice_id": invoice_id, "scope": "invoice"},
+                )
+            old_header = {
+                "purchase_date": invoice.invoice_date,
+                "source_name": invoice.source_name,
+                "currency": invoice.currency or DEFAULT_CURRENCY,
+            }
 
             if source_name is not UNSET:
                 clean = optional_text(
@@ -1172,7 +1213,7 @@ class InvoiceService:
                     normalize_name(clean) if clean else None
                 )
             if invoice_date is not UNSET:
-                invoice.invoice_date = parse_purchase_date(invoice_date)
+                invoice.invoice_date = _invoice_date_input(invoice_date)
             if currency is not UNSET:
                 invoice.currency = (
                     None
@@ -1193,8 +1234,64 @@ class InvoiceService:
                         allow_negative=False,
                     )
                 )
+            reviewed = set(json.loads(invoice.header_reviewed_fields or "[]"))
+            for name, value in (
+                ("source_name", source_name),
+                ("invoice_number", invoice_number),
+                ("invoice_date", invoice_date),
+                ("currency", currency),
+                ("invoice_total", invoice_total),
+            ):
+                if value is not UNSET:
+                    reviewed.add(name)
+            invoice.header_reviewed_fields = json.dumps(sorted(reviewed))
+            self._sync_confirmed_header_fields(session, invoice, old_header)
             session.flush()
             return self._view(session, invoice, with_candidates=True)
+
+    @staticmethod
+    def _sync_confirmed_header_fields(
+        session: Session, invoice: Invoice, old_header: dict[str, Any]
+    ) -> None:
+        new_header = {
+            "purchase_date": invoice.invoice_date,
+            "source_name": invoice.source_name,
+            "currency": invoice.currency or DEFAULT_CURRENCY,
+        }
+        changed_fields = [key for key in old_header if old_header[key] != new_header[key]]
+        if not changed_fields:
+            return
+        purchases = PurchaseRepository(session)
+        revisions = PurchaseRevisionRepository(session)
+        for line in invoice.lines:
+            if line.status != LINE_STATUS_CONFIRMED:
+                continue
+            purchase = purchases.find_active_by_invoice_line(line.id)
+            if purchase is None:
+                continue
+            overrides = set(_review_metadata(line).get("overrides", []))
+            changes: dict[str, dict[str, str | None]] = {}
+            for key in changed_fields:
+                if key in overrides or getattr(line, key):
+                    continue
+                before = old_header[key]
+                after = new_header[key]
+                if getattr(purchase, key) != before:
+                    continue
+                setattr(purchase, key, after)
+                if key == "source_name":
+                    purchase.source_name_normalized = normalize_name(after) if after else None
+                changes[key] = {
+                    "before": before.isoformat() if isinstance(before, date) else before,
+                    "after": after.isoformat() if isinstance(after, date) else after,
+                }
+            if changes:
+                revisions.add(PurchaseRevision(
+                    purchase_id=purchase.id,
+                    action=REVISION_ACTION_UPDATE,
+                    changed_fields=json.dumps(changes, ensure_ascii=False),
+                    reason="Corrected invoice header",
+                ))
 
     def add_line(
         self,
@@ -1458,6 +1555,20 @@ class InvoiceService:
 
     # --- 收口与作废 ---
 
+    def reopen_invoice(self, invoice_id: int) -> InvoiceView:
+        """让已完成单据重新进入审核；已确认的采购记录保持原样。"""
+        with self._database.unit_of_work() as session:
+            invoice = self._load_invoice(session, invoice_id)
+            self._require_not_voided(invoice)
+            if invoice.completed_at is None:
+                raise ConflictError(
+                    "这张单据已经可以编辑，请重新读取详情。",
+                    details={"invoice_id": invoice_id},
+                )
+            invoice.completed_at = None
+            session.flush()
+            return self._view(session, invoice, with_candidates=True)
+
     def complete_invoice(self, invoice_id: int) -> InvoiceView:
         """收口确认：老板审完所有行，确认这张单据处理完了。
 
@@ -1488,6 +1599,11 @@ class InvoiceService:
                     f"{', '.join(str(number) for number in pending)} 行）。"
                     "每一行都要么确认、要么标成跳过，才能完成这张单据。",
                     details={"invoice_id": invoice_id, "pending_line_nos": pending},
+                )
+            if invoice.invoice_date is None:
+                raise ConflictError(
+                    "请先填写单据日期，再完成入库。",
+                    details={"invoice_id": invoice_id, "field": "invoice_date"},
                 )
             invoice.completed_at = utcnow()
             session.flush()
@@ -1822,7 +1938,7 @@ class InvoiceService:
         """类型与大小白名单。返回小写扩展名。"""
         if not upload.original_name or not upload.original_name.strip():
             raise ValidationError("上传文件缺少文件名。", details={"field": "files"})
-        extension = _extension(upload.original_name)
+        extension = upload_extension(upload.original_name)
         if extension not in allowed_extensions:
             raise ValidationError(
                 f"不支持的文件类型 {extension or upload.original_name!r}。"
@@ -1870,7 +1986,7 @@ class InvoiceService:
         """
         target: tuple[InvoiceFile, UploadedFile] | None = None
         for record, upload in stored:
-            if _extension(upload.original_name) in RECOGNIZABLE_EXTENSIONS:
+            if upload_extension(upload.original_name) in RECOGNIZABLE_EXTENSIONS:
                 target = (record, upload)
                 break
         if target is None:
@@ -1999,6 +2115,7 @@ class InvoiceService:
         invoice.recognized_at = utcnow()
         if plan.raw_document_fields:
             invoice.raw_document_fields = plan.raw_document_fields
+            invoice.header_reviewed_fields = "[]"
 
         header = plan.header or {}
         if invoice.source_name is None and header.get("source_name"):
@@ -2028,6 +2145,7 @@ class InvoiceService:
         invoice.recognition_is_fake = result.is_fake
         invoice.recognized_at = result.recognized_at
         invoice.raw_document_fields = _raw_document_fields_json(result)
+        invoice.header_reviewed_fields = "[]"
 
         supplier = _recognized_text(result.document_field(FIELD_SUPPLIER))
         if supplier:
@@ -2442,6 +2560,18 @@ class InvoiceService:
                 )
             )
 
+        intake_sources = tuple({
+            "batch_id": link.item.batch_file.batch_id,
+            "item_id": link.item_id,
+            "kind": link.item.kind,
+            "page_no": link.item.page_no,
+            "row_no": link.item.row_no,
+            "original_name": link.item.batch_file.original_name,
+            "content_type": link.item.batch_file.file.content_type,
+            "batch_file_id": link.item.batch_file_id,
+            "version": link.item.version,
+        } for link in IntakeReviewRepository(session).links_for_invoice(invoice.id))
+
         return InvoiceView(
             id=invoice.id,
             status=_invoice_status(invoice),
@@ -2458,6 +2588,7 @@ class InvoiceService:
                 if invoice.raw_document_fields
                 else None
             ),
+            header_reviewed_fields=tuple(json.loads(invoice.header_reviewed_fields or "[]")),
             completed_at=invoice.completed_at,
             voided_at=invoice.voided_at,
             uploaded_at=invoice.created_at,
@@ -2468,6 +2599,7 @@ class InvoiceService:
             possible_duplicate_invoice_ids=duplicates,
             entry_source=invoice.entry_source,
             import_metadata=json.loads(invoice.import_metadata) if invoice.import_metadata else None,
+            intake_sources=intake_sources,
         )
 
     # --- 加载与校验 ---
@@ -2580,4 +2712,5 @@ __all__ = [
     "MatchCandidateView",
     "ReconciliationView",
     "UploadedFile",
+    "upload_extension",
 ]

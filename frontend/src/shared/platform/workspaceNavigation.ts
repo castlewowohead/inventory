@@ -1,8 +1,9 @@
-export type WorkspaceView = 'home' | 'upload' | 'invoices' | 'review' | 'ingredients'
+export type WorkspaceView = 'home' | 'upload' | 'batch' | 'organize' | 'ledger' | 'invoices' | 'review' | 'ingredients'
 
 export interface WorkspaceLocation {
   view: WorkspaceView
   invoiceId: number | null
+  batchId?: number | null
   foodItemId?: number | null
   ingredientTab?: 'catalog' | 'prices'
 }
@@ -14,7 +15,7 @@ export function readWorkspaceLocation(): WorkspaceLocation {
   // #ifdef H5
   const params = new URLSearchParams(window.location.search)
   const requested = params.get('view')
-  const view: WorkspaceView = requested === 'upload' || requested === 'ingredients' || requested === 'review' || requested === 'invoices' || requested === 'prices'
+  const view: WorkspaceView = requested === 'upload' || requested === 'batch' || requested === 'organize' || requested === 'ledger' || requested === 'ingredients' || requested === 'review' || requested === 'invoices' || requested === 'prices'
     ? requested === 'prices' ? 'ingredients' : requested
     : 'home'
   const rawId = params.get('invoice')
@@ -22,12 +23,16 @@ export function readWorkspaceLocation(): WorkspaceLocation {
     ? Number(rawId)
     : null
   const rawFoodId = params.get('food_item')
+  const rawBatchId = params.get('batch')
+  const batchId = rawBatchId && /^[1-9]\d*$/.test(rawBatchId) && Number.isSafeInteger(Number(rawBatchId))
+    ? Number(rawBatchId) : null
   const foodItemId = rawFoodId && /^[1-9]\d*$/.test(rawFoodId) && Number.isSafeInteger(Number(rawFoodId))
     ? Number(rawFoodId)
     : null
   return {
     view,
     invoiceId: view === 'review' ? invoiceId : null,
+    batchId: view === 'batch' || view === 'organize' || view === 'ledger' ? batchId : null,
     foodItemId: view === 'ingredients' ? foodItemId : null,
     ingredientTab: view === 'ingredients' && (requested === 'prices' || params.get('tab') === 'prices') ? 'prices' : 'catalog'
   }
@@ -44,6 +49,11 @@ export function writeWorkspaceLocation(location: WorkspaceLocation, replace = fa
     next.searchParams.set('invoice', String(location.invoiceId))
   } else {
     next.searchParams.delete('invoice')
+  }
+  if ((location.view === 'batch' || location.view === 'organize' || location.view === 'ledger') && location.batchId) {
+    next.searchParams.set('batch', String(location.batchId))
+  } else {
+    next.searchParams.delete('batch')
   }
   if (location.view === 'ingredients' && location.foodItemId) next.searchParams.set('food_item', String(location.foodItemId))
   else next.searchParams.delete('food_item')

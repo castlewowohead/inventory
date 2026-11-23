@@ -91,8 +91,8 @@ def test_upgrade_head_runs_on_a_fresh_database(tmp_path: Path) -> None:
     assert stamped_revisions(target) == [head_revision()]
 
 
-def test_upgrade_creates_exactly_the_step_10_tables(tmp_path: Path) -> None:
-    """当前修订链建出步骤 03—10 的十二张业务表。
+def test_upgrade_creates_exactly_the_expected_tables(tmp_path: Path) -> None:
+    """当前修订链建出步骤 03—10 的十二张业务表，加多文件计划 M02 的五张。
 
     断言写成"恰好等于"：每一步新增的表都必须在这里被显式承认一次，否则某个
     Feature 偷偷建了表也没人察觉。导入导出（06）不加表；步骤 08 加两张
@@ -109,6 +109,13 @@ def test_upgrade_creates_exactly_the_step_10_tables(tmp_path: Path) -> None:
     ⚠️ **步骤 09 没有给 `purchases` 加标准化价格列**，所以这里的表数量变了、
     列没变。标准化价格是查询时算的派生值（docs/stru_dev.md 09.5）：落一列回填
     的话，箱规一改那列就悄悄过期，而它看起来仍然像个可信的数字。
+
+    多文件计划 M02 加五张（`intake_*`）：混合上传的整理批次、按内容摘要一行一份的
+    原件字节、批次对原件的引用、可归类内容（PDF 的一页 / 表格的一行）与分类候选。
+    ⚠️ **这里没有「日期/商家组」表**——组由内容上的人工决定值派生，另存一张会与
+    内容打架（和"单据状态由行状态派生"同一条）。⚠️ **`invoices` / `invoice_files`
+    一个字都没改**：那边 `sha256` 全局唯一是步骤 05「完全相同的文件不许重复上传」
+    的落点，整理批次另立一套表而不是放宽它。
     """
     target = tmp_path / "inventory.db"
 
@@ -128,6 +135,18 @@ def test_upgrade_creates_exactly_the_step_10_tables(tmp_path: Path) -> None:
         "pack_specs",
         "price_alert_settings",
         "food_item_merges",
+        "intake_batches",
+        "intake_files",
+        "intake_batch_files",
+        "intake_items",
+        "intake_item_candidates",
+        "intake_moves",
+        "intake_move_entries",
+        "intake_review_links",
+        # M07 的商家记忆：**只有别名映射落表**。「这一家现在叫什么」与「这个版式
+        # 属于哪一家」都是派生值（最近一次人工确认 / 指纹 + 那页的确认），另存一张
+        # 就会出现两份能互相矛盾的真相。
+        "intake_source_aliases",
     }
 
 

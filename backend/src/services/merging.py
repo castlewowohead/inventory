@@ -58,9 +58,7 @@ BLOCK_INCOMPATIBLE_BASE_UNIT: Final[str] = "incompatible_base_unit"
 BLOCK_PACK_SPEC_CONFLICT: Final[str] = "pack_spec_conflict"
 
 IRREVERSIBLE_NOTE: Final[str] = (
-    "⚠️ **合并不可逆**：被并掉的那条食材会被删除，它名下的采购记录与草稿行改指向"
-    "保留的那条。系统会记下旧叫法（按旧叫法仍然搜得到），但**分不清哪几条采购原本"
-    "属于哪一边**，没有一键还原。"
+    "合并后无法撤销。原来的食材会被删除，相关采购记录和单据明细会归到保留的食材名下。"
 )
 
 
@@ -268,12 +266,7 @@ class MergeService:
                     MergeBlocker(
                         code=BLOCK_PACK_SPEC_CONFLICT,
                         message=(
-                            f"两条食材对「{spec.source_name or '不限来源'}的 1 "
-                            f"{spec.purchase_unit_normalized}」各有一份箱规，而且不一样"
-                            f"（{existing.pack_size} {existing.pack_unit} vs "
-                            f"{spec.pack_size} {spec.pack_unit}）。⚠️ 箱规是人确认过"
-                            "一次的事实，系统不替你挑一个——请先改成一致，或者删掉"
-                            "不对的那条，再合并。"
+                            "这两条食材留有不同的旧单位换算记录，暂时不能合并。"
                         ),
                         details={
                             "food_item_id": source_id,
@@ -330,11 +323,8 @@ class MergeService:
                 MergeBlocker(
                     code=BLOCK_INCOMPATIBLE_BASE_UNIT,
                     message=(
-                        f"{source.name} 按 {source.base_unit} 计量、"
-                        f"{target.name} 按 {target.base_unit} 计量，两者不是同一类"
-                        f"（{source_dimension} vs {target_dimension}）。"
-                        "没有密度就不能把体积换成重量，合并之后有一半历史永远算不出"
-                        "标准化价格。"
+                        f"{source.name} 使用 {source.base_unit}，{target.name} 使用"
+                        f" {target.base_unit}。这两种单位不能直接换算，因此不能合并。"
                     ),
                     details={
                         "food_item_id": source.id,
@@ -347,9 +337,8 @@ class MergeService:
             )
             return
         note = (
-            f"{source.name} 的基础单位是 {source.base_unit}，合并后按 "
-            f"{target.base_unit} 统计：它的历史标准化价格会换成另一个单位显示，"
-            "**金额没有变，变的是每单位的量**。"
+            f"{source.name} 原来按 {source.base_unit} 比价；合并后会按"
+            f" {target.base_unit} 比价。历史采购金额不变。"
         )
         if note not in notes:
             notes.append(note)

@@ -10,6 +10,10 @@
 默认只监听 127.0.0.1（见 .env.example 的 HOST / PORT）。当前阶段是本地演示，
 没有身份认证与访问控制，不要绑定到公网地址。
 
+**整理批次的切页**（多文件计划 M03）：`python app.py` 会装一个后台线程池，
+于是上传请求只做「存字节 + 登记」就返回，切页在请求之外进行；启动时还会把上次
+没切完的文件接着切。没装调度器（例如测试里直接 `create_app()`）就是当场切完。
+
 **提取 worker**（步骤 08）：`OCR_WORKER_MODE=thread` 且配了真实识别器时，
 `python app.py` 会顺带起一个应用内 worker，于是单机演示不用开第二个终端。
 要把它单独跑在另一个进程里（或另一台机器上）就用：
@@ -26,7 +30,7 @@ from dotenv import load_dotenv
 
 from src.config import BASE_DIR, Config
 from src.factory import configure_log_output, create_app
-from src.worker import start_in_process
+from src.worker import start_in_process, start_intake_ingest
 
 # 文件缺失时静默跳过；已存在的进程环境变量优先，.env 不覆盖它们。
 load_dotenv(BASE_DIR / ".env")
@@ -35,6 +39,9 @@ config = Config.from_env()
 configure_log_output(config)
 app = create_app(config)
 worker = start_in_process(app, config)
+# 整理批次的切页也挪出 HTTP 请求（多文件计划 M03）。与上面那一行同一条理由：
+# 装后台线程属于进程入口，不属于 create_app()。
+ingest_scheduler = start_intake_ingest(app)
 
 
 if __name__ == "__main__":

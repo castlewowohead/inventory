@@ -16,5 +16,7 @@ Service 之间互相调用时，把 Session 传给 `unit_of_work(session)` 加�
 不提前提交半个业务操作。详见 src/db.py。
 
 ingredients.py 在步骤 03，采购记录在步骤 04，invoices.py 在步骤 05，
-units.py 与 prices.py 在步骤 09。
+units.py 与 prices.py 在步骤 09，intake.py（混合上传的整理批次）在多文件计划 M02，
+intake_ingest.py（图片/PDF 摄入）在 M03，intake_spreadsheets.py（表格摄入）在 M04，
+intake_recognition.py（日期/商家候选与日期解析）在 M05。
 """

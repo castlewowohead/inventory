@@ -83,8 +83,7 @@ def test_invoice_needs_at_least_one_file(invoice_service: InvoiceService) -> Non
     with pytest.raises(ValidationError) as error:
         invoice_service.create_invoice([])
 
-    assert "至少需要一个文件" in error.value.message
-    assert "POST /api/purchases" in error.value.message
+    assert "请先选择" in error.value.message
 
 
 @pytest.mark.parametrize("name", ["invoice.txt", "invoice.docx", "invoice", "invoice.exe"])
@@ -954,24 +953,48 @@ def test_an_undated_invoice_lands_on_the_undated_worklist(
     assert purchase_service.search_purchases(undated=True, limit=50).total == 1
 
 
-def test_changing_the_header_later_does_not_touch_confirmed_purchases(
+def test_changing_the_header_updates_inherited_confirmed_purchase_with_revision(
     invoice_service: InvoiceService,
     purchase_service: PurchaseService,
     food_item: FoodItemView,
 ) -> None:
-    """继承只发生在确认那一刻；之后改单据头走 PATCH /api/purchases（有修改日志）。"""
+    """修正单据头时，沿用它的采购历史同步，并保留修订记录。"""
     invoice = draft(invoice_service)
-    invoice_service.update_invoice(invoice.id, source_name="Costco")
+    invoice_service.update_invoice(invoice.id, source_name="Costco", invoice_date="2026-06-29")
     outcome = invoice_service.confirm_lines(
         invoice.id,
         options=[ConfirmOption(line_id=invoice.lines[0].id, food_item_id=food_item.id)],
     )
 
-    invoice_service.update_invoice(invoice.id, source_name="Restaurant Depot")
+    invoice_service.update_invoice(invoice.id, source_name="Restaurant Depot", invoice_date="2026-07-29")
 
     purchase = purchase_service.get_purchase(outcome.results[0].purchase_id)
-    assert purchase.source_name == "Costco"
-    assert purchase.revision_count == 0
+    assert purchase.source_name == "Restaurant Depot"
+    assert purchase.purchase_date.isoformat() == "2026-07-29"
+    assert purchase.revision_count == 1
+
+
+def test_header_correction_preserves_line_override_and_purchase_correction(
+    invoice_service: InvoiceService,
+    purchase_service: PurchaseService,
+    food_item: FoodItemView,
+) -> None:
+    invoice = draft(invoice_service)
+    invoice_service.update_invoice(invoice.id, invoice_date="2026-06-29", source_name="Costco")
+    invoice_service.update_line(invoice.id, invoice.lines[0].id, source_name="Line supplier")
+    outcome = invoice_service.confirm_lines(
+        invoice.id,
+        options=[ConfirmOption(line_id=invoice.lines[0].id, food_item_id=food_item.id)],
+    )
+    purchase_id = outcome.results[0].purchase_id
+    purchase_service.update_purchase(purchase_id, purchase_date="2026-07-01", reason="Verified date")
+
+    invoice_service.update_invoice(invoice.id, invoice_date="2026-07-29", source_name="New supplier")
+
+    purchase = purchase_service.get_purchase(purchase_id)
+    assert purchase.purchase_date.isoformat() == "2026-07-01"
+    assert purchase.source_name == "Line supplier"
+    assert purchase.revision_count == 1
 
 
 def test_a_purchase_points_back_at_the_original_document(
@@ -1033,19 +1056,65 @@ def test_raw_fields_never_change_after_edits_and_confirmation(
     assert json.dumps(after.raw_fields, ensure_ascii=False, sort_keys=True) == original
 
 
-def test_a_food_item_used_by_an_invoice_line_cannot_be_deleted(
+def test_deleting_a_food_item_clears_an_unconfirmed_invoice_selection(
     invoice_service: InvoiceService,
     ingredient_service: IngredientService,
     food_item: FoodItemView,
 ) -> None:
-    """发票草稿也算引用：删掉食材会让草稿指向不存在的记录。"""
+    """草稿仅预选食材时，删除食材不影响单据原始内容。"""
     invoice = draft(invoice_service)
     invoice_service.update_line(invoice.id, invoice.lines[0].id, food_item_id=food_item.id)
+
+    ingredient_service.delete_food_item(food_item.id)
+
+    after = invoice_service.get_invoice(invoice.id)
+    assert after.lines[0].food_item is None
+    assert after.lines[0].description == invoice.lines[0].description
+
+
+def test_a_confirmed_invoice_food_item_cannot_be_deleted(
+    invoice_service: InvoiceService,
+    ingredient_service: IngredientService,
+    food_item: FoodItemView,
+) -> None:
+    invoice = draft(invoice_service)
+    line = invoice.lines[0]
+    invoice_service.update_line(
+        invoice.id, line.id, quantity="12", unit_price="7.00", line_amount="84.00"
+    )
+    invoice_service.confirm_lines(
+        invoice.id, options=[ConfirmOption(line_id=line.id, food_item_id=food_item.id)]
+    )
 
     with pytest.raises(ConflictError) as error:
         ingredient_service.delete_food_item(food_item.id)
 
-    assert "发票" in error.value.message
+    assert error.value.details["confirmed_invoice_lines"] == 1
+    assert error.value.details["invoice_linked_purchases"] == 1
+    assert ingredient_service.get_food_item(food_item.id).id == food_item.id
+
+
+def test_old_invoice_purchase_still_protects_its_food_item_after_unconfirm(
+    invoice_service: InvoiceService,
+    ingredient_service: IngredientService,
+    food_item: FoodItemView,
+) -> None:
+    invoice = draft(invoice_service)
+    line = invoice.lines[0]
+    invoice_service.update_line(
+        invoice.id, line.id, quantity="12", unit_price="7.00", line_amount="84.00"
+    )
+    invoice_service.confirm_lines(
+        invoice.id, options=[ConfirmOption(line_id=line.id, food_item_id=food_item.id)]
+    )
+    invoice_service.unconfirm_line(invoice.id, line.id)
+    invoice_service.update_line(invoice.id, line.id, food_item_id=None)
+
+    with pytest.raises(ConflictError) as error:
+        ingredient_service.delete_food_item(food_item.id)
+
+    assert error.value.details["confirmed_invoice_lines"] == 0
+    assert error.value.details["invoice_linked_purchases"] == 1
 
 
 # --- 撤销确认 ---------------------------------------------------------------
@@ -1446,7 +1515,7 @@ def test_a_missing_line_shows_up_as_a_mismatch_but_blocks_nothing(
 ) -> None:
     """漏行的主要兜底：各行之和对不上单据总额就提示，但不阻止完成。"""
     invoice = draft(invoice_service)
-    invoice_service.update_invoice(invoice.id, invoice_total="286.00")
+    invoice_service.update_invoice(invoice.id, invoice_total="286.00", invoice_date="2026-11-08")
     invoice_service.update_line(
         invoice.id, invoice.lines[1].id, status="skipped", skip_reason="认不出"
     )
@@ -1521,11 +1590,29 @@ def test_an_empty_invoice_cannot_be_completed(invoice_service: InvoiceService) -
     assert "还没有任何行" in error.value.message
 
 
+def test_invoice_date_is_required_to_complete(
+    invoice_service: InvoiceService, food_item: FoodItemView
+) -> None:
+    invoice = draft(invoice_service)
+    invoice_service.confirm_lines(
+        invoice.id,
+        options=[ConfirmOption(line_id=invoice.lines[0].id, food_item_id=food_item.id)],
+    )
+    invoice_service.update_line(invoice.id, invoice.lines[1].id, status="skipped", skip_reason="无法识别")
+
+    with pytest.raises(ConflictError) as error:
+        invoice_service.complete_invoice(invoice.id)
+
+    assert error.value.details["field"] == "invoice_date"
+    assert invoice_service.get_invoice(invoice.id).completed_at is None
+
+
 def test_status_goes_draft_in_review_ready_completed(
     invoice_service: InvoiceService, food_item: FoodItemView, other_food_item: FoodItemView
 ) -> None:
     """单据状态由行状态派生，`ready_to_complete` 与 `completed` 分开。"""
     invoice = draft(invoice_service)
+    invoice_service.update_invoice(invoice.id, invoice_date="2026-11-08")
     assert invoice.status == INVOICE_STATUS_DRAFT
 
     invoice_service.confirm_lines(
@@ -1547,6 +1634,7 @@ def test_unconfirming_after_completion_reopens_the_invoice(
 ) -> None:
     """收口确认是对某个状态的确认：行变了就得重新确认一次，不能停留在过期判断上。"""
     invoice = draft(invoice_service)
+    invoice_service.update_invoice(invoice.id, invoice_date="2026-11-08")
     invoice_service.update_line(
         invoice.id, invoice.lines[1].id, status="skipped", skip_reason="备注"
     )
@@ -1559,6 +1647,38 @@ def test_unconfirming_after_completion_reopens_the_invoice(
     invoice_service.unconfirm_line(invoice.id, invoice.lines[0].id)
 
     assert invoice_service.get_invoice(invoice.id).completed_at is None
+
+
+def test_completed_invoice_can_be_reopened_edited_and_completed_again(
+    invoice_service: InvoiceService, purchase_service: PurchaseService,
+    food_item: FoodItemView,
+) -> None:
+    invoice = draft(invoice_service)
+    line_id = invoice.lines[0].id
+    invoice_service.update_invoice(invoice.id, invoice_date="2026-11-08")
+    invoice_service.update_line(invoice.id, invoice.lines[1].id, status="skipped", skip_reason="备注")
+    first = invoice_service.confirm_lines(
+        invoice.id, options=[ConfirmOption(line_id=line_id, food_item_id=food_item.id)],
+    ).results[0].purchase_id
+    invoice_service.complete_invoice(invoice.id)
+
+    reopened = invoice_service.reopen_invoice(invoice.id)
+    assert reopened.status == INVOICE_STATUS_READY
+    assert reopened.completed_at is None
+    assert next(line for line in reopened.lines if line.id == line_id).purchase_id == first
+    assert purchase_service.get_purchase(first).voided_at is None
+    with pytest.raises(ConflictError):
+        invoice_service.reopen_invoice(invoice.id)
+
+    invoice_service.unconfirm_line(invoice.id, line_id)
+    assert purchase_service.get_purchase(first).voided_at is not None
+    invoice_service.update_line(invoice.id, line_id, unit_price="7.00", line_amount="70.00")
+    second = invoice_service.confirm_lines(
+        invoice.id, options=[ConfirmOption(line_id=line_id, food_item_id=food_item.id)],
+    ).results[0].purchase_id
+    assert second != first
+    assert purchase_service.get_purchase(second).voided_at is None
+    assert invoice_service.complete_invoice(invoice.id).status == INVOICE_STATUS_COMPLETED
 
 
 # --- 作废与列表 -------------------------------------------------------------
@@ -1687,6 +1807,7 @@ def test_the_worklist_lists_unfinished_invoices(
 ) -> None:
     """`completed=False` 就是老板的待办清单。"""
     done = draft(invoice_service)
+    invoice_service.update_invoice(done.id, invoice_date="2026-11-08")
     invoice_service.update_line(
         done.id, done.lines[1].id, status="skipped", skip_reason="备注"
     )
@@ -1818,7 +1939,7 @@ def test_adjustment_lines_get_their_own_bucket_and_never_join_a_category(
     assert reconciliation.adjustment_total.amount == Decimal("25.00")
     # 它没有混进任何分类——分类那几格加起来不含这 25 元。
     assert sum(row.amount for row in reconciliation.by_category) == Decimal("60.00")
-    assert any("单列一桶" in note for note in reconciliation.notes)
+    assert any("单独列出" in note for note in reconciliation.notes)
 
 
 def test_the_panel_is_withheld_when_the_invoice_mixes_currencies(

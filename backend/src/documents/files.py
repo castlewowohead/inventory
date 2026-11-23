@@ -147,6 +147,16 @@ def _is_heic_supported() -> bool:
     return True
 
 
+def heic_decoder_available() -> bool:
+    """本机装了 HEIC 解码器吗。
+
+    给**摄入阶段**区分两种解不开：文件本身坏了（用户要重传），还是本机缺解码器
+    （文件没问题，是环境缺依赖）。两者都报「解析失败」会让人去重传一张好照片，
+    传几次都一样。
+    """
+    return _is_heic_supported()
+
+
 def decode_image(content: bytes, *, original_name: str | None = None) -> DecodedImage:
     """解码一张图：摆正方向、必要时转码，返回可直接送出去的字节与媒体类型。
 
@@ -275,6 +285,7 @@ __all__ = [
     "HEIC_JPEG_QUALITY",
     "MAX_IMAGE_PIXELS",
     "decode_image",
+    "heic_decoder_available",
     "media_type_for",
     "sniff_format",
 ]

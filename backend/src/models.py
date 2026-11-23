@@ -10,6 +10,11 @@
 - **步骤 09（本文件当前内容）**：`pack_specs`（箱规：1 个包装单位 = 多少基础单位）、
   `price_alert_settings`（涨价阈值与开关）。⚠️ **标准化价格没有落列**：它是派生值，
   查询时算，不改采购记录里的原始数量、单位与金额（docs/stru_dev.md 09.5）。
+- **多文件计划 M02（本文件当前内容）**：`intake_batches`、`intake_files`、
+  `intake_batch_files`、`intake_items`、`intake_item_candidates`（混合上传的整理
+  批次，见 docs/multifiles.md M02）。⚠️ **日期/商家组没有落表**：组由内容上的
+  人工决定值派生，另存一张组表就会与内容打架。`invoice_files` 的两条既有约束
+  （`sha256` 全局唯一、一份文件只属一张单据）**一个字都没改**。
 
 命名约定不是风格偏好，而是迁移前提：SQLite 不支持大部分 ALTER，Alembic 要靠
 批处理模式重建表才能修改约束，而重建时必须能按名字引用既有约束。约束由数据库
@@ -644,6 +649,7 @@ class Invoice(Base, TimestampMixin):
     # 日历日，invoice_date 就只能留空。原文如果不留着，老板只会看到一个空日期，
     # 既不知道单据上到底写了什么，也不知道是没识别还是识别错了。
     raw_document_fields: Mapped[Optional[str]] = mapped_column(Text)
+    header_reviewed_fields: Mapped[str] = mapped_column(Text, nullable=False, default="[]", server_default="[]")
 
     completed_at: Mapped[Optional[datetime]] = mapped_column(UtcDateTime)
     voided_at: Mapped[Optional[datetime]] = mapped_column(UtcDateTime)
@@ -1162,4 +1168,647 @@ class PriceAlertSettings(Base, TimestampMixin):
         return (
             f"PriceAlertSettings(enabled={self.enabled!r}, "
             f"threshold_percent={self.threshold_percent!r})"
+        )
+
+
+# --- 多文件计划 M02：上传整理批次 ---------------------------------------------
+#
+# 五张表，解一个现有结构表达不了的事实：**一批混合文件要按「实际采购日 + 商家」
+# 整理，而一份 PDF 的不同页、一份表格的不同行可以进入不同的组**
+# （docs/multifiles.md 第 1、5 节）。
+#
+# 现有 `invoices` / `invoice_files` 表达的是「一张单据挂若干文件」，而且
+# `invoice_files.invoice_id` 非空、`sha256` 全局唯一——一份文件只能属于一张单据。
+# 整理阶段要的恰好相反：同一份 PDF 的第 1 页和第 3 页可能属于两个不同的日期/商家
+# 组。所以整理批次**另立一套表**，不改动 `invoice_files` 的那两条约束
+# （理由与被否决的方案见 docs/impl_record.md 的 M02 记录）。
+#
+# 三条贯穿本组表的决定：
+#
+# 1. **日期/商家组不落表。** 组是 `(decided_purchase_date,
+#    decided_source_name_normalized)` 的分组结果，由内容上的决定值派生。另存一张
+#    「组」表就会出现两份互相打架的真相：移动一个内容之后，组表里的成员名单和内容
+#    上的决定值谁对？（与「单据状态由行状态派生」、「标准化价格不落列」同一条。）
+# 2. **原件字节只存一次。** `intake_files` 是按 `sha256` 内容寻址的一行一份字节；
+#    批次对它的引用放在 `intake_batch_files`。同一份 PDF 出现在两个批次里只有一份
+#    字节、两条引用，删掉一个批次不会删掉另一个批次还在用的那份字节。
+# 3. **系统建议与人工确认分成两处。** `intake_item_candidates` 是候选（谁建议的、
+#    依据是什么）；`intake_items.decided_*` 是人确认过的值。写在一处就再也分不清
+#    界面上那个日期是模型猜的还是人填的——而 docs/multifiles.md 第 4 节要求这个区别
+#    必须显著可见。
+
+# 文件在某个批次里的处理状态。**不派生**：「上传完还没处理」与「处理失败」是两件
+# 不同的事实，而 docs/multifiles.md M02 明确要求批次文件重复、上传中断与文件回收
+# 都有明确状态。
+INTAKE_FILE_STATUS_MAX_LENGTH = 16
+INTAKE_FILE_STATUS_PENDING = "pending"
+"""字节已落盘、页/行还没切出来。中断的上传根本不会留下 `intake_files` 行
+（摘要要等字节收完才算得出），所以「传了一半」在这套表里的表现是**这个文件不在
+批次里**，重传即可；`pending` 说的是另一件事：文件在了，等处理。"""
+INTAKE_FILE_STATUS_READY = "ready"
+"""已切出可归类内容，`item_count` 是切出来的个数。"""
+INTAKE_FILE_STATUS_FAILED = "failed"
+"""解析失败。原件字节与同批次其它文件一概不动——一个坏文件不该让整批重传。"""
+INTAKE_FILE_STATUS_DISCARDED = "discarded"
+"""用户把这个文件从批次里撤掉了（文件回收）。行**保留**作为痕迹，读取路径默认
+排除它；那份字节是否能删，取决于有没有别的批次还引用着它。"""
+INTAKE_FILE_STATUSES = (
+    INTAKE_FILE_STATUS_PENDING,
+    INTAKE_FILE_STATUS_READY,
+    INTAKE_FILE_STATUS_FAILED,
+    INTAKE_FILE_STATUS_DISCARDED,
+)
+
+# 可归类内容来自哪一种原件：图片/PDF 按**页**，CSV/XLSX 按**行**。
+INTAKE_ITEM_KIND_MAX_LENGTH = 8
+INTAKE_ITEM_KIND_PAGE = "page"
+INTAKE_ITEM_KIND_ROW = "row"
+INTAKE_ITEM_KINDS = (INTAKE_ITEM_KIND_PAGE, INTAKE_ITEM_KIND_ROW)
+
+# 候选针对哪个分类维度。只有这两个——docs/multifiles.md 第 1 节：分类只有实际采购
+# 日期与商家来源两个业务维度，文件名与页序只是线索。
+INTAKE_CANDIDATE_FIELD_MAX_LENGTH = 16
+INTAKE_CANDIDATE_FIELD_PURCHASE_DATE = "purchase_date"
+INTAKE_CANDIDATE_FIELD_SOURCE_NAME = "source_name"
+INTAKE_CANDIDATE_FIELDS = (
+    INTAKE_CANDIDATE_FIELD_PURCHASE_DATE,
+    INTAKE_CANDIDATE_FIELD_SOURCE_NAME,
+)
+
+# 候选的依据，对应 docs/multifiles.md 第 3.2 节分的四层线索。
+# ⚠️ 这个词表**没有数据库 CHECK 约束**：它是 M05 / M07 的识别与建议逻辑在扩展的
+# 词表，加一个依据不该要求重建一张表（SQLite 改 CHECK 必须批处理重建）。取值由
+# services/intake.py 用上面这组常量校验，越界直接报错而不是静默写进去。
+INTAKE_CANDIDATE_BASIS_MAX_LENGTH = 24
+INTAKE_CANDIDATE_BASIS_PAPER = "paper"
+"""纸面直接读出（第一层）：带原文与页码证据。"""
+INTAKE_CANDIDATE_BASIS_SAME_FILE = "same_file"
+"""同文件参考（第二层）：同一文件别的页已确认了商家。单页写着别的来源时，单页证据优先。"""
+INTAKE_CANDIDATE_BASIS_HISTORY = "history"
+"""历史来源与别名（第三层）：用户确认过的写法。只建议，不自动合并两个不同商家。"""
+INTAKE_CANDIDATE_BASIS_SIMILAR_LAYOUT = "similar_layout"
+"""相似外观的待办堆（第四层）：版式特征相近。⚠️ 版式相似**不证明**商家相同
+（第 2 节的两篇研究），所以它只够形成一堆待人工命名的候选。"""
+INTAKE_CANDIDATE_BASES = (
+    INTAKE_CANDIDATE_BASIS_PAPER,
+    INTAKE_CANDIDATE_BASIS_SAME_FILE,
+    INTAKE_CANDIDATE_BASIS_HISTORY,
+    INTAKE_CANDIDATE_BASIS_SIMILAR_LAYOUT,
+)
+
+# 一个可归类内容的**识别处理状态**（多文件计划 M05）。
+#
+# ⚠️ 为什么需要这一列，而不是「有没有候选」就够了：识别跑完**没读出商家**与
+# **根本还没跑过**，在候选表上长得一模一样（都是 0 条）。分不开这两者，重新打开
+# 批次时就只能把所有没候选的内容再送一遍模型——那是对同一页重复收费。
+#
+# 与 `intake_batch_files.status` 同一条：**状态本身就是队列**，没有第二张任务表
+# （理由见 repositories/intake.py 的 `list_waiting`）。NULL = 还没排到它。
+INTAKE_RECOGNITION_STATUS_MAX_LENGTH = 16
+INTAKE_RECOGNITION_STATUS_PENDING = "pending"
+"""内容已登记、日期/商家识别还没跑。"""
+INTAKE_RECOGNITION_STATUS_DONE = "done"
+"""跑完了。⚠️ **不等于读出了东西**——纸面上本来就没有商家时也是 `done`，
+候选是 0 条。正因为这两件事要分得开，才有这一列。"""
+INTAKE_RECOGNITION_STATUS_FAILED = "failed"
+"""这一个内容识别失败（取不到字节、取不出整页图、模型调用失败）。
+**原件一个字节都不动**，同批次其它内容照常；重试走队列。"""
+INTAKE_RECOGNITION_STATUSES = (
+    INTAKE_RECOGNITION_STATUS_PENDING,
+    INTAKE_RECOGNITION_STATUS_DONE,
+    INTAKE_RECOGNITION_STATUS_FAILED,
+)
+
+# 置信度的小数位数。模型给的是 0—1 的小数（src/contracts.py 的 RecognizedField），
+# 这里按整数最小单位存，理由与金额、数量同一条：SQLite 下的 Numeric 会落成浮点。
+CONFIDENCE_SCALE = 4
+
+# XLSX 的工作表名。现有导入一次只读一张工作表（src/integrations/spreadsheets.py
+# 多表时报错要人选），所以它是**文件引用上的一个值**，不是每一行上的值。
+SHEET_NAME_MAX_LENGTH = 120
+
+# 版式指纹的长度上限（多文件计划 M07）。指纹是一串**人看得懂的**特征拼接
+# （`v1|pdf_scan|ink=non_uniform|rows=16|cols=yes|ar=1.3`），不是哈希：堆的依据
+# 要能直接读出来给人看，哈希只能证明两页一样、说不出为什么一样。
+# 文字层页的字号集合会长一些，120 留足余量。
+LAYOUT_FINGERPRINT_MAX_LENGTH = 200
+
+# 一条来源别名是怎么来的（多文件计划 M07）。
+# ⚠️ 与 `INTAKE_CANDIDATE_BASES` 一样**没有数据库 CHECK**：这是建议层在扩展的
+# 词表，加一种来历不该要求重建一张表。取值由 services/intake_suggestions.py 校验。
+INTAKE_ALIAS_BASIS_MAX_LENGTH = 32
+INTAKE_ALIAS_BASIS_CONFIRMED_READING = "confirmed_paper_reading"
+"""人在某一页上确认了商家，而这一页**纸面读出来的写法**与确认的写法不同。
+于是「纸面这样写 = 这一家」被记下来，下次读到同样的写法就能建议同一家。
+⚠️ 它只是**观察到的事实**，不是「这两个名字是同一家」的裁决——所以可更正。"""
+INTAKE_ALIAS_BASIS_PAPER_BILINGUAL = "paper_bilingual"
+"""同一张纸上同时印了英文名与中文名，人确认了其中一个。另一个写法因此是别名。
+⚠️ 这**不是翻译**：两个写法都印在同一张纸上（docs/multifiles.md 第 3.1 节
+明确禁止把中文自行翻译成英文）。"""
+INTAKE_ALIAS_BASIS_USER = "user"
+"""人直接说的：这个写法就是那一家。优先级最高，重算建议时不会被覆盖。"""
+INTAKE_ALIAS_BASES = (
+    INTAKE_ALIAS_BASIS_CONFIRMED_READING,
+    INTAKE_ALIAS_BASIS_PAPER_BILINGUAL,
+    INTAKE_ALIAS_BASIS_USER,
+)
+
+# CHECK 约束里的取值列表。拼成 SQL 字面量，与上面那几组常量同一处来源——
+# 两边各写一份就会出现「服务层放过、数据库拦住」这类两头不一致。
+_INTAKE_FILE_STATUS_SQL = ", ".join(f"'{value}'" for value in INTAKE_FILE_STATUSES)
+_INTAKE_ITEM_KIND_SQL = ", ".join(f"'{value}'" for value in INTAKE_ITEM_KINDS)
+_INTAKE_CANDIDATE_FIELD_SQL = ", ".join(
+    f"'{value}'" for value in INTAKE_CANDIDATE_FIELDS
+)
+
+
+class IntakeBatch(Base, TimestampMixin):
+    """一次混合上传的整理批次（docs/multifiles.md 第 5 节）。
+
+    **它不是一张发票，也不是一个导入批次。** 它是**工作队列**：十几份混合文件进来，
+    按「实际采购日 + 商家」整理成组，整理好的组再送进现有审核（M08）。同一个批次里
+    可能有好几张真正的发票；单据总额、重复提示与收口确认仍然各自分别处理，
+    **不把同一组的金额合成一张伪发票**。
+
+    状态**派生**，不存列——与 `invoices` 用 `completed_at` / `voided_at` 而不存
+    status 是同一条：`discarded_at` 有值是整批作废，`closed_at` 有值是整理收口，
+    都没有就是还在整理。再存一列 status 就会出现两份能互相矛盾的真相。
+
+    批次**长期留着**：第 5 节明确「允许先处理已经整理好的组，待定内容留在批次里以后
+    再办」，所以没整理完不是异常状态，不设超时自动清理。
+    """
+
+    __tablename__ = "intake_batches"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    closed_at: Mapped[Optional[datetime]] = mapped_column(UtcDateTime)
+    discarded_at: Mapped[Optional[datetime]] = mapped_column(UtcDateTime)
+
+    files: Mapped[list["IntakeBatchFile"]] = relationship(
+        back_populates="batch",
+        cascade="all, delete-orphan",
+        order_by="IntakeBatchFile.upload_order, IntakeBatchFile.id",
+    )
+
+    def __repr__(self) -> str:
+        return f"IntakeBatch(id={self.id!r}, closed_at={self.closed_at!r})"
+
+
+class IntakeFile(Base):
+    """一份原件的字节，按内容摘要**一行一份**（第 5 节「原件字节只存一次」）。
+
+    这张表里**没有文件名、没有批次、没有页序**：同一份字节在不同批次里可以被叫成
+    不同的文件名，那些都属于 `intake_batch_files`。这里只有「这份字节是什么、存在
+    哪里」。
+
+    `sha256` 与 `storage_key` 都唯一：一份字节一行，一行一个存储位置。于是「同一份
+    PDF 出现在两个批次」= 一行 `intake_files` + 两行 `intake_batch_files`，磁盘上
+    只有一份。
+
+    ⚠️ **与 `invoice_files` 的关系：两张表并存，谁也不改谁。** `invoice_files`
+    的 `sha256` 全局唯一是步骤 05 定下的「完全相同的文件不许重复上传」那条规则的
+    落点，而且它的 `invoice_id` 非空——一份文件只属于一张单据。整理批次需要的是
+    「一份文件的不同页属于不同组」，两者的约束方向相反，所以**不去放宽
+    `invoice_files` 的唯一索引**：放宽它会让旧单张上传路径的重复拦截失效，而那是
+    一条有测试、有文档、老板每天在用的规则。批次路径与旧上传路径的跨路径重复
+    因此只作**提示**（services/intake.py 的 `register_file` 会报出同摘要的旧单据
+    id），不互相阻断。
+
+    没有 updated_at：字节只新增与删除，不修改（与 `invoice_files` 同一条）。
+    """
+
+    __tablename__ = "intake_files"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    storage_key: Mapped[str] = mapped_column(
+        String(STORAGE_KEY_MAX_LENGTH), nullable=False, unique=True
+    )
+    sha256: Mapped[str] = mapped_column(
+        String(SHA256_LENGTH), nullable=False, unique=True
+    )
+    size: Mapped[int] = mapped_column(Integer, nullable=False)
+    content_type: Mapped[Optional[str]] = mapped_column(String(CONTENT_TYPE_MAX_LENGTH))
+    created_at: Mapped[datetime] = mapped_column(
+        UtcDateTime, nullable=False, default=utcnow
+    )
+
+    def __repr__(self) -> str:
+        return f"IntakeFile(id={self.id!r}, sha256={self.sha256[:12]!r})"
+
+
+class IntakeBatchFile(Base, TimestampMixin):
+    """某个批次对某份原件的引用：上传时叫什么、排第几、处理到哪一步。
+
+    `(batch_id, intake_file_id)` 唯一——**同一批次里同一份字节只能进来一次**。
+    老板一次拖进来的十几个文件里有两份是同一张照片时，第二份撞在这个约束上，
+    接口回 409 并指回批次里已有的那一条，而不是让同一页在整理页上出现两张卡片。
+    跨批次不拦：同一份 CSV 下个月又传了一次是正常操作，但 `register_file` 会把
+    「这份字节还在哪些批次里」一并报出来，M04 据此提示而不是静默再建一批采购记录。
+
+    `item_count` 是**解析出多少个可归类内容**，不叫 page_count：PDF 按页、图片
+    一张算一个、表格按行，三者是同一个计数。它在 `status` 变成 `ready` 时写一次，
+    与 `intake_items` 的实际行数由同一个事务保证一致。
+
+    `sheet_name` 只对 XLSX 有值：现有表格导入一次只读一张工作表
+    （`src/integrations/spreadsheets.py` 多表时报错要人选），所以「读的是哪张表」
+    是这条引用上的一个事实，不必在每一行上重复一遍。
+
+    删掉一个批次会级联删掉它的引用与内容，但**不会**删 `intake_files` 的行——
+    那份字节可能还有别的批次在用。字节的实际回收由 Service 在确认没有其它引用之后
+    决定，不靠级联。
+    """
+
+    __tablename__ = "intake_batch_files"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    batch_id: Mapped[int] = mapped_column(
+        ForeignKey("intake_batches.id"), nullable=False, index=True
+    )
+    intake_file_id: Mapped[int] = mapped_column(
+        ForeignKey("intake_files.id"), nullable=False, index=True
+    )
+    original_name: Mapped[str] = mapped_column(
+        String(UPLOAD_NAME_MAX_LENGTH), nullable=False
+    )
+    upload_order: Mapped[int] = mapped_column(Integer, nullable=False)
+    status: Mapped[str] = mapped_column(
+        String(INTAKE_FILE_STATUS_MAX_LENGTH),
+        nullable=False,
+        default=INTAKE_FILE_STATUS_PENDING,
+        index=True,
+    )
+    item_count: Mapped[Optional[int]] = mapped_column(Integer)
+    sheet_name: Mapped[Optional[str]] = mapped_column(String(SHEET_NAME_MAX_LENGTH))
+    table_metadata: Mapped[Optional[str]] = mapped_column(Text)
+    error_code: Mapped[Optional[str]] = mapped_column(String(ERROR_CODE_MAX_LENGTH))
+    error_message: Mapped[Optional[str]] = mapped_column(
+        String(ERROR_MESSAGE_MAX_LENGTH)
+    )
+    discarded_at: Mapped[Optional[datetime]] = mapped_column(UtcDateTime)
+
+    batch: Mapped[IntakeBatch] = relationship(back_populates="files")
+    file: Mapped[IntakeFile] = relationship()
+    items: Mapped[list["IntakeItem"]] = relationship(
+        back_populates="batch_file",
+        cascade="all, delete-orphan",
+        order_by="IntakeItem.page_no, IntakeItem.row_no, IntakeItem.id",
+    )
+
+    __table_args__ = (
+        UniqueConstraint("batch_id", "intake_file_id"),
+        CheckConstraint(f"status in ({_INTAKE_FILE_STATUS_SQL})", name="status"),
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"IntakeBatchFile(id={self.id!r}, batch_id={self.batch_id!r}, "
+            f"original_name={self.original_name!r}, status={self.status!r})"
+        )
+
+
+class IntakeItem(Base, TimestampMixin):
+    """一个**可归类内容**：PDF 的一页、一张图片，或表格的一行。
+
+    这是整理页上的一张卡片，也是分组的最小单位。**一份文件的不同页可以落到不同的
+    日期/商家组**，这正是现有 `invoice_files`（一份文件属于一张单据）表达不了的
+    那件事。
+
+    `page_no` / `row_no` 是**回看原件的坐标**：页内容记 1 起的页号（单张图片就是
+    第 1 页），表格行记原表格行号。两者由 CHECK 约束守着——`page` 必须有页号且没有
+    行号，`row` 反之。留一个两边都能填的通用列会让「这张卡片指的是哪里」变成要看
+    代码才知道的事。
+
+    `decided_*` 是**人确认过的分类值**，也是组的唯一来源：
+
+    - 拖到日期标题：只写 `decided_purchase_date`，商家仍然空着 → 它落在那一天的
+      「商家待定」里。
+    - 拖到某日期下的商家卡片：两个值一起写。
+    - 两个都空：还在左侧待归类区。
+
+    所以「系统建议」永远不在这几列里——建议在 `intake_item_candidates`。界面可以把
+    高可信候选**显示**在相应组里，但那一格必须说明它还没被人确认
+    （docs/multifiles.md 第 4 节）。`decided_source_name_normalized` 与
+    `invoices` / `purchases` 上那两列同一个口径（Costco 与 COSTCO 是同一家），
+    于是整理阶段的分组与已确认采购记录的来源比较不会分成两套写法。
+
+    `version` 是乐观锁，和 `invoice_lines.version` 同一个用途：整理页支持批量移动，
+    两个会话（手机和电脑）同时移动同一张卡片时，后一个带着旧版本号来就被拦住，
+    而不是悄悄覆盖——第 4 节要求的「用版本号提示冲突，不默默覆盖」就是这一列。
+
+    `decided_at` 记最后一次人工分类的时刻。`updated_at` 任何写入都会动，区分不出
+    「人改的」还是「系统补了候选」。
+    """
+
+    __tablename__ = "intake_items"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    batch_file_id: Mapped[int] = mapped_column(
+        ForeignKey("intake_batch_files.id"), nullable=False, index=True
+    )
+    kind: Mapped[str] = mapped_column(
+        String(INTAKE_ITEM_KIND_MAX_LENGTH), nullable=False
+    )
+    page_no: Mapped[Optional[int]] = mapped_column(Integer)
+    row_no: Mapped[Optional[int]] = mapped_column(Integer)
+    row_data: Mapped[Optional[str]] = mapped_column(Text)
+
+    # --- M05：识别处理状态与保存下来的原文 ---------------------------------
+    #
+    # `recognition_status` 为 NULL 表示还没排到它（见上面那组常量）。
+    # ⚠️ 这一列**没有 CHECK 约束**，与 `IntakeItemCandidate.basis` 同一条理由：
+    # SQLite 改 CHECK 必须批处理重建整张表，而这张表上有两条带 WHERE 的局部唯一
+    # 索引（`uq_intake_items_page` / `uq_intake_items_row`），重建时把 WHERE 丢掉
+    # 的代价远大于一条 CHECK 带来的好处。取值由 services/intake.py 校验。
+    recognition_status: Mapped[Optional[str]] = mapped_column(
+        String(INTAKE_RECOGNITION_STATUS_MAX_LENGTH), index=True
+    )
+    recognized_at: Mapped[Optional[datetime]] = mapped_column(UtcDateTime)
+    # 一列 JSON：这一页/这一行**读出来的原文**、出处（页码或单元格）、用了哪个
+    # provider / 哪几个模型 / 哪版提示词，以及歧义日期的两种读法。
+    #
+    # 它存在的理由有两条，都来自 docs/multifiles.md M05：
+    # ① **商家确认之后要用保存的日期原文重新解析**（`6/11/2026` 配上这家的
+    #    `date_order`），不必为此再 OCR 一次——所以原文必须落库，不能只活在候选里
+    #    （解析不出来的日期根本不会产生候选，原文就丢了）。
+    # ② **整理阶段已有的识别结果进入审核时不得重复收费**——所以这里连行项目一起
+    #    存下来，M08 据此建草稿。⚠️ 它是**候选那一轮**的产出（只跑了内容这一轮），
+    #    payload 里的 `purpose` / `rounds` 说明了这一点：手写件在步骤 08 还有一轮
+    #    结构提问与格线行容量，M08 不能把这份结果当成已经过那几层校验。
+    recognition_payload: Mapped[Optional[str]] = mapped_column(Text)
+    recognition_error_code: Mapped[Optional[str]] = mapped_column(
+        String(ERROR_CODE_MAX_LENGTH)
+    )
+    recognition_error_message: Mapped[Optional[str]] = mapped_column(
+        String(ERROR_MESSAGE_MAX_LENGTH)
+    )
+
+    decided_purchase_date: Mapped[Optional[date]] = mapped_column(Date)
+    decided_source_name: Mapped[Optional[str]] = mapped_column(
+        String(SOURCE_NAME_MAX_LENGTH)
+    )
+    decided_source_name_normalized: Mapped[Optional[str]] = mapped_column(
+        String(SOURCE_NAME_MAX_LENGTH), index=True
+    )
+    decided_at: Mapped[Optional[datetime]] = mapped_column(UtcDateTime)
+    version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    # M08 交给正式审核时写入；整理命令从此不得只移动卡片。
+    handed_off_at: Mapped[Optional[datetime]] = mapped_column(UtcDateTime)
+    pile_excluded: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="0")
+
+    # --- M07：版式指纹（相似堆的分组键） -----------------------------------
+    #
+    # 两列都是**本地测量的缓存**，不是业务决定：`documents/layout.py` 用 pypdf 与
+    # Pillow 量这一页的笔迹风格、格线行数、长宽比（或文字层的页面尺寸与字号集合），
+    # 算出一个分组键。存下来的理由是**代价**：一页约 0.3—0.6 秒，而「历史上有哪些
+    # 版式」要跨批次查几百页。字节本身按 sha256 寻址、永不修改，所以这份测量不会
+    # 过期——这与「标准化价格不落列」不冲突：那一列会随箱规变化而悄悄过期，这一列
+    # 的输入是不可变的字节。
+    #
+    # ⚠️ **版式相同不证明商家相同**（docs/multifiles.md 第 2 节的两篇研究）。
+    # 这一列只够把读不出商家的页聚成一堆待人确认，`services/intake_suggestions.py`
+    # 一个字都不会据此写进 `decided_*`。NULL = 还没量过（量不出来的页也留 NULL，
+    # 原因写在 `layout_features.problem` 里，于是「没量过」与「量不出来」分得开）。
+    layout_fingerprint: Mapped[Optional[str]] = mapped_column(
+        String(LAYOUT_FINGERPRINT_MAX_LENGTH), index=True
+    )
+    layout_features: Mapped[Optional[str]] = mapped_column(Text)
+
+    batch_file: Mapped[IntakeBatchFile] = relationship(back_populates="items")
+    candidates: Mapped[list["IntakeItemCandidate"]] = relationship(
+        back_populates="item",
+        cascade="all, delete-orphan",
+        order_by="IntakeItemCandidate.field, IntakeItemCandidate.id",
+    )
+
+    __table_args__ = (
+        CheckConstraint(f"kind in ({_INTAKE_ITEM_KIND_SQL})", name="kind"),
+        # 页内容有页号没行号，表格行反之。两种内容的「坐标」不许混填，否则
+        # 「回看原件」会拿到一个解释不了的位置。
+        CheckConstraint(
+            "(kind = 'page' and page_no is not null and row_no is null)"
+            " or (kind = 'row' and row_no is not null and page_no is null)",
+            name="source_ref",
+        ),
+        # 展示名与规范化名同时有或同时无：只存一个的话，要么分组键缺失，要么界面
+        # 上出现一个没人认得的全小写名字。
+        CheckConstraint(
+            "(decided_source_name is null"
+            " and decided_source_name_normalized is null)"
+            " or (decided_source_name is not null"
+            " and decided_source_name_normalized is not null)",
+            name="source_name_pair",
+        ),
+        # 同一个文件里一页只能有一个内容、一行也只能有一个内容。写成两条局部唯一
+        # 索引而不是一条 UniqueConstraint：另一半的列是 NULL，而 SQLite 的唯一索引
+        # 把多个 NULL 视为互不相同，一条约束根本拦不住重复
+        # （手法与 pack_specs 的两条局部索引相同）。
+        Index(
+            "uq_intake_items_page",
+            "batch_file_id",
+            "page_no",
+            unique=True,
+            sqlite_where=text("kind = 'page'"),
+        ),
+        Index(
+            "uq_intake_items_row",
+            "batch_file_id",
+            "row_no",
+            unique=True,
+            sqlite_where=text("kind = 'row'"),
+        ),
+    )
+
+    def __repr__(self) -> str:
+        where = (
+            f"page={self.page_no!r}"
+            if self.kind == INTAKE_ITEM_KIND_PAGE
+            else f"row={self.row_no!r}"
+        )
+        return (
+            f"IntakeItem(id={self.id!r}, batch_file_id={self.batch_file_id!r}, "
+            f"{where}, date={self.decided_purchase_date!r}, "
+            f"source={self.decided_source_name!r})"
+        )
+
+
+class IntakeReviewLink(Base):
+    """One classified page or spreadsheet row belongs to one review draft.
+
+    The original bytes stay in intake_files. This link is the durable idempotency
+    key and lets one PDF contribute different pages to different invoices.
+    """
+
+    __tablename__ = "intake_review_links"
+
+    item_id: Mapped[int] = mapped_column(
+        ForeignKey("intake_items.id"), primary_key=True
+    )
+    invoice_id: Mapped[int] = mapped_column(
+        ForeignKey("invoices.id"), nullable=False, index=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        UtcDateTime, nullable=False, default=utcnow
+    )
+
+    item: Mapped[IntakeItem] = relationship()
+    invoice: Mapped[Invoice] = relationship()
+
+
+class IntakeItemCandidate(Base):
+    """一条**系统建议**：这个内容的日期或商家可能是什么，依据是什么。
+
+    候选与人工决定分开存，是 docs/multifiles.md 第 4 节那条「必须保留系统建议／
+    人工确认的区别」在结构上的落点。候选**从不自动变成决定**：它只负责让界面能说
+    出「纸面读出」「参考同文件」「与历史单据外观相似」这几句话，并让老板一眼看出
+    该不该接受。
+
+    同一个 `(item_id, field)` 可以有多条候选——纸面读出一个、历史写法建议另一个，
+    恰恰是老板需要看见的分歧。因此这里**没有**唯一约束；重算建议时由 Service 按
+    `(item_id, field, basis)` 整组替换，不做「叠加一层新建议」。
+
+    `value` 是候选的**展示值**（日期用 ISO 文本，商家用纸面写法）；
+    `value_normalized` 只有商家候选才有，与 `intake_items` 的分组键同一个口径。
+    日期不另存规范化值：ISO 文本本身就是规范形式。
+
+    `evidence` 是一列 JSON：原文、页码、可得的区域坐标、依据说明、哪个模型给的。
+    与 `invoice_lines.raw_fields` 同一个道理——它只被原样读出来给人看，不参与查询、
+    排序与统计。
+
+    没有 updated_at：候选是重算后整组替换的，不原地修改。
+    """
+
+    __tablename__ = "intake_item_candidates"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    item_id: Mapped[int] = mapped_column(ForeignKey("intake_items.id"), nullable=False)
+    field: Mapped[str] = mapped_column(
+        String(INTAKE_CANDIDATE_FIELD_MAX_LENGTH), nullable=False
+    )
+    value: Mapped[str] = mapped_column(String(SOURCE_NAME_MAX_LENGTH), nullable=False)
+    value_normalized: Mapped[Optional[str]] = mapped_column(
+        String(SOURCE_NAME_MAX_LENGTH)
+    )
+    basis: Mapped[str] = mapped_column(
+        String(INTAKE_CANDIDATE_BASIS_MAX_LENGTH), nullable=False
+    )
+    confidence: Mapped[Optional[Decimal]] = mapped_column(
+        DecimalAsInteger(CONFIDENCE_SCALE)
+    )
+    evidence: Mapped[Optional[str]] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(
+        UtcDateTime, nullable=False, default=utcnow
+    )
+
+    item: Mapped[IntakeItem] = relationship(back_populates="candidates")
+
+    __table_args__ = (
+        CheckConstraint(f"field in ({_INTAKE_CANDIDATE_FIELD_SQL})", name="field"),
+        # 读取路径一律是「这个内容这个维度的候选」，所以索引是这个复合键；
+        # item_id 在最左，顺带替掉单列外键索引。
+        Index("ix_intake_item_candidates_item_field", "item_id", "field"),
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"IntakeItemCandidate(id={self.id!r}, item_id={self.item_id!r}, "
+            f"field={self.field!r}, value={self.value!r}, basis={self.basis!r})"
+        )
+
+
+class IntakeMove(Base):
+    """M06 的一次原子批量归组；request_key 使重发可安全回放。"""
+
+    __tablename__ = "intake_moves"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    batch_id: Mapped[int] = mapped_column(ForeignKey("intake_batches.id"), nullable=False, index=True)
+    request_key: Mapped[str] = mapped_column(String(80), nullable=False)
+    request_signature: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(UtcDateTime, nullable=False, default=utcnow)
+    undone_at: Mapped[Optional[datetime]] = mapped_column(UtcDateTime)
+    entries: Mapped[list["IntakeMoveEntry"]] = relationship(
+        back_populates="move", cascade="all, delete-orphan", order_by="IntakeMoveEntry.id"
+    )
+
+    __table_args__ = (UniqueConstraint("batch_id", "request_key"),)
+
+
+class IntakeMoveEntry(Base):
+    """受影响内容的前后快照；撤销只恢复本次改动的字段。"""
+
+    __tablename__ = "intake_move_entries"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    move_id: Mapped[int] = mapped_column(ForeignKey("intake_moves.id"), nullable=False, index=True)
+    item_id: Mapped[int] = mapped_column(ForeignKey("intake_items.id"), nullable=False, index=True)
+    before_date: Mapped[Optional[date]] = mapped_column(Date)
+    before_source: Mapped[Optional[str]] = mapped_column(String(SOURCE_NAME_MAX_LENGTH))
+    before_decided_at: Mapped[Optional[datetime]] = mapped_column(UtcDateTime)
+    before_pile_excluded: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    after_version: Mapped[int] = mapped_column(Integer, nullable=False)
+
+    move: Mapped[IntakeMove] = relationship(back_populates="entries")
+    item: Mapped[IntakeItem] = relationship()
+
+    __table_args__ = (UniqueConstraint("move_id", "item_id"),)
+
+
+class IntakeSourceAlias(Base, TimestampMixin):
+    """商家记忆：**纸面上的一种写法 → 人确认过的那一家**（多文件计划 M07）。
+
+    ⚠️ **这不是供应商主数据，更不是应付账款的供应商模块**（M07 自己的措辞）。
+    这里没有联系人、地址、账期、商品目录——与 `ocr_routes`「只有来源名 → 走哪条
+    路」同一条：一张表只回答一个问题。本表回答的是
+    「`COSTCO WHOLESALE #1162` 这种写法以前被确认成哪一家」。
+
+    ### 为什么这一张表要落库，而「这一家叫什么」不落库
+
+    - **别名映射落库**：它是人的决定，推不出来，而且必须**可更正**
+      （docs/multifiles.md 第 5 节：「来源别名/模板记忆需要有独立、可更正的
+      映射」）。虽然「哪些写法被改成了哪一家」能从历史内容里*猜*出来，但猜出来的
+      东西没法删——而一条错别名会在之后每一批里不停建议错的那一家。
+    - **规范化名与展示写法不落库**：「这个规范化键现在显示成什么名字」是
+      `intake_items.decided_source_name` / `purchases.source_name` 聚合出来的
+      派生值（最近一次人工确认的写法），与「日期/商家组不落表」同一条。本表只
+      存 `source_name` 作为**记下这条别名那一刻**的展示写法，供核对，不当成
+      当前名字的来源。
+    - **版式记忆也不落表**：「这个版式属于哪一家」由
+      `intake_items.layout_fingerprint` + 该页上的人工确认派生。要更正它，改那页的
+      确认即可——不会出现「版式表说是 A、页上确认的是 B」两份打架的真相。
+
+    `alias_key` 唯一：一种写法只能指向一家，否则建议层就得在两个答案之间猜。
+    要改指向就更新这一行（`basis` 变成 `user`），要撤销就删掉它。
+
+    CHECK 守着 `alias_key <> source_key`：一条指向自己的别名没有任何信息量，
+    但会让「这个写法是别名」的判断永远为真。
+    """
+
+    __tablename__ = "intake_source_aliases"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    alias_key: Mapped[str] = mapped_column(
+        String(SOURCE_NAME_MAX_LENGTH), nullable=False, unique=True
+    )
+    alias_text: Mapped[str] = mapped_column(
+        String(SOURCE_NAME_MAX_LENGTH), nullable=False
+    )
+    source_key: Mapped[str] = mapped_column(
+        String(SOURCE_NAME_MAX_LENGTH), nullable=False, index=True
+    )
+    source_name: Mapped[str] = mapped_column(
+        String(SOURCE_NAME_MAX_LENGTH), nullable=False
+    )
+    basis: Mapped[str] = mapped_column(
+        String(INTAKE_ALIAS_BASIS_MAX_LENGTH), nullable=False
+    )
+    evidence: Mapped[Optional[str]] = mapped_column(Text)
+
+    __table_args__ = (
+        CheckConstraint("alias_key <> source_key", name="alias_not_self"),
+    )
+
+    def __repr__(self) -> str:
+        return (
+            f"IntakeSourceAlias(alias_key={self.alias_key!r}, "
+            f"source_key={self.source_key!r}, basis={self.basis!r})"
         )

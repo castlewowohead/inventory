@@ -162,6 +162,7 @@ from src.normalization import (
 from src.repositories.extraction import ExtractionJobRepository, OcrRouteRepository
 from src.repositories.ingredients import CategoryRepository, FoodItemRepository
 from src.repositories.invoices import InvoiceRepository
+from src.repositories.intake_reviews import IntakeReviewRepository
 from src.repositories.purchases import PurchaseRepository
 from src.services.ingredients import (
     BASE_UNITS,
@@ -433,6 +434,9 @@ class ExtractionService:
         """
         with self._database.unit_of_work() as session:
             invoice = self._load_invoice(session, invoice_id)
+            if IntakeReviewRepository(session).links_for_invoice(invoice_id):
+                raise ConflictError("这张草稿来自整理批次，已复用保存的识别证据；请在审核中修正，不要重复提取。",
+                                    details={"invoice_id": invoice_id})
             repository = ExtractionJobRepository(session)
             active = repository.active_for_invoice(invoice_id)
             if active is not None:
@@ -1296,7 +1300,9 @@ class ExtractionService:
         plan.header = self._header_from(
             result, date_order=date_order, suppress=prefill == PREFILL_SUPPRESSED_HANDWRITTEN
         )
-        plan.raw_document_fields = self._raw_document_json(result, doc_class=doc_class)
+        plan.raw_document_fields = self._raw_document_json(
+            result, doc_class=doc_class, outcome=outcome
+        )
 
         for offset, line in enumerate(result.lines):
             if offset >= row_cap:
@@ -1893,7 +1899,9 @@ class ExtractionService:
                     header["invoice_total"] = parsed
         date_text = _text_of(result.document_field(FIELD_INVOICE_DATE))
         if date_text:
-            normalized_date = normalize_date_text(date_text, date_order=date_order)
+            normalized_date = normalize_date_text(
+                date_text, date_order=date_order, allow_short_year=True
+            )
             if normalized_date.ok:
                 header["invoice_date"] = normalized_date.text
         supplier = _text_of(result.document_field(FIELD_SUPPLIER))
@@ -1904,7 +1912,10 @@ class ExtractionService:
             header["currency"] = currency.strip().upper()
         return header
 
-    def _raw_document_json(self, result: RecognitionResult, *, doc_class: str) -> str:
+    def _raw_document_json(
+        self, result: RecognitionResult, *, doc_class: str,
+        outcome: CrossCheckOutcome | None = None,
+    ) -> str:
         return json.dumps(
             {
                 "provider": result.provider,
@@ -1918,6 +1929,11 @@ class ExtractionService:
                         "raw_text": found.raw_text,
                         "confidence": found.confidence,
                         "page": found.page,
+                        "box": _box_payload(found)[0],
+                        "model_values": list(outcome.agreements[name].values)
+                        if outcome is not None and name in outcome.agreements else [],
+                        "agreement": outcome.agreements[name].note
+                        if outcome is not None and name in outcome.agreements else None,
                     }
                     for name in DOCUMENT_FIELDS
                     if (found := result.document_field(name)) is not None

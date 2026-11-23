@@ -20,7 +20,15 @@ from typing import NamedTuple, Sequence
 from sqlalchemy import Select, case, func, select
 from sqlalchemy.orm import Session, joinedload
 
-from src.models import Category, FoodItem, FoodItemMerge, Purchase
+from src.models import (
+    LINE_STATUS_CONFIRMED,
+    Category,
+    FoodItem,
+    FoodItemMerge,
+    InvoiceLine,
+    PackSpec,
+    Purchase,
+)
 
 # 搜索结果的排序档位。精确命中排在前缀命中之前，前缀命中排在"仅出现在某处"之前；
 # 同档内按规范化名称排序，保证分页结果稳定（否则同一个 offset 两次请求可能不同）。
@@ -234,6 +242,65 @@ class FoodItemRepository:
 
     def delete(self, food_item: FoodItem) -> None:
         self._session.delete(food_item)
+        self._session.flush()
+
+    def reference_counts(self, food_item_id: int) -> dict[str, int]:
+        """Count direct references before deciding whether deletion is allowed."""
+
+        def count(model, *conditions) -> int:
+            statement = select(func.count()).select_from(model).where(*conditions)
+            return int(self._session.scalar(statement) or 0)
+
+        return {
+            "purchases": count(Purchase, Purchase.food_item_id == food_item_id),
+            "manual_purchases": count(
+                Purchase,
+                Purchase.food_item_id == food_item_id,
+                Purchase.entry_source == "manual",
+            ),
+            "voided_purchases": count(Purchase, Purchase.food_item_id == food_item_id, Purchase.voided_at.is_not(None)),
+            "invoice_linked_purchases": count(
+                Purchase,
+                Purchase.food_item_id == food_item_id,
+                Purchase.invoice_line_id.is_not(None),
+            ),
+            "invoice_lines": count(InvoiceLine, InvoiceLine.food_item_id == food_item_id),
+            "confirmed_invoice_lines": count(
+                InvoiceLine,
+                InvoiceLine.food_item_id == food_item_id,
+                InvoiceLine.status == LINE_STATUS_CONFIRMED,
+            ),
+            "pack_specs": count(PackSpec, PackSpec.food_item_id == food_item_id),
+            "merge_history": count(FoodItemMerge, FoodItemMerge.target_food_item_id == food_item_id),
+        }
+
+    def clear_unlinked_history(self, food_item_id: int) -> None:
+        """Remove standalone history and release draft references before deletion."""
+        for line in self._session.scalars(
+            select(InvoiceLine).where(InvoiceLine.food_item_id == food_item_id)
+        ):
+            if line.status != LINE_STATUS_CONFIRMED:
+                line.food_item_id = None
+                line.version += 1
+
+        for purchase in self._session.scalars(
+            select(Purchase).where(
+                Purchase.food_item_id == food_item_id,
+                Purchase.invoice_line_id.is_(None),
+            )
+        ):
+            self._session.delete(purchase)
+
+        for spec in self._session.scalars(
+            select(PackSpec).where(PackSpec.food_item_id == food_item_id)
+        ):
+            self._session.delete(spec)
+
+        for merge in self._session.scalars(
+            select(FoodItemMerge).where(FoodItemMerge.target_food_item_id == food_item_id)
+        ):
+            self._session.delete(merge)
+
         self._session.flush()
 
 

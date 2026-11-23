@@ -8,3 +8,5 @@
 /backend/docs/*
 !/backend/docs/struct.md
 !/backend/docs/deploy.md
+!/backend/docs/multifiles.md
+!/backend/docs/multifiles-wireframe.png

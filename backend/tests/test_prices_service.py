@@ -14,7 +14,7 @@
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, timedelta
 from decimal import Decimal
 
 import pytest
@@ -38,6 +38,8 @@ from src.services.prices import (
     comparable_periods,
     month_start,
     previous_month_start,
+    comparable_weeks,
+    week_start,
 )
 from src.services.purchases import PurchaseService
 
@@ -60,6 +62,36 @@ def last_month() -> date:
 
 def two_months_ago() -> date:
     return previous_month_start(last_month())
+
+
+def test_weekly_comparison_uses_matching_weekdays() -> None:
+    current, previous = comparable_weeks(date(2026, 11, 19))
+    assert (current.date_from, current.date_to, current.days) == (
+        date(2026, 11, 16), date(2026, 11, 19), 4
+    )
+    assert (previous.date_from, previous.date_to, previous.days) == (
+        date(2026, 11, 9), date(2026, 11, 12), 4
+    )
+    assert current.key == "2026-W47" and previous.key == "2026-W46"
+
+
+def test_weekly_prices_keep_monthly_report_available(
+    price_service: PriceService, purchase_service: PurchaseService, food_item
+) -> None:
+    reference = date.today()
+    current_start = week_start(reference)
+    previous_start = current_start - timedelta(weeks=1)
+    record(purchase_service, food_item, purchase_date=previous_start.isoformat(),
+           quantity="10", unit_price="4", line_amount="40")
+    record(purchase_service, food_item, purchase_date=current_start.isoformat(),
+           quantity="10", unit_price="6", line_amount="60")
+    report = price_service.weekly_prices(food_item.id, weeks=3, today=reference)
+    assert len(report.weeks) == 3
+    assert report.weeks[-1].period.date_from == current_start
+    assert report.weeks[-1].weighted_average_unit_price == Decimal("6.0000")
+    assert report.comparison.base.weighted_average_unit_price == Decimal("4.0000")
+    assert report.comparison.change_percent == Decimal("50.00")
+    assert len(price_service.monthly_prices(food_item.id, months=3, today=reference).months) == 3
 
 
 def record(
@@ -233,7 +265,7 @@ def test_unknown_packaging_does_not_enter_standardized_comparison(
     assert "包装规格" in (conversion.reason or "")
     assert page.convertible_count == 0
     assert page.excluded.pending_pack_spec == 1
-    assert any("缺箱规" in note for note in page.notes)
+    assert any("采购单位" in note for note in page.notes)
 
 
 def test_pending_lines_never_reach_the_statistics(

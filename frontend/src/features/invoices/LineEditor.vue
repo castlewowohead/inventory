@@ -27,7 +27,7 @@
 import { computed, nextTick, onUnmounted, ref, watch } from 'vue'
 import {
   addInvoiceLine, ApiError, confirmInvoiceLine, deleteInvoiceLine, errorMessage,
-  getFoodItems, getInvoice, unconfirmInvoiceLine, updateInvoiceLine,
+  getFoodItems, getInvoice, unconfirmInvoiceLine, updateInvoiceLine, userMessage,
   type Invoice, type InvoiceLine
 } from '../../shared/api'
 import { registerLeaveGuard } from '../../shared/platform/leaveGuard'
@@ -35,11 +35,11 @@ import FoodItemMatcher from './FoodItemMatcher.vue'
 import { suggestedValue } from './evidence'
 import {
   changedFields, draftOf, FIELD_LABEL, ISSUE_FIELDS, issuesByField, missingLabel,
-  patchBody, validateDraft,
+  patchBody, plainAmount, validateDraft,
   type DraftField, type LineDraft
 } from './lineDraft'
 
-const props = defineProps<{ invoice: Invoice; line: InvoiceLine }>()
+const props = defineProps<{ invoice: Invoice; line: InvoiceLine; beforeConfirm?: () => Promise<boolean> }>()
 
 const emit = defineEmits<{
   /** The server's new version of this line; the parent replaces its copy. */
@@ -69,7 +69,7 @@ const skipError = ref('')
 const showSkip = ref(false)
 const mismatch = ref<Record<string, unknown> | null>(null)
 /** The draft as it stood when a 409 came back, kept for the comparison panel. */
-const conflict = ref<{ mine: LineDraft; message: string; versions: string | null } | null>(null)
+const conflict = ref<{ mine: LineDraft } | null>(null)
 
 const readOnly = computed(() => props.line.status === 'confirmed' || props.invoice.status === 'voided' || props.invoice.status === 'completed')
 const changed = computed(() => changedFields(draft.value, props.line))
@@ -101,7 +101,10 @@ function suggestion(name: DraftField): string | null {
 function acceptSuggestion(name: DraftField) {
   const value = suggestion(name)
   if (!value) return
-  draft.value[name] = value
+  // 识别出来的是纸面原文（「$1,040.00」），金额框只收 `1040.00`（多文件计划 M12）。
+  draft.value[name] = (MONEY_FIELDS as readonly string[]).includes(name)
+    ? plainAmount(value)
+    : value
   dismissed.value = new Set([...dismissed.value, name])
   activeCandidate.value = candidateFields.find((key) => suggestion(key)) ?? null
 }
@@ -158,7 +161,7 @@ function confirmLeaveLine(): Promise<boolean> {
 defineExpose({ confirmLeaveLine, hasUnsavedEdits: () => dirty.value && !readOnly.value })
 
 /** One PATCH. `extra` lets the food matcher save `food_item_id` alongside the cells. */
-async function patch(extra: Record<string, unknown> = {}, note = '已保存，并已读回服务端的新版本。'): Promise<InvoiceLine | null> {
+async function patch(extra: Record<string, unknown> = {}, note = '已保存这一行。'): Promise<InvoiceLine | null> {
   if (saving.value || readOnly.value) return null
   savedNote.value = ''
   saveError.value = ''
@@ -169,6 +172,7 @@ async function patch(extra: Record<string, unknown> = {}, note = '已保存，�
     return null
   }
   const body = { ...(patchBody(draft.value, props.line) ?? { version: props.line.version }), ...extra }
+  const submitted = { ...draft.value }
   saving.value = true
   try {
     let stored = await updateInvoiceLine(props.invoice.id, props.line.id, body)
@@ -189,10 +193,14 @@ async function patch(extra: Record<string, unknown> = {}, note = '已保存，�
       emit('applied', stored)
     }
     conflict.value = null
-    // The server's stored values win: it may have trimmed or re-formatted them
-    // (`12.345` comes back as `12.345` but `10.0000` reads back as `10`), and the
-    // form must show what is actually stored, not what was typed.
-    draft.value = draftOf(stored)
+    // Apply the server's formatting only to cells unchanged while the request
+    // was in flight. A later manual edit stays in the draft for the next save.
+    const normalized = draftOf(stored)
+    const current = { ...draft.value }
+    for (const key of Object.keys(current) as DraftField[]) {
+      if (current[key] === submitted[key]) current[key] = normalized[key]
+    }
+    draft.value = current
     savedNote.value = note
     mismatch.value = null
     return stored
@@ -201,7 +209,7 @@ async function patch(extra: Record<string, unknown> = {}, note = '已保存，�
     if (error instanceof ApiError) {
       const field = error.details?.field
       if (typeof field === 'string' && field in FIELD_LABEL) {
-        fieldErrors.value = { ...fieldErrors.value, [field as DraftField]: error.message }
+        fieldErrors.value = { ...fieldErrors.value, [field as DraftField]: errorMessage(error) }
       }
       if (error.status === 409) await handleConflict(error)
     }
@@ -210,7 +218,7 @@ async function patch(extra: Record<string, unknown> = {}, note = '已保存，�
 }
 
 function showActionFailure(code: string, message: string, details?: Record<string, unknown>) {
-  actionError.value = message
+  actionError.value = code === 'amount_mismatch' ? '' : userMessage(message)
   mismatch.value = code === 'amount_mismatch' ? details ?? {} : null
   const missing = details?.missing_fields
   if (Array.isArray(missing)) {
@@ -227,6 +235,10 @@ async function confirmLine(acceptMismatch = false) {
   actionError.value = ''
   actionNote.value = ''
   try {
+    if (props.beforeConfirm && !await props.beforeConfirm()) {
+      actionError.value = '请先检查并保存单据信息。'
+      return
+    }
     const stored = dirty.value ? await patch() : props.line
     if (!stored) return
     let existingFoodId: number | null = null
@@ -271,7 +283,7 @@ async function confirmLine(acceptMismatch = false) {
     if (!result?.ok) {
       emit('stored', outcome.invoice, false)
       showActionFailure(result?.error?.code ?? 'unexpected_result',
-        result?.error?.message ?? '确认请求已返回，但没有这一行的成功结果。请重新读取单据。',
+        result?.error?.message ?? '暂时无法确认这一行，请重新读取单据后再试。',
         result?.error?.details)
       return
     }
@@ -282,15 +294,15 @@ async function confirmLine(acceptMismatch = false) {
     try {
       confirmedInvoice = await getInvoice(props.invoice.id)
     } catch (readError) {
-      actionError.value = `已入账，但重新读取“待确认”状态失败：${errorMessage(readError)}。请点“重新读取详情”核对。`
+      actionError.value = `这一行已入账，但页面暂时没更新：${errorMessage(readError)}。请点“重新读取详情”核对。`
     }
     emit('stored', confirmedInvoice, true)
     mismatch.value = null
-    actionNote.value = `第 ${stored.line_no} 行已入账，采购记录 #${result.purchase_id}。`
+    actionNote.value = `第 ${stored.line_no} 行已入账。`
   } catch (error) {
     actionError.value = errorMessage(error)
     if (error instanceof ApiError && error.status === 409) {
-      actionError.value += ' 请重新核对服务端状态。'
+      actionError.value += ' 请重新读取单据后再试。'
       emit('reload')
     }
   } finally { actionBusy.value = false }
@@ -315,7 +327,7 @@ async function skipLine() {
     changedOnServer = true
     emit('stored', await getInvoice(props.invoice.id), true)
     showSkip.value = false
-    actionNote.value = '这一行已跳过；没有生成采购记录。'
+    actionNote.value = '这一行已移除，没有生成采购记录。'
   } catch (error) {
     actionError.value = changedOnServer
       ? `跳过请求已成功，但详情回读失败：${errorMessage(error)}。请点「重新读取详情」核对当前状态。`
@@ -336,7 +348,7 @@ async function restoreLine() {
     })
     changedOnServer = true
     emit('stored', await getInvoice(props.invoice.id), false)
-    actionNote.value = '这一行已退回待核对，跳过原因已清除。'
+    actionNote.value = '这一行已恢复，可以继续核对。'
   } catch (error) {
     actionError.value = changedOnServer
       ? `恢复请求已成功，但详情回读失败：${errorMessage(error)}。请点「重新读取详情」核对当前状态。`
@@ -348,9 +360,9 @@ async function restoreLine() {
 async function unconfirmLine() {
   if (actionBusy.value || props.line.status !== 'confirmed') return
   const ok = await new Promise<boolean>((resolve) => uni.showModal({
-    title: '撤销这行的入账？',
-    content: `第 ${props.line.line_no} 行的采购记录 #${props.line.purchase_id ?? '未知'} 将作废并保留追溯记录；这一行会退回待核对。`,
-    confirmText: '撤销确认', cancelText: '保留入账',
+    title: '修改这行入库记录？',
+    content: `第 ${props.line.line_no} 行原来的入库记录会撤销并保留历史。修改后请重新确认这一行入库。`,
+    confirmText: '继续修改', cancelText: '取消',
     success: (result) => resolve(Boolean(result.confirm)), fail: () => resolve(false)
   }))
   if (!ok) return
@@ -361,7 +373,7 @@ async function unconfirmLine() {
     await unconfirmInvoiceLine(props.invoice.id, props.line.id, props.line.version)
     changedOnServer = true
     emit('stored', await getInvoice(props.invoice.id), false)
-    actionNote.value = '采购记录已作废，这一行已退回待核对。'
+    actionNote.value = '这一行已退回待核对，修改后请重新确认入库。'
   } catch (error) {
     actionError.value = changedOnServer
       ? `撤销请求已成功，但详情回读失败：${errorMessage(error)}。请点「重新读取详情」核对当前状态。`
@@ -377,15 +389,9 @@ async function unconfirmLine() {
  * automatically — the two numbers may both be plausible, and picking one for
  * the user is how the wrong price gets stored without anyone noticing.
  */
-async function handleConflict(error: ApiError) {
-  const expected = error.details?.expected_version
-  const current = error.details?.current_version
+async function handleConflict(_error: ApiError) {
   conflict.value = {
-    mine: { ...draft.value },
-    message: error.message,
-    versions: typeof expected === 'number' && typeof current === 'number'
-      ? `你打开的是第 ${expected} 版，服务端现在是第 ${current} 版。`
-      : null
+    mine: { ...draft.value }
   }
   // Re-reading is the whole point of the 409: the parent gets the current line
   // so "服务端现在的值" below is the server's, not a guess.
@@ -397,13 +403,13 @@ function resolveWithServer() {
   fieldErrors.value = {}
   conflict.value = null
   saveError.value = ''
-  savedNote.value = '已改用服务端的当前值。你刚才的输入已经丢弃。'
+  savedNote.value = '已改用最新保存的内容。你刚才的输入已丢弃。'
 }
 
 function resolveWithMine() {
   draft.value = { ...(conflict.value?.mine ?? draft.value) }
   conflict.value = null
-  void patch({}, '已按服务端的新版本重新保存你的输入。')
+  void patch({}, '已重新保存你的输入。')
 }
 
 function discard() {
@@ -448,6 +454,22 @@ async function removeLine() {
   } finally { deleting.value = false }
 }
 
+async function removeRecognizedLine() {
+  if (readOnly.value || actionBusy.value || props.line.status !== 'pending' || handAdded.value) return
+  const ok = await new Promise<boolean>((resolve) => {
+    uni.showModal({
+      title: '移除多余行？',
+      content: `确定移除第 ${props.line.line_no} 行？`,
+      confirmText: '移除这一行', cancelText: '保留',
+      success: (result) => resolve(Boolean(result.confirm)),
+      fail: () => resolve(false)
+    })
+  })
+  if (!ok) return
+  skipReason.value = '原件没有对应的采购行（多余识别行）'
+  await skipLine()
+}
+
 // A new line means a new draft. Only the id is watched: when the parent swaps in
 // the server's version of the *same* line, the form must keep what is typed.
 watch(() => props.line.id, () => {
@@ -471,28 +493,30 @@ watch(() => props.line.id, () => {
 
 <template>
   <view class="editor">
-    <view v-if="handAdded" class="editor-head">
-      <view class="head-tags"><text class="tag">手工加的行</text></view>
+    <view v-if="line.status === 'pending' && !readOnly" class="editor-head">
+      <view v-if="handAdded" class="head-tags"><text class="tag">手工加的行</text></view>
+      <button v-if="handAdded" class="ui-button secondary remove-row" :disabled="deleting" @click="removeLine">
+        {{ deleting ? '删除中…' : '删掉这一行' }}
+      </button>
+      <button v-else class="ui-button secondary remove-row" :disabled="actionBusy || saving" @click="removeRecognizedLine">移除多余行</button>
     </view>
 
     <view v-if="readOnly" class="note" role="status">
-      <text v-if="invoice.status === 'completed'">这张单据已完成；可回看已入账行和原件，不能在此修改草稿。</text>
+      <text v-if="invoice.status === 'completed'">这张单据已完成。如需更改，请点右上角“修改”。</text>
       <text v-else-if="line.status === 'confirmed'">
-        这一行已经入账（采购记录 #{{ line.purchase_id ?? '未记录' }}），草稿不能再改：改了会让草稿和采购历史两处数字对不上。
-        当前界面尚不支持修改已入账历史值；请通过后端的 PATCH /api/purchases/{{ line.purchase_id }} 修正采购记录（保留修改日志），或先撤销确认再重新审核。
+        这一行已经入账。如需更改，请点下方“修改此行”，改完后重新确认入库。
       </text>
       <text v-else>这张单据已作废，不能再改。</text>
     </view>
     <view v-else-if="line.status === 'skipped'" class="note" role="status">
-      这一行标成了跳过{{ line.skip_reason ? `（原因：${line.skip_reason}）` : '' }}。先改回待核对才能确认入账。
+      这一行已移除{{ line.skip_reason ? `（原因：${line.skip_reason}）` : '' }}。恢复后可以继续核对。
     </view>
 
     <view v-if="conflict" class="conflict" role="alert">
       <text class="conflict-title">这一行被改过了，两边的值不一样</text>
-      <text class="conflict-message">{{ conflict.message }}</text>
-      <text v-if="conflict.versions" class="muted small">{{ conflict.versions }}</text>
+      <text class="conflict-message">这行在你编辑期间发生了变化，请对照原件选择要保留的内容。</text>
       <view class="conflict-table">
-        <view class="conflict-row heading"><text>字段</text><text>你的输入</text><text>服务端现在的值</text></view>
+        <view class="conflict-row heading"><text>项目</text><text>你的输入</text><text>最新保存的内容</text></view>
         <view v-for="key in changedFields(conflict.mine, line)" :key="key" class="conflict-row">
           <text>{{ FIELD_LABEL[key] }}</text>
           <text>{{ conflict.mine[key] || '（空）' }}</text>
@@ -501,8 +525,8 @@ watch(() => props.line.id, () => {
       </view>
       <text class="muted small">两个值都可能看起来是对的，请对着原件选。</text>
       <view class="conflict-actions">
-        <button class="ui-button secondary" @click="resolveWithServer">用服务端的值（丢弃我的输入）</button>
-        <button class="ui-button" @click="resolveWithMine">保留我的输入，按新版本重新保存</button>
+        <button class="ui-button secondary" @click="resolveWithServer">使用最新内容</button>
+        <button class="ui-button" @click="resolveWithMine">保留我的输入并保存</button>
       </view>
     </view>
 
@@ -511,28 +535,28 @@ watch(() => props.line.id, () => {
     </view>
     <view v-if="generalIssues.length" class="issue-block" role="status">
       <text v-for="(issue, index) in generalIssues" :key="`general-${index}`" class="issue-text">
-        待核对（{{ FIELD_LABEL[issue.field as keyof typeof FIELD_LABEL] || issue.field || '未指明字段' }}）：{{ issue.message || issue.code || '服务端标记了一个需要核对的问题' }}
+        待核对（{{ FIELD_LABEL[issue.field as keyof typeof FIELD_LABEL] || '这一项' }}）：{{ issue.message ? userMessage(issue.message) : '请对照原件核对。' }}
       </text>
     </view>
 
     <view class="fields">
       <view class="field">
         <view class="field-label-row"><text class="field-label">{{ FIELD_LABEL.description }}</text><text v-if="suggestion('description')" class="ai-badge">AI 识别 · 待核对</text></view>
-        <input v-model="draft.description" class="ui-input" :disabled="readOnly"
+        <input v-model="draft.description" class="ui-input" :disabled="readOnly || actionBusy"
           :focus="focusField === 'description'" @focus="activeCandidate = 'description'"
           :aria-label="FIELD_LABEL.description" :placeholder="suggestion('description') || ''" />
         <view v-if="suggestion('description') && activeCandidate === 'description'" class="ai-review">
           <text>请对照原件核对</text>
           <view class="ai-actions"><button class="accept" @click="acceptSuggestion('description')">此数据正确</button><button class="edit" @click="editSuggestion('description')">修改</button></view>
         </view>
-        <text v-for="(issue, index) in issues.get('description') ?? []" :key="index" class="issue-text">{{ issue.message }}</text>
+        <text v-for="(issue, index) in issues.get('description') ?? []" :key="index" class="issue-text">{{ userMessage(issue.message || '请核对商品名称。') }}</text>
         <text v-if="fieldErrors.description" class="error-text" role="alert">{{ fieldErrors.description }}</text>
       </view>
 
       <view class="field-grid">
         <view v-for="name in MONEY_FIELDS" :key="name" class="field">
           <view class="field-label-row"><text class="field-label">{{ FIELD_LABEL[name] }}</text><text v-if="suggestion(name)" class="ai-badge">AI 识别 · 待核对</text></view>
-          <input v-model="draft[name]" class="ui-input" :disabled="readOnly" inputmode="decimal"
+          <input v-model="draft[name]" class="ui-input" :disabled="readOnly || actionBusy" inputmode="decimal"
             :focus="focusField === name" @focus="activeCandidate = name"
             :aria-label="FIELD_LABEL[name]" :placeholder="suggestion(name) || ''" />
           <view v-if="suggestion(name) && activeCandidate === name" class="ai-review">
@@ -540,20 +564,20 @@ watch(() => props.line.id, () => {
             <view class="ai-actions"><button class="accept" @click="acceptSuggestion(name)">此数据正确</button><button class="edit" @click="editSuggestion(name)">修改</button></view>
           </view>
           <text v-for="(issue, index) in issues.get(name) ?? []" :key="index" class="issue-text">
-            {{ issue.message }}<template v-if="issue.raw_text">（原文「{{ issue.raw_text }}」）</template>
+            {{ userMessage(issue.message || '请核对这一项。') }}<template v-if="issue.raw_text">（原文「{{ issue.raw_text }}」）</template>
           </text>
           <text v-if="fieldErrors[name]" class="error-text" role="alert">{{ fieldErrors[name] }}</text>
         </view>
         <view class="field">
           <view class="field-label-row"><text class="field-label">{{ FIELD_LABEL.purchase_unit }}</text><text v-if="suggestion('purchase_unit')" class="ai-badge">AI 识别 · 待核对</text></view>
-          <input v-model="draft.purchase_unit" class="ui-input" :disabled="readOnly"
+        <input v-model="draft.purchase_unit" class="ui-input" :disabled="readOnly || actionBusy"
             :focus="focusField === 'purchase_unit'" @focus="activeCandidate = 'purchase_unit'"
             :aria-label="FIELD_LABEL.purchase_unit" :placeholder="suggestion('purchase_unit') || '例如：lb'" />
           <view v-if="suggestion('purchase_unit') && activeCandidate === 'purchase_unit'" class="ai-review">
             <text>请对照原件核对</text>
             <view class="ai-actions"><button class="accept" @click="acceptSuggestion('purchase_unit')">此数据正确</button><button class="edit" @click="editSuggestion('purchase_unit')">修改</button></view>
           </view>
-          <text v-for="(issue, index) in issues.get('purchase_unit') ?? []" :key="index" class="issue-text">{{ issue.message }}</text>
+          <text v-for="(issue, index) in issues.get('purchase_unit') ?? []" :key="index" class="issue-text">{{ userMessage(issue.message || '请核对采购单位。') }}</text>
           <text v-if="fieldErrors.purchase_unit" class="error-text" role="alert">{{ fieldErrors.purchase_unit }}</text>
         </view>
       </view>
@@ -564,23 +588,23 @@ watch(() => props.line.id, () => {
       <view v-if="showOverrides" class="field-grid">
         <view class="field">
           <text class="field-label">{{ FIELD_LABEL.purchase_date }}</text>
-          <input v-model="draft.purchase_date" class="ui-input" :disabled="readOnly"
+          <input v-model="draft.purchase_date" class="ui-input" :disabled="readOnly || actionBusy"
             :aria-label="FIELD_LABEL.purchase_date" placeholder="YYYY-MM-DD；不填跟单据" />
           <text class="muted small">{{ inheritedNote('purchase_date') }}</text>
           <text v-if="fieldErrors.purchase_date" class="error-text" role="alert">{{ fieldErrors.purchase_date }}</text>
         </view>
         <view class="field">
           <text class="field-label">{{ FIELD_LABEL.source_name }}</text>
-          <input v-model="draft.source_name" class="ui-input" :disabled="readOnly"
+          <input v-model="draft.source_name" class="ui-input" :disabled="readOnly || actionBusy"
             :aria-label="FIELD_LABEL.source_name" placeholder="不填跟单据" />
           <text class="muted small">{{ inheritedNote('source_name') }}</text>
           <text v-if="fieldErrors.source_name" class="error-text" role="alert">{{ fieldErrors.source_name }}</text>
         </view>
         <view class="field">
           <text class="field-label">{{ FIELD_LABEL.currency }}</text>
-          <picker :disabled="readOnly" :range="['继承单据头', 'USD', 'CNY']" :value="CURRENCIES.indexOf(draft.currency)"
+          <picker :disabled="readOnly" :range="['与单据相同', 'USD', 'CNY']" :value="CURRENCIES.indexOf(draft.currency)"
             @change="draft.currency = CURRENCIES[Number($event.detail.value)] ?? ''">
-            <view class="ui-input picker-text">{{ draft.currency || '继承单据头' }}</view>
+            <view class="ui-input picker-text">{{ draft.currency || '与单据相同' }}</view>
           </picker>
           <text class="muted small">{{ inheritedNote('currency') }}</text>
         </view>
@@ -618,7 +642,7 @@ watch(() => props.line.id, () => {
         <button class="ui-button secondary" :disabled="addingLine" @click="addBlankLine">
           {{ addingLine ? '正在加…' : '加一行' }}
         </button>
-        <button v-if="handAdded" class="ui-button ghost danger" :disabled="deleting" @click="removeLine">
+        <button v-if="handAdded && line.status === 'skipped'" class="ui-button ghost danger" :disabled="deleting" @click="removeLine">
           {{ deleting ? '删除中…' : '删掉这一行' }}
         </button>
       </view>
@@ -630,8 +654,8 @@ watch(() => props.line.id, () => {
         <text class="emphasis">行金额与数量 × 单价不符</text>
         <text>纸面行金额：{{ mismatch.line_amount ?? '未提供' }}</text>
         <text>数量 × 单价：{{ mismatch.expected ?? '未提供' }}</text>
-        <text>差额：{{ mismatch.difference ?? '未提供' }}（容差 {{ mismatch.tolerance ?? '未提供' }}）</text>
-        <text>请对照原件。继续后将按行金额入账，并标记金额异常。</text>
+        <text>差额：{{ mismatch.difference ?? '未提供' }}（允许误差 {{ mismatch.tolerance ?? '未提供' }}）</text>
+        <text>请对照原件核对。如果原件上的行金额确实如此，可以按这个金额入账。</text>
         <view class="primary-actions">
           <button class="ui-button" :disabled="actionBusy" @click="confirmLine(true)">仍按行金额入账</button>
           <button class="ui-button secondary" :disabled="actionBusy" @click="mismatch = null">返回核对数字</button>
@@ -651,10 +675,10 @@ watch(() => props.line.id, () => {
           <button class="ui-button secondary" :disabled="actionBusy" @click="skipLine">保存跳过原因</button>
         </view>
       </template>
-      <button v-else-if="line.status === 'skipped'" class="ui-button secondary" :disabled="actionBusy" @click="restoreLine">改回待核对</button>
+      <button v-else-if="line.status === 'skipped'" class="ui-button secondary" :disabled="actionBusy" @click="restoreLine">恢复这一行</button>
       <view v-else-if="line.status === 'confirmed'" class="confirmed-actions">
-        <text class="muted small">撤销后这条采购记录会作废。</text>
-        <button class="ui-button ghost danger" :disabled="actionBusy" @click="unconfirmLine">更多操作：撤销确认</button>
+        <text class="muted small">如需更改，先退回这一行；改完后重新确认入库。</text>
+        <button class="ui-button secondary" :disabled="actionBusy" @click="unconfirmLine">修改此行</button>
       </view>
     </view>
   </view>
@@ -662,6 +686,8 @@ watch(() => props.line.id, () => {
 
 <style scoped>
 .editor { display: flex; flex-direction: column; gap: 16px; padding: 20px; min-width: 0; }
+.editor > .editor-head { display: flex; align-items: center; justify-content: flex-end; gap: 10px; }
+.editor > .editor-head .head-tags { margin-right: auto; }
 .editor-head { display: flex; align-items: start; justify-content: space-between; gap: 12px; }
 .editor-title { display: block; margin-top: 6px; font-size: 17px; font-weight: 650; }
 .head-tags { flex: none; display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 6px; }

@@ -153,8 +153,8 @@ def test_framework_errors_use_the_same_language_as_business_errors(
     client: FlaskClient,
 ) -> None:
     """404 / 405 这类框架错误也用本项目的文案，不直接回显 werkzeug 的英文描述。"""
-    assert client.get("/no-such-endpoint").get_json()["error"]["message"] == "请求的资源不存在。"
-    assert client.post("/health").get_json()["error"]["message"] == "该路径不支持此 HTTP 方法。"
+    assert client.get("/no-such-endpoint").get_json()["error"]["message"] == "找不到这项内容，请刷新后重试。"
+    assert client.post("/health").get_json()["error"]["message"] == "当前操作暂时无法完成，请刷新后重试。"
 
 
 def test_framework_error_does_not_echo_request_path(client: FlaskClient) -> None:

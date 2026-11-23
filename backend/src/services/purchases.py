@@ -921,9 +921,8 @@ class PurchaseService:
         raise AmountMismatchError(
             f"数量 × 单价 = {format_money(expected)}，但行金额填的是 "
             f"{format_money(line_amount)}，差 {format_money(difference)}，"
-            f"超过了 {format_money(AMOUNT_TOLERANCE)} 的容差。"
-            "请核对单据；确认单据上就是这么印的，带 accept_amount_mismatch=true 再提交，"
-            "这一行会按行金额入账并标记为金额异常。",
+            f"超过了允许的误差 {format_money(AMOUNT_TOLERANCE)}。"
+            "请对照单据核对。如果单据上的金额确实如此，可以选择按填写的行金额入账。",
             details={
                 "field": "line_amount",
                 "expected": format_money(expected),

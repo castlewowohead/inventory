@@ -46,7 +46,7 @@ from __future__ import annotations
 import logging
 from calendar import monthrange
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from decimal import ROUND_HALF_UP, Decimal, localcontext
 from typing import Any, Final, Iterable
 
@@ -129,6 +129,8 @@ STATISTICS_ROW_LIMIT: Final[int] = 20_000
 # 月度趋势默认与上限的月份数。
 DEFAULT_MONTHS: Final[int] = 6
 MAX_MONTHS: Final[int] = 36
+DEFAULT_WEEKS: Final[int] = 6
+MAX_WEEKS: Final[int] = 104
 
 # 换算状态。`available` 之外的三种都意味着这一行**不参与**任何均价。
 CONVERSION_AVAILABLE: Final[str] = "available"
@@ -145,6 +147,8 @@ CONVERSION_STATUSES: Final[tuple[str, ...]] = (
 # 期间口径。
 BASIS_FULL_MONTH: Final[str] = "full_month"
 BASIS_MONTH_TO_DATE: Final[str] = "month_to_date"
+BASIS_FULL_WEEK: Final[str] = "full_week"
+BASIS_WEEK_TO_DATE: Final[str] = "week_to_date"
 
 # 比较结果的状态。**没有 `zero_change` 这一项**：没有基期就是没有基期，
 # 不是"没变化"（09.11）。
@@ -161,11 +165,10 @@ PACK_SPEC_MATCH_ANY_SOURCE: Final[str] = "any_source"
 # 『发票能录进去』说成『价格分析可用』」，这里是同一条——不要把"商品行均价"
 # 读成"到手总成本"。
 NOTE_EXCLUDES_ADJUSTMENTS: Final[str] = (
-    "标准化价格只含商品行（line_kind=purchase）且未作废的记录："
-    "退货、折让、运费与税费是调整行，不参与均价，对账请用 /api/purchases?kind=all。"
+    "平均价格只统计已入账的商品；退货、折让、运费和税费不计入。"
 )
 NOTE_NO_FX: Final[str] = (
-    "不同币种分开统计，本轮不做汇率换算。"
+    "不同币种分别统计，金额不会自动换算。"
 )
 
 
@@ -206,6 +209,36 @@ def previous_month_start(day: date) -> date:
     if first.month == 1:
         return first.replace(year=first.year - 1, month=12)
     return first.replace(month=first.month - 1)
+
+
+def week_start(day: date) -> date:
+    """周一是一周的第一天，跨年时仍按 ISO 周编号。"""
+    return day - timedelta(days=day.weekday())
+
+
+def week_key(day: date) -> str:
+    year, week, _ = day.isocalendar()
+    return f"{year:04d}-W{week:02d}"
+
+
+def week_period(day: date, *, today: date) -> Period:
+    start = week_start(day)
+    end = start + timedelta(days=6)
+    if start <= today < end:
+        return Period(week_key(day), start, today, BASIS_WEEK_TO_DATE)
+    return Period(week_key(day), start, end, BASIS_FULL_WEEK)
+
+
+def comparable_weeks(today: date) -> tuple[Period, Period]:
+    """本周截至今天，与上周相同天数比较。周日两周均为完整 7 天。"""
+    current = week_period(today, today=today)
+    previous_start = current.date_from - timedelta(days=7)
+    base = Period(
+        week_key(previous_start), previous_start,
+        previous_start + timedelta(days=current.days - 1),
+        BASIS_FULL_WEEK if current.days == 7 else BASIS_WEEK_TO_DATE,
+    )
+    return current, base
 
 
 def month_period(day: date, *, today: date) -> Period:
@@ -471,6 +504,18 @@ class MonthlyPriceReport:
     currency: str
     base_unit: str
     months: tuple[PeriodStats, ...]
+    comparison: ComparisonView
+    excluded: ExclusionSummary
+    available_currencies: tuple[str, ...]
+    notes: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class WeeklyPriceReport:
+    food_item: FoodItemView
+    currency: str
+    base_unit: str
+    weeks: tuple[PeriodStats, ...]
     comparison: ComparisonView
     excluded: ExclusionSummary
     available_currencies: tuple[str, ...]
@@ -958,6 +1003,64 @@ class PriceService:
                 notes=notes,
             )
 
+    def weekly_prices(
+        self,
+        food_item_id: int,
+        *,
+        currency: Any = None,
+        weeks: Any = DEFAULT_WEEKS,
+        today: date | None = None,
+    ) -> WeeklyPriceReport:
+        """每周加权均价；本周与上周按相同天数比较。"""
+        week_count = self._require_weeks(weeks)
+        reference = today or date.today()
+        window_start = week_start(reference) - timedelta(weeks=week_count - 1)
+        with self._database.unit_of_work() as session:
+            food_item = self._require_food_item(session, food_item_id)
+            rows = PurchaseRepository(session).for_statistics(
+                food_item_id=food_item.id,
+                date_from=window_start - timedelta(weeks=1),
+                date_to=reference,
+                limit=STATISTICS_ROW_LIMIT,
+            )
+            self._guard_row_limit(len(rows))
+            available = self._currencies_of(rows)
+            selected = self._select_currency(currency, available, required=True)
+            index = self._pack_spec_index(session, rows)
+            resolved, excluded = self._partition(rows, index, currency=selected)
+            undated = PurchaseRepository(session).count_statistics_candidates(
+                food_item_id=food_item.id
+            )["undated"]
+            excluded = ExclusionSummary(
+                undated=undated,
+                unit_unknown=excluded.unit_unknown,
+                pending_pack_spec=excluded.pending_pack_spec,
+                incompatible_unit=excluded.incompatible_unit,
+                other_currency=excluded.other_currency,
+            )
+            series = tuple(
+                self._aggregate(
+                    resolved,
+                    week_period(window_start + timedelta(weeks=index), today=reference),
+                )
+                for index in range(week_count)
+            )
+            current_period, base_period = comparable_weeks(reference)
+            comparison = self._compare(
+                self._aggregate(resolved, current_period),
+                self._aggregate(resolved, base_period),
+            )
+            return WeeklyPriceReport(
+                food_item=FoodItemView.of(food_item),
+                currency=selected or "",
+                base_unit=food_item.base_unit,
+                weeks=series,
+                comparison=comparison,
+                excluded=excluded,
+                available_currencies=available,
+                notes=self._notes(excluded, extra=self._period_notes(comparison)),
+            )
+
     # --- 来源比价 ---
 
     def source_comparison(
@@ -967,6 +1070,7 @@ class PriceService:
         currency: Any = None,
         date_from: Any = None,
         date_to: Any = None,
+        period: str = "month",
         today: date | None = None,
     ) -> SourceComparisonReport:
         """同一食材在不同采购来源之间的加权均价比较。
@@ -981,10 +1085,15 @@ class PriceService:
         （`POST /api/food-items/<id>/merge`，合并之后它们本来就是同一条）。
         """
         reference = today or date.today()
+        self._require_period(period)
         start = _parse_window_date(date_from, field="date_from")
         end = _parse_window_date(date_to, field="date_to")
         if start is None:
-            start = month_start(previous_month_start(previous_month_start(reference)))
+            start = (
+                week_start(reference) - timedelta(weeks=11)
+                if period == "week"
+                else month_start(previous_month_start(previous_month_start(reference)))
+            )
         if end is None:
             end = reference
         if start > end:
@@ -1100,7 +1209,7 @@ class PriceService:
                     key=f"{start.isoformat()}..{end.isoformat()}",
                     date_from=start,
                     date_to=end,
-                    basis=BASIS_MONTH_TO_DATE,
+                    basis=BASIS_WEEK_TO_DATE if period == "week" else BASIS_MONTH_TO_DATE,
                 ),
                 sources=tuple(sources),
                 cheapest_source_normalized=(
@@ -1166,6 +1275,7 @@ class PriceService:
         threshold_percent: Any = None,
         today: date | None = None,
         limit: Any = MAX_LIMIT,
+        period: str = "month",
     ) -> AlertReport:
         """涨得超过阈值的食材清单。
 
@@ -1176,6 +1286,7 @@ class PriceService:
         ⚠️ **按（食材, 币种）分组比较**，所以不会出现把 USD 与 CNY 相加的均价。
         """
         clean_limit = require_limit(limit, max_limit=MAX_LIMIT)
+        self._require_period(period)
         reference = today or date.today()
         override: Decimal | None = None
         if threshold_percent is not None:
@@ -1185,7 +1296,11 @@ class PriceService:
                 scale=PERCENT_SCALE,
                 allow_zero=True,
             )
-        current_period, base_period = comparable_periods(reference)
+        current_period, base_period = (
+            comparable_weeks(reference)
+            if period == "week"
+            else comparable_periods(reference)
+        )
 
         with self._database.unit_of_work() as session:
             settings = self._load_or_create_settings(session)
@@ -1202,7 +1317,7 @@ class PriceService:
                     compared_count=0,
                     skipped={},
                     excluded=EMPTY_EXCLUSIONS,
-                    notes=("涨价提醒已关闭（settings.enabled=false），本次不做比较。",),
+                    notes=("涨价提醒已关闭。",),
                 )
 
             rows = PurchaseRepository(session).for_statistics(
@@ -1264,10 +1379,10 @@ class PriceService:
             notes = self._notes(
                 excluded,
                 extra=(
-                    f"比较期间：{current_period.date_from.isoformat()}…"
-                    f"{current_period.date_to.isoformat()}（{current_period.days} 天）"
-                    f" vs {base_period.date_from.isoformat()}…"
-                    f"{base_period.date_to.isoformat()}（{base_period.days} 天）。",
+                    f"本期为 {current_period.date_from.isoformat()} 至"
+                    f" {current_period.date_to.isoformat()}（{current_period.days} 天）；"
+                    f"上期为 {base_period.date_from.isoformat()} 至"
+                    f" {base_period.date_to.isoformat()}（{base_period.days} 天）。",
                     "只提示上涨：跌价不提醒。",
                 ),
             )
@@ -1595,13 +1710,13 @@ class PriceService:
         notes.extend(extra)
         if excluded.pending_pack_spec:
             notes.append(
-                f"有 {excluded.pending_pack_spec} 条按包装单位计价的记录还缺箱规，"
-                "没有参与均价；清单见 GET /api/prices/pack-specs/pending。"
+                f"有 {excluded.pending_pack_spec} 条旧采购记录的单位无法与食材单位统一，"
+                "未计入平均价格。请检查这些记录的采购单位。"
             )
         if excluded.undated:
             notes.append(
-                f"有 {excluded.undated} 条采购记录没有日期，进不了任何月度统计；"
-                "清单见 GET /api/purchases?undated=true。"
+                f"有 {excluded.undated} 条采购记录没有日期，未计入价格统计。"
+                "请补上采购日期。"
             )
         if excluded.unit_unknown:
             notes.append(
@@ -1623,16 +1738,14 @@ class PriceService:
         current = comparison.current.period
         base = comparison.base.period
         note = (
-            f"比较期间：{current.key} 的 {current.date_from.isoformat()}…"
-            f"{current.date_to.isoformat()}（{current.days} 天，{current.basis}）"
-            f" vs {base.key} 的 {base.date_from.isoformat()}…"
-            f"{base.date_to.isoformat()}（{base.days} 天，{base.basis}）。"
+            f"比较了 {current.date_from.isoformat()} 至 {current.date_to.isoformat()}"
+            f"（{current.days} 天）和 {base.date_from.isoformat()} 至"
+            f" {base.date_to.isoformat()}（{base.days} 天）的采购价格。"
         )
         notes = [note]
         if current.days != base.days:
             notes.append(
-                f"两个期间天数不同（{current.days} vs {base.days}）：上月没有那么多天，"
-                "已取到上月最后一天。"
+                "上月天数较少，已比较到上月最后一天。"
             )
         if comparison.current.zero_amount_count:
             notes.append(
@@ -1708,6 +1821,23 @@ class PriceService:
                 details={"field": "months", "max": MAX_MONTHS},
             )
         return months
+
+    @staticmethod
+    def _require_weeks(weeks: Any) -> int:
+        if isinstance(weeks, bool) or not isinstance(weeks, int) or not 1 <= weeks <= MAX_WEEKS:
+            raise ValidationError(
+                f"查看周数须为 1 至 {MAX_WEEKS} 的整数。",
+                details={"field": "weeks", "max": MAX_WEEKS},
+            )
+        return weeks
+
+    @staticmethod
+    def _require_period(period: str) -> str:
+        if period not in ("week", "month"):
+            raise ValidationError(
+                "请选择按周或按月查看。", details={"field": "period"}
+            )
+        return period
 
     @staticmethod
     def _require_packaging_unit(value: Any) -> str:

@@ -181,8 +181,7 @@ def void_purchase(purchase_id: int) -> tuple[Response, int]:
         jsonify(
             {
                 "status": "voided",
-                "message": "采购记录已作废；它仍可通过 include_voided=true 查到，"
-                "原始单据的追溯关系不受影响。",
+                "message": "采购记录已撤销，修改历史仍会保留。",
             }
         ),
         200,

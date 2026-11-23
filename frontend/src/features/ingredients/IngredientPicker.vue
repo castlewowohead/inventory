@@ -71,10 +71,6 @@ function reasonLabel(item: FoodItemSuggestion): string {
   }
 }
 
-function scoreLabel(score: number | null): string {
-  return score === null ? '无文本分数' : `分数 ${score.toFixed(4)}`
-}
-
 async function loadMore() {
   if (state.value !== 'ready' || loadingMore.value || nextOffset.value >= total.value) return
   const current = generation
@@ -139,7 +135,7 @@ onUnmounted(() => {
               <text class="picker-name">{{ item.food_item.name }}</text>
               <text v-if="item.food_item.name_zh" class="muted">{{ item.food_item.name_zh }}</text>
               <text class="muted">{{ categoryDisplay(item.food_item.category) }} · {{ item.food_item.base_unit }}</text>
-              <text class="muted">{{ reasonLabel(item) }} ({{ item.match_reason }}) · {{ scoreLabel(item.score) }}</text>
+              <text class="muted">{{ reasonLabel(item) }}</text>
               <text v-if="item.match_reason === 'merged_from'" class="merged-note">「{{ item.merged_from }}」这个旧叫法已经合并到「{{ item.food_item.name }}」。</text>
               <text class="muted">历史采购 {{ item.purchase_count ?? '—' }} 次 · 最近采购 {{ item.last_purchase_date ?? '—' }}</text>
             </view>

@@ -66,16 +66,13 @@ class _FakeClient:
 # --- 提示词的身份 -----------------------------------------------------------
 
 
-def test_content_prompt_is_byte_identical_to_the_evaluated_one() -> None:
-    """⚠️ **提示词是被测配置的一部分。**
-
-    步骤 07 的 234 份结果全是这个提示词跑出来的（sha256 前 12 位
-    `12e0246b0377`）。改一个字就等于换一个被测系统，那批准确率数字立刻失效，
-    必须重跑 `tools/eval_adapter.py`。这条断言就是那个配置的身份证。
-    """
+def test_content_prompt_has_a_new_version_for_seller_extraction() -> None:
+    """M01 configuration is separate from the historical 12e0246b0377 results."""
     digest = hashlib.sha256(CONTENT_PROMPT.encode("utf-8")).hexdigest()[:12]
 
-    assert digest == CONTENT_PROMPT_SHA12 == "12e0246b0377"
+    assert digest == CONTENT_PROMPT_SHA12 == "67fb7df1217b"
+    assert '"supplier_english"' in CONTENT_PROMPT
+    assert '"supplier_chinese"' in CONTENT_PROMPT
 
 
 # --- 三态归类 ---------------------------------------------------------------
@@ -109,7 +106,7 @@ def test_a_dash_keeps_its_raw_text_instead_of_becoming_missing() -> None:
 
 
 def test_a_key_the_prompt_never_asked_for_is_not_reported_as_a_model_null() -> None:
-    """⚠️ `supplier` / `currency` 不在 CONTENT_PROMPT 的要求里。
+    """⚠️ `currency` remains unasked by the content prompt.
 
     把"没问"报成"模型给了 null"会与步骤 07 的实测记录直接冲突，
     下一个排查的人会以为那条记录错了。诊断信息说错话比不说话更糟。
@@ -118,9 +115,69 @@ def test_a_key_the_prompt_never_asked_for_is_not_reported_as_a_model_null() -> N
     real_null = classify_value(None)
 
     assert not_asked.status == "missing"
-    assert "没有要求" in (not_asked.note or "")
+    assert "没有这个键" in (not_asked.note or "")
     assert real_null.status == "missing"
     assert "从不" in (real_null.note or "")
+
+
+@pytest.mark.parametrize(
+    ("response", "expected", "status"),
+    [
+        ({"supplier_english": "Paper Seller", "supplier_chinese": "纸面商家", "supplier_evidence": "Seller: Paper Seller / 纸面商家"}, "Paper Seller", FieldStatus.RECOGNIZED),
+        ({"supplier_english": None, "supplier_chinese": "纸面商家", "supplier_evidence": "卖方：纸面商家"}, "纸面商家", FieldStatus.RECOGNIZED),
+        ({"supplier_english": None, "supplier_chinese": None, "buyer_english": "Buyer Ltd"}, None, FieldStatus.MISSING),
+        ({"supplier_english": "UNREADABLE", "supplier_chinese": None, "buyer_english": "Buyer Ltd"}, None, FieldStatus.UNREADABLE),
+    ],
+)
+def test_seller_name_selection_keeps_paper_readings(response, expected, status) -> None:
+    result = to_recognition_result(_call(json.dumps({**response, "lines": []}, ensure_ascii=False)), page=3)
+    supplier = result.document_field("supplier")
+    assert supplier is not None and supplier.status is status
+    assert supplier.raw_text == expected
+    if expected is not None:
+        assert supplier.page == 3
+    english = result.document_field("supplier_english")
+    assert english is not None
+    if response.get("supplier_english") not in (None, "UNREADABLE"):
+        assert english.raw_text == response["supplier_english"]
+    if response.get("supplier_evidence"):
+        assert result.document_field("supplier_evidence").raw_text == response["supplier_evidence"]
+
+
+def test_seller_disagreement_keeps_readings_without_a_prefill() -> None:
+    first = to_recognition_result(_call(json.dumps({"supplier_english": "Paper Seller", "supplier_chinese": None, "lines": []})))
+    second = to_recognition_result(_call(json.dumps({"supplier_english": None, "supplier_chinese": "纸面商家", "lines": []}), model="qwen3-vl-plus"))
+    outcome = combine((first, second), models=("qwen3.5-ocr", "qwen3-vl-plus"))
+    assert outcome.result.document_field("supplier").status is FieldStatus.UNREADABLE
+    assert not outcome.agreements["supplier"].agreed
+    assert outcome.agreements["supplier_english"].values == ("Paper Seller", None)
+    assert outcome.result.document_field("supplier_chinese").status is FieldStatus.UNREADABLE
+
+
+def test_agreed_absence_differs_from_a_model_conflict() -> None:
+    absent = {"supplier_english": None, "supplier_chinese": None, "lines": []}
+    first = to_recognition_result(_call(json.dumps(absent)))
+    second = to_recognition_result(_call(json.dumps(absent), model="qwen3-vl-plus"))
+    outcome = combine((first, second), models=("qwen3.5-ocr", "qwen3-vl-plus"))
+    assert outcome.result.document_field("supplier").status is FieldStatus.MISSING
+    assert outcome.agreements["supplier"].agreed
+
+
+def test_disagreement_about_the_other_paper_name_blocks_a_shared_display_name() -> None:
+    first = to_recognition_result(_call(json.dumps({"supplier_english": "Paper Seller", "supplier_chinese": "纸面商家", "lines": []}, ensure_ascii=False)))
+    second = to_recognition_result(_call(json.dumps({"supplier_english": "Paper Seller", "supplier_chinese": None, "lines": []}), model="qwen3-vl-plus"))
+    outcome = combine((first, second), models=("qwen3.5-ocr", "qwen3-vl-plus"))
+    assert outcome.result.document_field("supplier").status is FieldStatus.UNREADABLE
+    assert outcome.agreements["supplier"].values == ("Paper Seller", "Paper Seller")
+
+
+def test_terminal_punctuation_does_not_hide_an_agreeing_paper_name() -> None:
+    first = to_recognition_result(_call(json.dumps({"supplier_english": "Paper Seller Inc.", "supplier_chinese": "纸面商家", "lines": []}, ensure_ascii=False)))
+    second = to_recognition_result(_call(json.dumps({"supplier_english": "Paper Seller Inc", "supplier_chinese": "纸面商家.", "lines": []}, ensure_ascii=False), model="qwen3-vl-plus"))
+    outcome = combine((first, second), models=("qwen3.5-ocr", "qwen3-vl-plus"))
+    assert outcome.result.document_field("supplier").status is FieldStatus.RECOGNIZED
+    assert outcome.result.document_field("supplier").raw_text == "Paper Seller Inc."
+    assert outcome.agreements["supplier_chinese"].values == ("纸面商家", "纸面商家.")
 
 
 # --- 输出解析 ---------------------------------------------------------------

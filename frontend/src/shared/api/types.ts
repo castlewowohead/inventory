@@ -1,6 +1,110 @@
 /** Wire types mirror backend/src/api/schemas.py. Decimal values stay as strings. */
 export type DecimalText = string | null
 
+export interface IntakeBatchFile {
+  id: number
+  original_name: string
+  status: 'pending' | 'ready' | 'failed' | 'discarded'
+  item_count: number | null
+  size: number
+  sheet_name: string | null
+  error: { code: string; message: string } | null
+}
+
+export interface IntakeBatch {
+  id: number
+  status: 'open' | 'closed' | 'discarded'
+  files: IntakeBatchFile[]
+  created_at: string
+  updated_at: string
+}
+
+/** One classification suggestion. Never a decision: M06 only writes `decided_*`. */
+export interface IntakeCandidate {
+  id: number
+  field: 'purchase_date' | 'source_name'
+  value: string | null
+  value_normalized: string | null
+  basis: 'paper' | 'same_file' | 'history' | 'similar_layout'
+  confidence: DecimalText
+  evidence: Record<string, unknown> | null
+  created_at: string
+}
+
+/** How far date/supplier recognition got on one content. `status: null` = never run. */
+export interface IntakeRecognition {
+  status: 'pending' | 'done' | 'failed' | null
+  recognized_at: string | null
+  provider: string | null
+  models: string[]
+  prompt_sha12: string | null
+  is_fake: boolean | null
+  date_raw_text: string | null
+  date_ambiguous: boolean
+  date_problem: string | null
+  date_readings: { value: string; order: string | null; note: string | null }[]
+  date_order: string | null
+  date_order_from: string | null
+  notes: string[]
+  error: { code: string; message: string } | null
+}
+
+/** One classifiable content: a PDF/image page or a spreadsheet row. */
+export interface IntakeItem {
+  id: number
+  batch_id: number
+  batch_file_id: number
+  kind: 'page' | 'row'
+  page_no: number | null
+  row_no: number | null
+  sheet_name: string | null
+  original_name: string
+  sha256: string
+  decided_purchase_date: string | null
+  decided_source_name: string | null
+  decided_source_name_normalized: string | null
+  decided_at: string | null
+  version: number
+  /**
+   * Set once M08 handed this content to review. Non-null means the organizer
+   * must not try to move it: the server answers 409, and the date/supplier are
+   * changed through the review's classification revision instead.
+   */
+  handed_off_at: string | null
+  pile_excluded: boolean
+  /** Parsed spreadsheet cells; decimal fields remain strings from the server. */
+  row_values: Record<string, string | null> | null
+  candidates: IntakeCandidate[]
+  recognition: IntakeRecognition
+}
+
+/**
+ * A derived (date, supplier) group. The server has no group table: these rows
+ * are `GROUP BY` over the human decisions, so a row with neither value is the
+ * unclassified bucket and `source_name: null` under a date is 商家待定.
+ */
+export interface IntakeGroup {
+  purchase_date: string | null
+  source_name: string | null
+  source_name_normalized: string | null
+  item_count: number
+}
+
+export interface IntakeGroupPage {
+  groups: IntakeGroup[]
+  total: number
+  limit: number
+  offset: number
+}
+
+/** The result of one move command, or of undoing it. */
+export interface IntakeMoveResult {
+  move_id: number
+  request_key: string
+  undone: boolean
+  items: IntakeItem[]
+}
+
 export interface Page<T> {
   items: T[]
   total: number
@@ -85,6 +189,18 @@ export interface InvoiceFile {
   content_type: string
   page_order: number
   created_at: string
+}
+
+export interface IntakeSource {
+  batch_id: number
+  item_id: number
+  batch_file_id: number
+  version: number
+  kind: 'page' | 'row'
+  page_no: number | null
+  row_no: number | null
+  original_name: string
+  content_type: string | null
 }
 
 export interface MatchCandidate {
@@ -184,6 +300,7 @@ export interface Invoice {
   invoice_date: string | null
   currency: string | null
   invoice_total: DecimalText
+  header_reviewed_fields: string[]
   recognition: {
     provider: string | null
     is_fake: boolean
@@ -195,6 +312,7 @@ export interface Invoice {
   voided_at: string | null
   updated_at: string
   files: InvoiceFile[]
+  intake_sources: IntakeSource[]
   lines: InvoiceLine[]
   reconciliation: Reconciliation
   possible_duplicate_invoice_ids: number[]
@@ -276,24 +394,6 @@ export interface PackSpec {
   updated_at: string
 }
 
-export interface PendingPackSpec {
-  food_item: FoodItemRef
-  source_name: string | null
-  source_name_normalized: string | null
-  purchase_unit: string
-  purchase_count: number
-  total_amount: string
-  latest_purchase_date: string | null
-  descriptions: string[]
-  suggestion: {
-    pack_size: string
-    pack_unit: string
-    spec_text: string
-    from_description: string
-    confirmation_required: boolean
-  } | null
-}
-
 export interface PriceHistory {
   food_item: FoodItemRef
   base_unit: string
@@ -368,6 +468,17 @@ export interface MonthlyPrices {
   currency: string
   base_unit: string
   months: PricePeriodStats[]
+  comparison: PriceComparison
+  excluded: PriceExclusions
+  available_currencies: string[]
+  notes: string[]
+}
+
+export interface WeeklyPrices {
+  food_item: FoodItemRef
+  currency: string
+  base_unit: string
+  weeks: PricePeriodStats[]
   comparison: PriceComparison
   excluded: PriceExclusions
   available_currencies: string[]

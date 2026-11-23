@@ -35,6 +35,7 @@ export class PickerCancelledError extends Error {
 
 /** Extensions the backend accepts (src/services/invoices.py ALLOWED_UPLOAD_EXTENSIONS). */
 export const DOCUMENT_EXTENSIONS = ['.jpg', '.jpeg', '.png', '.pdf', '.heic'] as const
+export const INTAKE_EXTENSIONS = [...DOCUMENT_EXTENSIONS, '.csv', '.xlsx'] as const
 
 function isCancel(reason: unknown): boolean {
   const message = reason && typeof reason === 'object' && 'errMsg' in reason
@@ -112,8 +113,7 @@ export function pickDocuments(count: number): Promise<PickedFile[]> {
   // #ifndef H5
   return Promise.reject(
     new PickerUnavailableError(
-      'App 端不支持从文件系统选择 PDF/图片（uni.chooseFile 无 App 实现），'
-        + '需要单独的 App 文件选择适配器与真机验证。可先用「拍照」。'
+      '当前设备暂时无法选择 PDF 或图片文件。可以先用“拍照”上传。'
     )
   )
   // #endif
@@ -128,10 +128,24 @@ export function pickDocuments(count: number): Promise<PickedFile[]> {
   })
 }
 
+/** Mixed intake files; each selected file still uses its own backend endpoint. */
+export function pickIntakeFiles(count = 50): Promise<PickedFile[]> {
+  // #ifndef H5
+  return Promise.reject(new PickerUnavailableError('当前设备暂时无法选择混合文件，请在浏览器中上传。'))
+  // #endif
+  return new Promise((resolve, reject) => {
+    uni.chooseFile({
+      count: Math.max(1, count), type: 'all', extension: [...INTAKE_EXTENSIONS],
+      success: (result) => resolve(toPickedFiles(result as { tempFiles?: unknown })),
+      fail: (reason) => reject(isCancel(reason) ? new PickerCancelledError() : reason)
+    })
+  })
+}
+
 /** CSV/XLSX selection. H5 only until an App file picker is implemented. */
 export function pickSpreadsheet(): Promise<PickedFile[]> {
   // #ifndef H5
-  return Promise.reject(new PickerUnavailableError('App 端尚不能选择表格文件，请在 Web 上导入。'))
+  return Promise.reject(new PickerUnavailableError('当前设备暂时无法选择表格文件，请在浏览器中导入。'))
   // #endif
   return new Promise((resolve, reject) => {
     uni.chooseFile({

@@ -154,14 +154,13 @@ export async function renderImage(
     URL.revokeObjectURL(url)
     throw new PreviewUnavailableError(
       isHeic(name, mediaType)
-        ? `这个浏览器解不开 HEIC（${name}）。原件已经完整保存在服务端，不受影响；`
-          + '要在屏幕上核对，请用支持 HEIC 的浏览器/设备打开，或改传 JPG / PNG。'
-        : `这个浏览器解不开 ${name}。原件已经完整保存在服务端，不受影响。`
+        ? `无法预览 ${name}。原件已保存；请换用支持 HEIC 的设备查看，或上传 JPG、PNG 格式。`
+        : `无法预览 ${name}。原件已保存，可下载后查看。`
     )
   }
   // #endif
   throw new PreviewUnavailableError(
-    'App 端还没有图片预览适配器：需要先把字节写成本地临时文件再交给 image 组件。'
+    '当前设备暂时无法预览图片，请下载原件查看。'
   )
 }
 

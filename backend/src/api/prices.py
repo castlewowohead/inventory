@@ -1,4 +1,4 @@
-"""标准化价格、月度统计、来源比价与涨价提醒的接口（步骤 09）。
+"""标准化价格、周度与月度统计、来源比价和涨价提醒的接口。
 
 本层只做三件事：解析请求、调用 Service、把结果或异常转成响应。没有业务判断，
 也不碰 Session——事务边界在 Service（见 README 第 10 节）。
@@ -10,6 +10,7 @@
 | GET    | /api/prices/units                      | 支持的单位、量纲与两条拒绝规则（静态）      |
 | GET    | /api/prices/food-items/<id>/history    | 采购历史 + 每行的标准化价格或算不出的原因   |
 | GET    | /api/prices/food-items/<id>/monthly    | 月度加权均价序列 + 本期/基期比较            |
+| GET    | /api/prices/food-items/<id>/weekly     | 周度加权均价序列 + 本周/上周同期比较        |
 | GET    | /api/prices/food-items/<id>/sources    | 同一食材的来源比价                          |
 | GET    | /api/prices/alerts                     | 涨得超过阈值的食材                          |
 | GET    | /api/prices/alert-settings             | 提醒阈值与开关                              |
@@ -43,6 +44,7 @@ from src.api.schemas import (
     alerts_payload,
     json_object,
     monthly_prices_payload,
+    weekly_prices_payload,
     pack_spec_page_payload,
     pack_spec_payload,
     pending_pack_spec_payload,
@@ -55,7 +57,7 @@ from src.api.schemas import (
 )
 from src.factory import get_database
 from src.services.ingredients import DEFAULT_LIMIT, MAX_LIMIT
-from src.services.prices import DEFAULT_MONTHS, PriceService
+from src.services.prices import DEFAULT_MONTHS, DEFAULT_WEEKS, PriceService
 
 prices_bp = Blueprint("prices", __name__, url_prefix="/api/prices")
 
@@ -110,6 +112,16 @@ def monthly_prices(food_item_id: int) -> tuple[Response, int]:
     return jsonify(monthly_prices_payload(report)), 200
 
 
+@prices_bp.get("/food-items/<int:food_item_id>/weekly")
+def weekly_prices(food_item_id: int) -> tuple[Response, int]:
+    report = service().weekly_prices(
+        food_item_id,
+        currency=query_text(request.args, "currency"),
+        weeks=query_int(request.args, "weeks", DEFAULT_WEEKS),
+    )
+    return jsonify(weekly_prices_payload(report)), 200
+
+
 @prices_bp.get("/food-items/<int:food_item_id>/sources")
 def source_comparison(food_item_id: int) -> tuple[Response, int]:
     report = service().source_comparison(
@@ -117,6 +129,7 @@ def source_comparison(food_item_id: int) -> tuple[Response, int]:
         currency=query_text(request.args, "currency"),
         date_from=query_text(request.args, "date_from"),
         date_to=query_text(request.args, "date_to"),
+        period=query_text(request.args, "period") or "month",
     )
     return jsonify(source_comparison_payload(report)), 200
 
@@ -127,6 +140,7 @@ def alerts() -> tuple[Response, int]:
     report = service().alerts(
         threshold_percent=query_text(request.args, "threshold"),
         limit=query_int(request.args, "limit", MAX_LIMIT),
+        period=query_text(request.args, "period") or "month",
     )
     return jsonify(alerts_payload(report)), 200
 

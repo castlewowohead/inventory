@@ -151,6 +151,7 @@ def test_import_is_durable_review_not_ocr_or_direct_purchase(
     assert fixed.raw_fields == raw
     assert not fixed.review_issues
     assert invoice_service.confirm_lines(view.id, options=[ConfirmOption(second.id, food_item_id=food_item.id)]).confirmed_count == 1
+    invoice_service.update_invoice(view.id, invoice_date="2026-10-01")
     invoice_service.complete_invoice(view.id)
     migrated_database.dispose()
     restarted = create_app(config, database=migrated_database, file_storage=storage).test_client()
@@ -242,6 +243,7 @@ def test_mixed_currencies_do_not_reconcile_to_a_fake_total(spreadsheets, invoice
     assert outcome.invoice.reconciliation.status == "mixed_currencies"
     assert outcome.invoice.reconciliation.confirmed_amount is None
     assert outcome.invoice.reconciliation.difference is None
+    invoice_service.update_invoice(view.id, invoice_date="2026-10-01")
     assert invoice_service.complete_invoice(view.id).status == "completed"
 
 

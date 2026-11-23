@@ -24,11 +24,9 @@
 3. ⚠️ **输出格式不一致**：`qwen3.5-ocr` 一律用 ```json 围栏包裹，
    `qwen3-vl-plus` 给裸 JSON；234 份里有 1 份解析失败。
    **解析失败必须有处理分支**，不能假设一定是合法 JSON。
-4. ⚠️ **提示词是被测配置的一部分**。`CONTENT_PROMPT` 与
-   `tools/ocr_batch.py` 的 `DEFAULT_PROMPT` **逐字节相同**（sha256 前 12 位
-   `12e0246b0377`，234 份结果全都是它）。改提示词等于换一个被测配置，
-   选型结论与那些准确率数字就不再适用，必须重跑 `tools/eval_adapter.py`。
-   测试会守住这个 sha。
+4. ⚠️ **提示词是被测配置的一部分**。步骤 07 的 234 份历史结果绑定旧
+   SHA `12e0246b0377`；M01 将运行时提示词改为 `67fb7df1217b`，加入商家
+   英文、中文及原文线索。旧准确率不能当成新配置结果；测试守住新 SHA。
 
 ### `UNREADABLE` 自报只能当旁证
 
@@ -67,9 +65,13 @@ from src.contracts import (
     FIELD_LINE_AMOUNT,
     FIELD_QUANTITY,
     FIELD_SUPPLIER,
+    FIELD_SUPPLIER_ENGLISH,
+    FIELD_SUPPLIER_CHINESE,
+    FIELD_SUPPLIER_EVIDENCE,
     FIELD_UNIT,
     FIELD_UNIT_PRICE,
     FieldEvidence,
+    FieldStatus,
     RecognitionResult,
     RecognizedField,
     RecognizedLine,
@@ -80,9 +82,8 @@ logger = logging.getLogger(__name__)
 
 PROVIDER = "dashscope"
 
-# ⚠️ 与 tools/ocr_batch.py 的 DEFAULT_PROMPT **逐字节相同**。
-# sha256 前 12 位必须是 12e0246b0377——步骤 07 的 234 份结果全是这个配置跑出来的。
-# 改这段文字就等于换一个被测系统，那批准确率数字立刻失效（测试会守住 sha）。
+# 步骤 07 的旧配置保留在 tools/ocr_batch.py；其历史结果绑定 12e0246b0377。
+# 本提示词是 M01 新配置，不能把旧评测准确率记到它名下。
 CONTENT_PROMPT = """这是一张餐厅采购单据的扫描件。请只识别你在图上真正看到的内容。
 
 以 JSON 输出，结构如下：
@@ -90,6 +91,9 @@ CONTENT_PROMPT = """这是一张餐厅采购单据的扫描件。请只识别你
   "invoice_number": ...,
   "invoice_date": ...,
   "invoice_total": ...,
+  "supplier_english": ...,
+  "supplier_chinese": ...,
+  "supplier_evidence": ...,
   "lines": [
     {"index": 1, "item_description": ..., "quantity": ..., "unit": ..., "unit_price": ..., "line_amount": ...}
   ]
@@ -101,9 +105,11 @@ CONTENT_PROMPT = """这是一张餐厅采购单据的扫描件。请只识别你
 3. 单据上根本没有这一项 → 该字段填 null。
 4. 不要做任何计算。invoice_total 只能来自单据上印着或写着的那个总额数字；单据上没有总额就填 null，**禁止把各行金额相加后填进去**。
 5. 表格里没有填写内容的空白行不要输出。
-6. 只输出 JSON，不要解释。"""
+6. supplier_english 和 supplier_chinese 只填纸面上作为卖方、开票方或商家印出的英文和中文名称；买方、收货方、付款方、商品品牌都不是商家。两种文字都出现就分别照抄；只出现一种就把另一项填 null，绝不翻译、扩写或根据商品推测。
+7. supplier_evidence 填纸面上可见的卖方标签及名称原文片段；没有可引用的片段填 null，不要编造位置或文字。不能确定谁是卖方时，商家字段填 "UNREADABLE"，不要把买方填进去。纸面确实没有商家时填 null。
+8. 只输出 JSON，不要解释。"""
 
-CONTENT_PROMPT_SHA12 = "12e0246b0377"
+CONTENT_PROMPT_SHA12 = "67fb7df1217b"
 """`CONTENT_PROMPT` 的 sha256 前 12 位。被测配置的身份证。"""
 
 # 第 1 层「先定结构，不读内容」的提示词（步骤 08.3b）。
@@ -137,8 +143,7 @@ STRUCTURE_PROMPT = """这是一张餐厅采购单据的扫描件。**不要转�
 
 # 批次 2 新增的两个提示词（08.3a / 08.3d 的锚定）。
 #
-# ⚠️ **它们是新增配置，不动 `CONTENT_PROMPT`。** `CONTENT_PROMPT` 绑着步骤 07 的
-# 选型结论（sha 由测试守着），改它等于换一个被测系统，那批准确率数字立刻失效。
+# 它们是独立配置。步骤 07 的结果绑定旧内容提示词；M01 已另开新 SHA。
 # 这两个提示词问的都是**印刷体**内容——行号与表头——而印刷体正是模型最准的那一类
 # （步骤 07 实测字段准确率 96.6%）。它们都**不读手写内容**，也不产出任何草稿值。
 ROW_NUMBER_PROMPT = """这是一张预印表格**最左侧一列**的格子，已经按从上到下的顺序一格一格裁下来，
@@ -514,19 +519,9 @@ class RawValue:
 
 
 NOT_ASKED = object()
-"""提示词里**根本没有要求**这个字段时传进来的哨兵值。
+"""响应缺少提示词要求的键；与模型明确返回 JSON null 分开记录。
 
-⚠️ 它与 JSON `null` 必须分开。`CONTENT_PROMPT` 只要求 `invoice_number` /
-`invoice_date` / `invoice_total` 与行内五个字段——**没有 `supplier` 与
-`currency`**。响应里取不到这两个键，是因为**没问**，不是因为模型报了 null。
-
-混成一条消息的后果：日志里会出现「模型给的是 JSON null」，与步骤 07 实测记录的
-「三个模型从不输出 JSON null」直接矛盾，而下一个来排查的人会以为那条实测记录
-错了。诊断信息说错话比不说话更糟。
-
-为什么不干脆把 `supplier` 加进提示词：**提示词是被测配置的一部分**，改了
-`CONTENT_PROMPT` 就等于换一个被测系统，步骤 07 那批准确率数字立刻失效、要重跑
-整轮评测。供应商名因此由人填（或在供应商路由上设一次），代价写在实施记录里。
+步骤 07 的历史提示词没有要求商家，旧结果必须继续按旧 SHA 解读。
 """
 
 
@@ -543,8 +538,8 @@ def classify_value(value: Any) -> RawValue:
         return RawValue(
             None,
             "missing",
-            "提示词没有要求这个字段，模型也就没给——**不是模型报了 null**。"
-            "改提示词会让步骤 07 的选型结论失效，所以这个字段由人填。",
+            "响应没有这个键；它不是模型明确返回的 JSON null。"
+            "若当前提示词确实要求该字段，应检查模型是否漏答。",
         )
     if value is None:
         return RawValue(
@@ -587,6 +582,23 @@ def _field_of(name: str, value: Any, *, page: int) -> tuple[RecognizedField, str
     if raw.status == "missing":
         return RecognizedField.missing(name), raw.note
     return RecognizedField.unreadable(name, evidence=evidence), raw.note
+
+
+def _supplier_from_names(fields: dict[str, RecognizedField], *, page: int) -> RecognizedField:
+    """Choose only a paper reading, with English taking precedence over Chinese."""
+    english = fields[FIELD_SUPPLIER_ENGLISH]
+    chinese = fields[FIELD_SUPPLIER_CHINESE]
+    if english.status is FieldStatus.RECOGNIZED:
+        return RecognizedField.recognized(
+            FIELD_SUPPLIER, english.raw_text or "", evidence=english.evidence
+        )
+    if english.status is FieldStatus.MISSING and chinese.status is FieldStatus.RECOGNIZED:
+        return RecognizedField.recognized(
+            FIELD_SUPPLIER, chinese.raw_text or "", evidence=chinese.evidence
+        )
+    if english.status is FieldStatus.MISSING and chinese.status is FieldStatus.MISSING:
+        return RecognizedField.missing(FIELD_SUPPLIER)
+    return RecognizedField.unreadable(FIELD_SUPPLIER, evidence=FieldEvidence(page=page))
 
 
 @dataclass(frozen=True)
@@ -746,18 +758,26 @@ def to_recognition_result(
         (FIELD_INVOICE_NUMBER, "invoice_number"),
         (FIELD_INVOICE_DATE, "invoice_date"),
         (FIELD_INVOICE_TOTAL, "invoice_total"),
-        (FIELD_SUPPLIER, "supplier"),
+        (FIELD_SUPPLIER_ENGLISH, "supplier_english"),
+        (FIELD_SUPPLIER_CHINESE, "supplier_chinese"),
+        (FIELD_SUPPLIER_EVIDENCE, "supplier_evidence"),
         (FIELD_CURRENCY, "currency"),
     ):
-        # 键不在响应里 → NOT_ASKED，而不是 None。`supplier` 与 `currency` 本来就
-        # 不在 CONTENT_PROMPT 的要求里，报成"模型给了 null"会与步骤 07 的实测记录
-        # 冲突，把下一个排查的人带偏。
+        # M01 商家键已被明确要求；模型省略时不能误判为纸面没有。
+        value = data[key] if key in data else (
+            "UNREADABLE" if name in {FIELD_SUPPLIER_ENGLISH, FIELD_SUPPLIER_CHINESE}
+            else NOT_ASKED
+        )
         recognized, note = _field_of(
-            name, data[key] if key in data else NOT_ASKED, page=page
+            name, value, page=page
         )
         document_fields.append(recognized)
+        if key not in data and name in {FIELD_SUPPLIER_ENGLISH, FIELD_SUPPLIER_CHINESE}:
+            warnings.append(f"{name}：模型未返回提示词要求的键，按需人工确认处理。")
         if note:
             warnings.append(f"{name}：{note}")
+    names = {item.name: item for item in document_fields}
+    document_fields.append(_supplier_from_names(names, page=page))
 
     lines: list[RecognizedLine] = []
     raw_lines = data.get("lines")

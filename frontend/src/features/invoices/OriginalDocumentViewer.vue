@@ -16,30 +16,53 @@
  * hunting for the row they were reading.
  */
 import { computed, onUnmounted, ref, watch } from 'vue'
-import { errorMessage, getInvoiceFileContent, type InvoiceFile } from '../../shared/api'
+import { errorMessage, getIntakeItemOriginal, getInvoiceFileContent, type IntakeSource, type InvoiceFile } from '../../shared/api'
 import {
   classifyDocument, isHeic, openPdf, renderImage,
   PreviewUnavailableError,
   type DocumentKind, type PdfDocument, type RenderedPage
 } from '../../shared/platform/documentPreview'
 import { formatBytes } from '../../shared/format'
+import { downloadAttachment } from '../../shared/platform/download'
 
-const props = defineProps<{
-  invoiceId: number
+const props = withDefaults(defineProps<{
+  /** Null when the pane shows batch contents instead of an invoice (M10). */
+  invoiceId?: number | null
   files: InvoiceFile[]
+  sources?: IntakeSource[]
   isFake: boolean
+  /** Overridden by the intake board, where the bytes are not an invoice yet. */
+  eyebrow?: string
   /** Where the selected line's evidence says to look. */
   focus: { fileId: number | null; page: number | null } | null
   /** False while the narrow layout shows the form instead. */
   visible: boolean
-}>()
+}>(), { invoiceId: null, eyebrow: '单据原件' })
+
+/**
+ * Only an invoice file is read through the invoice endpoint; a batch content
+ * carries its own `intake` reference. Asking for one without an invoice is a
+ * programming error, so it says so instead of sending `/api/invoices/0/...`.
+ */
+function invoiceIdOrFail(): number {
+  if (props.invoiceId === null) throw new Error('这个原件不属于单据，不能按单据读取。')
+  return props.invoiceId
+}
 
 const ZOOM_STEPS = [1, 1.5, 2, 3, 4] as const
 /** How sharp a rendered PDF page is, in device pixels across. */
 const PDF_BASE_WIDTH = 1600
 const PDF_MAX_WIDTH = 4000
 
-const ordered = computed(() => [...props.files].sort((a, b) => a.page_order - b.page_order))
+type PreviewFile = InvoiceFile & { intake?: IntakeSource }
+const ordered = computed<PreviewFile[]>(() => [
+  ...props.files,
+  ...(props.sources ?? []).map((source, index) => ({
+    id: -source.item_id, original_name: source.original_name,
+    size: 0, sha256: '', content_type: source.content_type ?? 'application/octet-stream',
+    page_order: props.files.length + index + 1, created_at: '', intake: source
+  }))
+].sort((a, b) => a.page_order - b.page_order))
 const fileKey = computed(() => ordered.value.map((file) => file.id).join(','))
 const currentFileId = ref<number | null>(null)
 const current = computed(() =>
@@ -76,10 +99,12 @@ function closePdf() {
   pdfFileId = null
 }
 
-async function bytesFor(file: InvoiceFile): Promise<ArrayBuffer> {
+async function bytesFor(file: PreviewFile): Promise<ArrayBuffer> {
   const cached = bytesCache.get(file.id)
   if (cached) return cached
-  const response = await getInvoiceFileContent(props.invoiceId, file.id)
+  const response = file.intake
+    ? await getIntakeItemOriginal(file.intake.batch_id, file.intake.item_id)
+    : await getInvoiceFileContent(invoiceIdOrFail(), file.id)
   bytesCache.set(file.id, response.bytes)
   return response.bytes
 }
@@ -97,8 +122,7 @@ async function render() {
   try {
     if (kind.value === 'unknown') {
       state.value = 'unavailable'
-      failure.value = `${file.original_name} 不是图片或 PDF（${file.content_type || '媒体类型未记录'}），`
-        + '这里不做预览。原件已完整保存，可以下载后用对应的程序打开。'
+      failure.value = `${file.original_name} 暂时无法在页面中预览。原件已保存，可以下载后打开。`
       return
     }
     const bytes = await bytesFor(file)
@@ -175,7 +199,7 @@ function resetScroll() {
 function selectFile(fileId: number) {
   if (currentFileId.value === fileId) return
   currentFileId.value = fileId
-  page.value = 1
+  page.value = ordered.value.find((file) => file.id === fileId)?.intake?.page_no ?? 1
   resetScroll()
   void render()
 }
@@ -196,12 +220,23 @@ function changeZoom(delta: number) {
   if (kind.value === 'pdf') void render()
 }
 
+async function downloadCurrent() {
+  const file = current.value
+  if (!file) return
+  try {
+    const response = file.intake
+      ? await getIntakeItemOriginal(file.intake.batch_id, file.intake.item_id)
+      : await getInvoiceFileContent(invoiceIdOrFail(), file.id)
+    downloadAttachment(response, file.original_name)
+  } catch (error) { failure.value = errorMessage(error) }
+}
+
 // A re-read of the invoice hands over a new array with the same files; only an
 // actual change of the file set may touch the selection.
 watch(fileKey, () => {
   if (!ordered.value.some((file) => file.id === currentFileId.value)) {
     currentFileId.value = ordered.value[0]?.id ?? null
-    page.value = 1
+    page.value = ordered.value[0]?.intake?.page_no ?? 1
     resetScroll()
   }
   void render()
@@ -243,11 +278,11 @@ defineExpose({ reload: render })
   <view class="viewer">
     <view class="viewer-head">
       <view class="head-text">
-        <text class="eyebrow">ORIGINAL / 原件</text>
-        <text class="viewer-title">{{ current ? current.original_name : '这张单据还没有原件' }}</text>
+        <text class="eyebrow">{{ eyebrow }}</text>
+        <text class="viewer-title">{{ current ? current.original_name : '还没有可看的原件' }}</text>
         <text v-if="current" class="muted meta">
-          第 {{ current.page_order }} 个文件 · {{ formatBytes(current.size) }}
-          · {{ current.content_type || '媒体类型未记录' }}
+          <template v-if="current.intake">批次原件 · {{ current.intake.kind === 'page' ? `第 ${current.intake.page_no} 页` : `第 ${current.intake.row_no} 行` }}</template>
+          <template v-else>第 {{ current.page_order }} 个文件 · {{ formatBytes(current.size) }}</template>
           <template v-if="kind === 'pdf'"> · PDF 共 {{ pageCount }} 页</template>
         </text>
       </view>
@@ -259,7 +294,7 @@ defineExpose({ reload: render })
         :class="{ active: current?.id === file.id }"
         :aria-current="current?.id === file.id ? 'true' : undefined"
         @click="selectFile(file.id)">
-        第 {{ file.page_order }} 页 · {{ file.original_name }}
+        {{ file.intake ? (file.intake.kind === 'page' ? `第 ${file.intake.page_no} 页` : `第 ${file.intake.row_no} 行`) : `第 ${file.page_order} 页` }} · {{ file.original_name }}
       </button>
     </view>
 
@@ -274,6 +309,7 @@ defineExpose({ reload: render })
         <text class="toolbar-text">{{ zoom === 1 ? '适应宽度' : `${zoom}×` }}</text>
         <button class="ui-button secondary small" :disabled="zoomIndex >= ZOOM_STEPS.length - 1" @click="changeZoom(1)">放大</button>
       </view>
+      <button v-if="current" class="ui-button secondary small" @click="downloadCurrent">下载原件</button>
     </view>
 
     <scroll-view class="canvas" scroll-x scroll-y :scroll-top="scrollTop" :scroll-left="scrollLeft"
@@ -284,7 +320,7 @@ defineExpose({ reload: render })
         <text class="unavailable-title">这个文件不能在页面里预览</text>
         <text class="placeholder">{{ failure }}</text>
         <text v-if="current && isHeic(current.original_name, current.content_type)" class="placeholder">
-          这是浏览器的解码能力问题，不是上传失败：服务端那份字节没有改动过。
+          原件已经保存，可以换个设备查看或下载原件。
         </text>
       </view>
       <view v-else-if="state === 'error'" class="canvas-state" role="alert">

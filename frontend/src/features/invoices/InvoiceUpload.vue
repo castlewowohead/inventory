@@ -32,6 +32,7 @@ const emit = defineEmits<{
   /** Files were added to the invoice being viewed (append mode). */
   stored: []
   openExisting: [invoiceId: number]
+  openBatch: []
   close: []
 }>()
 
@@ -169,9 +170,10 @@ onMounted(() => {
       <button class="ui-button secondary" :disabled="running || slotsLeft === 0" @click="chooseDocuments">选择图片或 PDF</button>
     </view>
     <text class="muted hint">
-      可传 {{ ALLOWED_EXTENSIONS.join(' / ') }}；单个文件默认上限 20 MB，一张单据最多 {{ MAX_FILES_PER_INVOICE }} 个文件（还可加 {{ slotsLeft }} 个）。实际上限由后端配置决定。
+      可传 {{ ALLOWED_EXTENSIONS.join(' / ') }}；单个文件不超过 20 MB，一张单据最多 {{ MAX_FILES_PER_INVOICE }} 个文件（还可加 {{ slotsLeft }} 个）。
     </text>
-    <text class="muted hint">CSV / XLSX 请从单据列表的「导入表格 / 导出明细」进入。</text>
+    <text class="muted hint">这一入口把所选文件作为同一张单据的多页。不同单据和 CSV / XLSX 可使用混合文件整理；旧表格单独导入仍在单据列表。</text>
+    <button v-if="props.mode === 'create'" class="ui-button ghost" :disabled="running" @click="emit('openBatch')">改用混合文件整理</button>
 
     <view v-if="props.mode === 'create'" class="manual-toggle">
       <switch :checked="manualOnly" :disabled="running" color="#176b4d" @change="toggleManualOnly" />
@@ -180,7 +182,7 @@ onMounted(() => {
 
     <text v-if="notice" class="field-error" role="alert">{{ notice }}</text>
     <text v-if="hasHeic" class="history-note">
-      HEIC 原件可以保存；能否在浏览器里预览、能否识别取决于后端与浏览器当前的支持情况，页面不替它们承诺。
+      HEIC 文件可以上传。如果无法预览，请下载原件查看；识别不成功时可手工录入。
     </text>
 
     <view v-if="items.length" class="queue">

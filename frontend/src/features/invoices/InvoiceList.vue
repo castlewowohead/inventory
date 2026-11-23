@@ -5,7 +5,7 @@ import { confirmLeave } from '../../shared/platform/leaveGuard'
 import InvoiceUpload from './InvoiceUpload.vue'
 import SpreadsheetImport from './SpreadsheetImport.vue'
 
-const emit = defineEmits<{ open: [id: number] }>()
+const emit = defineEmits<{ open: [id: number]; openBatch: [] }>()
 const selected = ref<'pending' | 'completed'>('pending')
 const items = ref<Invoice[]>([])
 const total = ref(0)
@@ -157,10 +157,10 @@ defineExpose({ refresh: load, showCompleted, showUpload })
   <view class="list-layout">
     <view class="page-heading">
       <view><text class="eyebrow">WORKSPACE / 单据</text><text class="page-title">单据</text><text class="muted">查看待处理与已完成的采购单据</text></view>
-      <view class="heading-actions"><button class="ui-button secondary" :aria-expanded="importing" @click="toggleImport">{{ importing ? '收起表格' : '导入表格 / 导出明细' }}</button><button class="ui-button" :aria-expanded="uploading" @click="toggleUpload">{{ uploading ? '收起上传' : '上传单据' }}</button></view>
+      <view class="heading-actions"><button class="ui-button secondary" @click="emit('openBatch')">混合文件整理 / 接着整理</button><button class="ui-button secondary" :aria-expanded="importing" @click="toggleImport">{{ importing ? '收起表格' : '导入表格 / 导出明细' }}</button><button class="ui-button" :aria-expanded="uploading" @click="toggleUpload">{{ uploading ? '收起上传' : '上传单据' }}</button></view>
     </view>
 
-    <InvoiceUpload v-if="uploading" mode="create" @uploaded="uploaded" @open-existing="uploaded" @close="uploading = false" />
+    <InvoiceUpload v-if="uploading" mode="create" @uploaded="uploaded" @open-existing="uploaded" @open-batch="emit('openBatch')" @close="uploading = false" />
     <SpreadsheetImport v-if="importing" @created="uploaded" @open-existing="uploaded" @close="importing = false" />
 
     <view class="tabs" aria-label="单据状态">

@@ -208,6 +208,25 @@ def test_patching_the_header(migrated_client: FlaskClient) -> None:
     assert body["invoice_total"] == "286.00"
 
 
+def test_patching_an_existing_invoice_accepts_clear_ocr_date_text(
+    migrated_client: FlaskClient,
+) -> None:
+    payload = post_invoice(migrated_client)
+
+    response = migrated_client.patch(
+        f"/api/invoices/{payload['id']}", json={"invoice_date": "6/29/26"}
+    )
+
+    assert response.status_code == 200
+    assert response.get_json()["invoice_date"] == "2026-06-29"
+
+    ambiguous = migrated_client.patch(
+        f"/api/invoices/{payload['id']}", json={"invoice_date": "6/11/26"}
+    )
+    assert ambiguous.status_code == 400
+    assert ambiguous.get_json()["error"]["details"]["field"] == "invoice_date"
+
+
 def test_unknown_fields_are_rejected(migrated_client: FlaskClient) -> None:
     payload = post_invoice(migrated_client)
 
@@ -494,6 +513,7 @@ def test_a_purchase_links_back_to_its_invoice(migrated_client: FlaskClient) -> N
 def test_completing_reports_the_counts(migrated_client: FlaskClient) -> None:
     """收口确认要把数字摆出来：这是漏行唯一会被拦住的时刻。"""
     payload = post_invoice(migrated_client)
+    migrated_client.patch(f"/api/invoices/{payload['id']}", json={"invoice_date": "2026-11-08"})
     food_item_id = create_food_item(migrated_client)
     migrated_client.post(
         f"/api/invoices/{payload['id']}/confirm",
@@ -517,6 +537,29 @@ def test_completing_reports_the_counts(migrated_client: FlaskClient) -> None:
     assert "1 个原始文件" in body["message"]
     assert body["invoice"]["status"] == "completed"
 
+    reopened = migrated_client.post(f"/api/invoices/{payload['id']}/reopen")
+    assert reopened.status_code == 200
+    assert reopened.get_json()["status"] == "ready_to_complete"
+    assert reopened.get_json()["completed_at"] is None
+    assert reopened.get_json()["lines"][0]["status"] == "confirmed"
+    assert migrated_client.post(f"/api/invoices/{payload['id']}/reopen").status_code == 409
+    assert migrated_client.post(f"/api/invoices/{payload['id']}/complete").status_code == 200
+
+
+def test_reviewed_header_fields_are_saved_separately_from_original_evidence(
+    migrated_client: FlaskClient,
+) -> None:
+    payload = post_invoice(migrated_client)
+    original = payload["recognition"]["raw_document_fields"]
+    response = migrated_client.patch(
+        f"/api/invoices/{payload['id']}",
+        json={"invoice_date": "2026-11-08", "invoice_total": "60.00"},
+    )
+
+    assert response.status_code == 200
+    assert response.get_json()["header_reviewed_fields"] == ["invoice_date", "invoice_total"]
+    assert response.get_json()["recognition"]["raw_document_fields"] == original
+
 
 def test_completing_with_pending_lines_is_refused(migrated_client: FlaskClient) -> None:
     payload = post_invoice(migrated_client)
@@ -527,12 +570,12 @@ def test_completing_with_pending_lines_is_refused(migrated_client: FlaskClient) 
     assert response.get_json()["error"]["details"]["pending_line_nos"] == [1, 2]
 
 
-def test_completed_invoice_source_can_be_renamed_without_changing_booked_source(
+def test_completed_invoice_source_correction_updates_booked_source(
     migrated_client: FlaskClient,
 ) -> None:
     payload = post_invoice(migrated_client)
     invoice_id = payload["id"]
-    migrated_client.patch(f"/api/invoices/{invoice_id}", json={"source_name": "Original"})
+    migrated_client.patch(f"/api/invoices/{invoice_id}", json={"source_name": "Original", "invoice_date": "2026-11-08"})
     food_item_id = create_food_item(migrated_client)
     migrated_client.post(f"/api/invoices/{invoice_id}/confirm", json={"lines": [
         {"line_id": payload["lines"][0]["id"], "food_item_id": food_item_id}
@@ -544,11 +587,16 @@ def test_completed_invoice_source_can_be_renamed_without_changing_booked_source(
     assert migrated_client.post(f"/api/invoices/{invoice_id}/complete").status_code == 200
 
     response = migrated_client.patch(
-        f"/api/invoices/{invoice_id}", json={"source_name": "Renamed"}
+        f"/api/invoices/{invoice_id}",
+        json={"source_name": "Renamed", "invoice_date": "2026-11-09"},
     )
     assert response.status_code == 200
     assert response.get_json()["source_name"] == "Renamed"
-    assert migrated_client.get("/api/purchases").get_json()["items"][0]["source_name"] == "Original"
+    purchase = migrated_client.get("/api/purchases").get_json()["items"][0]
+    assert purchase["source_name"] == "Renamed"
+    assert purchase["purchase_date"] == "2026-11-09"
+    history = migrated_client.get(f"/api/prices/food-items/{food_item_id}/history").get_json()
+    assert history["items"][0]["purchase"]["purchase_date"] == "2026-11-09"
 
 
 def test_voiding_an_invoice(migrated_client: FlaskClient) -> None:

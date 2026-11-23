@@ -588,13 +588,14 @@ def test_adjustment_can_be_voided_and_still_reconciled(
 # --- 与食材接口的衔接 -------------------------------------------------------
 
 
-def test_food_item_referenced_by_a_purchase_cannot_be_deleted(
+def test_food_item_with_standalone_purchase_can_be_deleted(
     migrated_client: FlaskClient, item_id: int
 ) -> None:
-    """步骤 03 写的「被采购记录引用时 409」现在真有引用方了。"""
-    post_purchase(migrated_client, item_id)
+    """删除食材时，独立采购也从历史中移除。"""
+    _, purchase = post_purchase(migrated_client, item_id)
 
     response = migrated_client.delete(f"/api/food-items/{item_id}")
 
-    assert response.status_code == 409
-    assert response.get_json()["error"]["code"] == "conflict"
+    assert response.status_code == 204
+    assert migrated_client.get(f"/api/food-items/{item_id}").status_code == 404
+    assert migrated_client.get(f"/api/purchases/{purchase['id']}").status_code == 404

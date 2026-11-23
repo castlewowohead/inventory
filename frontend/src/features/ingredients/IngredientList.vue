@@ -4,8 +4,9 @@ import { ApiError, deleteFoodItem, errorMessage, getCategories, getFoodItem, get
 import type { Category, CategoryRef, FoodItem, MergePlan } from '../../shared/api'
 import IngredientForm from './IngredientForm.vue'
 import CategoryManager from './CategoryManager.vue'
-import IngredientPicker from './IngredientPicker.vue'
 import IngredientMerge from './IngredientMerge.vue'
+
+const emit = defineEmits<{ openPrices: [] }>()
 
 const PAGE_SIZE = 20
 const categories = ref<Category[]>([])
@@ -27,10 +28,8 @@ const selectedId = ref<number | null>(null)
 const detail = ref<FoodItem | null>(null)
 const detailState = ref<'idle' | 'loading' | 'ready' | 'error'>('idle')
 const detailError = ref('')
-const panel = ref<'create' | 'edit' | 'categories' | 'picker' | 'merge' | null>(null)
+const panel = ref<'create' | 'edit' | 'categories' | 'merge' | null>(null)
 const mergeResult = ref('')
-const selectedFromPicker = ref<FoodItem | null>(null)
-const pickerError = ref('')
 const confirmDelete = ref(false)
 const deleting = ref(false)
 const deleteError = ref('')
@@ -177,13 +176,13 @@ function closeDetail() {
   detailState.value = 'idle'
 }
 
-function openPanel(next: 'create' | 'edit' | 'categories' | 'picker' | 'merge') {
+function openPanel(next: 'create' | 'edit' | 'categories' | 'merge') {
   panel.value = next
   showCategoryChoices.value = false
 }
 
 function onMerged(plan: MergePlan) {
-  mergeResult.value = `已合并：搬动采购记录 ${plan.moved_purchase_count} 条、发票行 ${plan.moved_invoice_line_count} 条、箱规 ${plan.moved_pack_spec_count} 条。`
+  mergeResult.value = `已合并：${plan.moved_purchase_count} 条采购记录和 ${plan.moved_invoice_line_count} 条单据明细已归入保留的食材。`
   void loadFirstPage()
 }
 
@@ -204,17 +203,6 @@ function onOpenExisting(id: number) {
   void openDetail(id)
 }
 
-async function onPickerSelect(id: number) {
-  panel.value = null
-  pickerError.value = ''
-  try {
-    selectedFromPicker.value = await getFoodItem(id)
-  } catch (error) {
-    selectedFromPicker.value = null
-    pickerError.value = errorMessage(error)
-  }
-}
-
 async function removeDetail() {
   if (!detail.value || deleting.value) return
   deleting.value = true
@@ -225,12 +213,21 @@ async function removeDetail() {
     void loadFirstPage()
   } catch (error) {
     deleteError.value = error instanceof ApiError && error.status === 409
-      ? `这项食材已被采购记录或单据引用，不能删除。${error.message}`
+      ? blockedDeleteMessage(error)
       : errorMessage(error)
     confirmDelete.value = false
   } finally {
     deleting.value = false
   }
+}
+
+function blockedDeleteMessage(error: ApiError): string {
+  const details = error.details
+  const confirmed = details?.confirmed_invoice_lines
+  const linked = details?.invoice_linked_purchases
+  if (typeof confirmed === 'number' && confirmed > 0) return `这项食材已有 ${confirmed} 条单据明细确认入库，不能删除。`
+  if (typeof linked === 'number' && linked > 0) return '这项食材有单据入库记录，不能删除。'
+  return '这项食材仍被单据使用，不能删除。'
 }
 
 onMounted(() => {
@@ -271,18 +268,16 @@ onUnmounted(() => {
       </view>
       <button class="never-filter" :aria-pressed="neverPurchased" @click="toggleNeverPurchased">{{ neverPurchased ? '☑' : '□' }} 从没买过</button>
     </view>
-    <text class="filter-help">已作废的采购记录仍算买过；草稿行也可能引用筛出的食材，所以筛选结果不保证可删除。</text>
+    <text class="filter-help">已作废的采购记录仍算买过；已有单据入库记录的食材不能删除。</text>
     <view v-if="mergeResult" class="selection-note" role="status">{{ mergeResult }}</view>
     <view v-if="categoryState === 'loading'" class="minor-status" role="status">正在读取分类…</view>
     <view v-else-if="categoryState === 'error'" class="minor-status error-state" role="alert">
       分类读取失败：{{ categoryError }} <button class="text-button" @click="loadCategories">重试分类</button>
     </view>
     <view class="local-actions">
-      <button class="text-button" @click="openPanel('picker')">选择食材</button>
       <button class="text-button" :disabled="categoryState !== 'ready'" @click="openPanel('categories')">分类管理</button>
+      <button class="text-button" @click="emit('openPrices')">价格</button>
     </view>
-    <view v-if="selectedFromPicker" class="selection-note" role="status">已选择：{{ selectedFromPicker.name }}（ID {{ selectedFromPicker.id }}）</view>
-    <view v-if="pickerError" class="error-state" role="alert">选择结果读取失败：{{ pickerError }}</view>
 
     <view class="ui-card list-card">
       <view class="list-head"><text>食材名称</text><text>分类</text><text>基础单位</text></view>
@@ -332,7 +327,7 @@ onUnmounted(() => {
           </view>
           <text v-if="deleteError" class="error-state" role="alert">{{ deleteError }}</text>
           <view v-if="confirmDelete" class="delete-check">
-            <text>确定删除「{{ detail.name }}」？已被单据或采购记录引用的食材无法删除。</text>
+            <text>确定删除「{{ detail.name }}」？没有单据入库记录时，相关的独立采购历史也会一并删除。</text>
             <view class="detail-actions"><button class="ui-button secondary" @click="confirmDelete = false">取消</button><button class="ui-button danger-solid" :disabled="deleting" @click="removeDetail">{{ deleting ? '删除中…' : '确认删除' }}</button></view>
           </view>
         </view>
@@ -340,11 +335,10 @@ onUnmounted(() => {
     </view>
 
     <view v-if="panel" class="detail-overlay" @click.self="closePanel">
-      <view class="detail-panel ui-card" :class="{ 'merge-dialog': panel === 'merge' }" role="dialog" aria-modal="true" :aria-label="panel === 'categories' ? '分类管理' : panel === 'picker' ? '选择食材' : panel === 'merge' ? '合并重复食材' : '食材表单'">
+      <view class="detail-panel ui-card" :class="{ 'merge-dialog': panel === 'merge' }" role="dialog" aria-modal="true" :aria-label="panel === 'categories' ? '分类管理' : panel === 'merge' ? '合并重复食材' : '食材表单'">
         <IngredientForm v-if="panel === 'create'" :categories="categories" @saved="onSaved" @cancel="panel = null" @open-existing="onOpenExisting" />
         <IngredientForm v-else-if="panel === 'edit' && detail" :key="detail.id" :item="detail" :categories="categories" @saved="onSaved" @cancel="panel = null" @open-existing="onOpenExisting" />
         <CategoryManager v-else-if="panel === 'categories'" :categories="categories" @changed="refreshCategories" @close="panel = null" />
-        <IngredientPicker v-else-if="panel === 'picker'" @select="onPickerSelect" @close="panel = null" />
         <IngredientMerge v-else-if="panel === 'merge' && detail" :target="detail" @merged="onMerged" @close="closePanel" />
       </view>
     </view>

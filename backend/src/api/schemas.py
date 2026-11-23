@@ -50,6 +50,7 @@ from src.services.prices import (
     ConversionView,
     ExclusionSummary,
     MonthlyPriceReport,
+    WeeklyPriceReport,
     PackSpecPage,
     PackSpecView,
     PendingPackSpecRow,
@@ -68,6 +69,24 @@ from src.services.purchases import (
     PurchaseView,
     format_money,
     format_quantity,
+)
+from src.services.intake import (
+    IntakeBatchView,
+    IntakeCandidateView,
+    IntakeFileRefView,
+    IntakeItemPage,
+    IntakeItemView,
+)
+from src.services.intake_ingest import IngestedFile, UploadOutcome
+from src.services.intake_recognition import RecognizedItem
+from src.services.intake_suggestions import (
+    AliasView,
+    ItemSuggestions,
+    PileBoard,
+    PileView,
+    SourceMemoryEntry,
+    SuggestionRun,
+    SuggestionView,
 )
 from src.services.merging import MergePlan
 from src.services.suggestions import FoodItemSuggestion, FoodItemSuggestions
@@ -569,6 +588,7 @@ def invoice_payload(view: InvoiceView) -> dict[str, Any]:
         "invoice_total": (
             format_money(view.invoice_total) if view.invoice_total is not None else None
         ),
+        "header_reviewed_fields": list(view.header_reviewed_fields),
         "recognition": {
             "provider": view.recognition_provider,
             "is_fake": view.recognition_is_fake,
@@ -582,6 +602,7 @@ def invoice_payload(view: InvoiceView) -> dict[str, Any]:
         "voided_at": view.voided_at.isoformat() if view.voided_at else None,
         "updated_at": view.updated_at.isoformat(),
         "files": [invoice_file_payload(item) for item in view.files],
+        "intake_sources": list(view.intake_sources),
         "lines": [invoice_line_payload(line) for line in view.lines],
         "reconciliation": reconciliation_payload(view.reconciliation),
         "possible_duplicate_invoice_ids": list(view.possible_duplicate_invoice_ids),
@@ -814,6 +835,20 @@ def monthly_prices_payload(report: MonthlyPriceReport) -> dict[str, Any]:
     }
 
 
+def weekly_prices_payload(report: WeeklyPriceReport) -> dict[str, Any]:
+    """每周加权均价序列及本周与上周同期比较。"""
+    return {
+        "food_item": food_item_ref_payload(report.food_item),
+        "currency": report.currency,
+        "base_unit": report.base_unit,
+        "weeks": [period_stats_payload(stats) for stats in report.weeks],
+        "comparison": comparison_payload(report.comparison),
+        "excluded": exclusion_payload(report.excluded),
+        "available_currencies": list(report.available_currencies),
+        "notes": list(report.notes),
+    }
+
+
 def source_stats_payload(stats: SourceStats) -> dict[str, Any]:
     """一个采购来源的均价。
 
@@ -924,4 +959,378 @@ def pending_pack_spec_payload(row: PendingPackSpecRow) -> dict[str, Any]:
             if row.suggestion is not None
             else None
         ),
+    }
+
+
+# --- 整理批次（多文件计划 M02 / M03） ----------------------------------------
+
+
+def intake_candidate_payload(view: IntakeCandidateView) -> dict[str, Any]:
+    """一条系统建议。
+
+    ⚠️ 候选与人工决定在响应里是**两处**，不是一处：`basis` 说明这条建议的依据，
+    而它永远不会自己变成 `decided_*`（docs/multifiles.md 第 4 节）。界面要能把
+    「系统建议」与「人确认过」显著区分开。
+    """
+    return {
+        "id": view.id,
+        "field": view.field,
+        "value": view.value,
+        "value_normalized": view.value_normalized,
+        "basis": view.basis,
+        "confidence": str(view.confidence) if view.confidence is not None else None,
+        "evidence": view.evidence,
+        "created_at": view.created_at.isoformat(),
+    }
+
+
+def intake_file_payload(view: IntakeFileRefView) -> dict[str, Any]:
+    """批次里的一个文件：处理到哪一步、切出了几个内容。
+
+    `status` 只有四个离散值（`pending` / `ready` / `failed` / `discarded`），
+    **没有百分比**：本地切页没有可信的中间进度，编一个出来只会让人以为卡住了。
+    `item_count` 在 `ready` 之后才有值，它就是「这份文件贡献了几张卡片」。
+
+    ⚠️ 不透出 `storage_key`：那是存储布局的内部引用，回看原件走
+    `/api/intake/files/<id>/content`。
+    """
+    return {
+        "id": view.id,
+        "batch_id": view.batch_id,
+        "original_name": view.original_name,
+        "upload_order": view.upload_order,
+        "status": view.status,
+        "item_count": view.item_count,
+        "sheet_name": view.sheet_name,
+        "sha256": view.sha256,
+        "size": view.size,
+        "content_type": view.content_type,
+        "error": (
+            None
+            if view.error_code is None
+            else {"code": view.error_code, "message": view.error_message}
+        ),
+        "discarded_at": view.discarded_at.isoformat() if view.discarded_at else None,
+        "created_at": view.created_at.isoformat(),
+    }
+
+
+def intake_item_payload(view: IntakeItemView) -> dict[str, Any]:
+    """一个可归类内容（整理页上的一张卡片）。
+
+    `page_no` / `row_no` 是**回看原件的坐标**：页内容有页号没行号，表格行反之。
+    `decided_*` 为 null 不是"识别失败"，而是「还没人定过」——卡片留在待归类区或
+    某一天的「商家待定」里。
+
+    ⚠️ `handed_off_at` 不是 null 时这张卡片**已经进了审核**，整理命令会被服务端
+    拒成 409。透出它是为了让界面先说清楚「这张已送审，改它要走审核里的分类修订」，
+    而不是让人点一下才撞到报错（多文件计划 M12）。
+    """
+    return {
+        "id": view.id,
+        "batch_id": view.batch_id,
+        "batch_file_id": view.batch_file_id,
+        "kind": view.kind,
+        "page_no": view.page_no,
+        "row_no": view.row_no,
+        "sheet_name": view.sheet_name,
+        "original_name": view.original_name,
+        "sha256": view.sha256,
+        "decided_purchase_date": (
+            view.decided_purchase_date.isoformat()
+            if view.decided_purchase_date
+            else None
+        ),
+        "decided_source_name": view.decided_source_name,
+        "decided_source_name_normalized": view.decided_source_name_normalized,
+        "decided_at": view.decided_at.isoformat() if view.decided_at else None,
+        "version": view.version,
+        "handed_off_at": (
+            view.handed_off_at.isoformat() if view.handed_off_at else None
+        ),
+        "pile_excluded": view.pile_excluded,
+        "row_values": view.row_data.get("values") if isinstance(view.row_data, dict) else None,
+        "candidates": [
+            intake_candidate_payload(candidate) for candidate in view.candidates
+        ],
+        "recognition": intake_recognition_payload(view),
+    }
+
+
+def intake_recognition_payload(view: IntakeItemView) -> dict[str, Any]:
+    """这张卡片的日期/商家识别跑到哪一步了（多文件计划 M05）。
+
+    ⚠️ `status` 与「有没有候选」**不是同一件事**：读完发现纸面上没有商家时
+    `status` 是 `done`、候选是 0 条；没跑过时是 null。前端据此说得出
+    「还没读」「读了但纸上没有」「读失败了」三句不同的话，而不是一律显示「未知」。
+
+    `date_raw_text` 与 `date_readings` 是**歧义日期的两种可能**：`6/11/2026` 会给出
+    两条读法，都只是候选。确认商家并给这家设 `date_order` 之后，
+    `POST .../items/<id>/reparse-date` 用这段原文重新解析，**不再调一次模型**。
+
+    不透出整份 payload（里面还有行项目与原始响应，那是 M08 建草稿要用的）：
+    卡片上要的是「读到什么、还能不能定死日期」。
+    """
+    payload = view.recognition_payload or {}
+    readings = payload.get("date_readings") or {}
+    date_order = payload.get("date_order") or {}
+    return {
+        "status": view.recognition_status,
+        "recognized_at": (
+            view.recognized_at.isoformat() if view.recognized_at else None
+        ),
+        "provider": payload.get("provider"),
+        "models": list(payload.get("models") or []),
+        "prompt_sha12": payload.get("prompt_sha12"),
+        "is_fake": payload.get("is_fake"),
+        "date_raw_text": readings.get("raw_text"),
+        "date_ambiguous": bool(readings.get("ambiguous")),
+        "date_problem": readings.get("problem"),
+        "date_readings": list(readings.get("readings") or []),
+        "date_order": date_order.get("value"),
+        "date_order_from": date_order.get("from"),
+        "notes": list(payload.get("notes") or []),
+        "error": (
+            None
+            if view.recognition_error_code is None
+            else {
+                "code": view.recognition_error_code,
+                "message": view.recognition_error_message,
+            }
+        ),
+    }
+
+
+def intake_item_page_payload(page: IntakeItemPage) -> dict[str, Any]:
+    return {
+        "items": [intake_item_payload(item) for item in page.items],
+        "total": page.total,
+        "limit": page.limit,
+        "offset": page.offset,
+    }
+
+
+def intake_batch_payload(view: IntakeBatchView) -> dict[str, Any]:
+    """一个整理批次。
+
+    `status` 是**派生值**（数据库里没这一列）：open / closed / discarded。
+    `files` 里不含已撤掉的文件，所以它就是「这一批现在有什么」。
+    """
+    return {
+        "id": view.id,
+        "status": view.status,
+        "created_at": view.created_at.isoformat(),
+        "updated_at": view.updated_at.isoformat(),
+        "closed_at": view.closed_at.isoformat() if view.closed_at else None,
+        "discarded_at": view.discarded_at.isoformat() if view.discarded_at else None,
+        "files": [intake_file_payload(item) for item in view.files],
+    }
+
+
+def intake_ingested_payload(result: IngestedFile) -> dict[str, Any]:
+    """一次切页的结果。
+
+    `outcome` 三种：`ingested` 切成了、`already_ingested` 早就切过（页的 id 不变）、
+    `failed` 失败并带原因。`notes` 是**留痕**——转了方向、缺解码器、某一页的内嵌图
+    列不出来，都在这里，不静默发生。
+    """
+    return {
+        "file": intake_file_payload(result.ref),
+        "outcome": result.outcome,
+        "document_format": result.document_format,
+        "page_count": result.page_count,
+        "item_ids": [item.id for item in result.items],
+        "notes": list(result.notes),
+        "error": (
+            None
+            if result.error_code is None
+            else {"code": result.error_code, "message": result.error_message}
+        ),
+    }
+
+
+def intake_recognized_payload(result: RecognizedItem) -> dict[str, Any]:
+    """一个内容的识别结局（多文件计划 M05）。
+
+    `outcome` 三种：`recognized` 读完了、`already_recognized` 早就读过（**不花钱**，
+    这正是不重复收费的闸门）、`failed` 失败并带原因。
+
+    `model_calls` 是**这一次真的发了几次模型调用**：数字 PDF 文字层与 CSV/XLSX 行
+    都是 0，扫描页等于配置里的模型个数。把它放进响应是为了让「没有重复收费」成为
+    一条可以核对的事实，而不是一句承诺。
+    """
+    return {
+        "item": intake_item_payload(result.item),
+        "outcome": result.outcome,
+        "provider": result.provider,
+        "model_calls": result.calls,
+        "date_candidates": list(result.date_candidates),
+        "source_candidates": list(result.source_candidates),
+        "notes": list(result.notes),
+        "error": (
+            None
+            if result.error_code is None
+            else {
+                "code": result.error_code,
+                "message": result.item.recognition_error_message,
+            }
+        ),
+    }
+
+
+def intake_upload_payload(outcome: UploadOutcome) -> dict[str, Any]:
+    """一次文件上传的结果。
+
+    三个提示字段都是**事实而不是拦截结果**（能走到这里就说明没被拦住）：
+
+    - `reused_bytes`：这份字节库里已经有了，没有再存一份。
+    - `shared_with_batch_ids`：同一份字节还在哪些别的批次里。
+    - `same_bytes_invoice_ids`：同一份字节在旧单张上传路径上已有的单据。
+
+    `queued` 为 true 表示切页交给后台了，此时 `ingest` 是 null——**不假装已经切完**，
+    前端去轮询 `GET /api/intake/batches/<id>`。
+    """
+    registered = outcome.registered
+    return {
+        "file": intake_file_payload(outcome.ref),
+        "queued": outcome.queued,
+        "reused_bytes": registered.reused_bytes,
+        "shared_with_batch_ids": list(registered.shared_with_batch_ids),
+        "same_bytes_invoice_ids": list(registered.same_bytes_invoice_ids),
+        "ingest": (
+            None if outcome.ingested is None else intake_ingested_payload(outcome.ingested)
+        ),
+    }
+
+
+# --- 多文件计划 M07：商家记忆与相似堆 ----------------------------------------
+
+
+def intake_alias_payload(view: AliasView) -> dict[str, Any]:
+    """一条别名映射：纸面上的这种写法指向人确认过的哪一家。
+
+    ⚠️ `basis` 必须透出：`user` 是人自己说的（重算不会覆盖它），
+    `confirmed_paper_reading` / `paper_bilingual` 是系统**观察**到的，可以删掉或
+    改指向——这正是 docs/multifiles.md 第 5 节要求的「可更正」。
+    """
+    return {
+        "id": view.id,
+        "alias_key": view.alias_key,
+        "alias_text": view.alias_text,
+        "source_key": view.source_key,
+        "source_name": view.source_name,
+        "basis": view.basis,
+        "evidence": view.evidence,
+        "created_at": view.created_at.isoformat(),
+        "updated_at": view.updated_at.isoformat(),
+    }
+
+
+def intake_source_memory_payload(entry: SourceMemoryEntry) -> dict[str, Any]:
+    """一家确认过的来源。
+
+    `source_key` 是规范化名（`Costco` 与 `COSTCO` 同一个键），`source_name` 是
+    **最近一次人工确认的写法**——不是翻译，也不是模型给的名字。两个计数让人看出
+    这条记忆有多少依据。
+    """
+    return {
+        "source_key": entry.source_key,
+        "source_name": entry.source_name,
+        "confirmed_items": entry.confirmed_items,
+        "purchase_records": entry.purchase_records,
+        "last_confirmed_at": (
+            entry.last_confirmed_at.isoformat() if entry.last_confirmed_at else None
+        ),
+        "aliases": [intake_alias_payload(alias) for alias in entry.aliases],
+    }
+
+
+def intake_suggestion_payload(view: SuggestionView) -> dict[str, Any]:
+    """一条商家建议。
+
+    ⚠️ `score` 只用于**排序**，不是概率、也不是「到几分就能自动确认」的阈值：
+    界面按它排先后，确认永远是人点的那一下（第 4 节）。
+    """
+    return {
+        "basis": view.basis,
+        "value": view.value,
+        "value_normalized": view.value_normalized,
+        "score": str(view.score),
+        "evidence": view.evidence,
+    }
+
+
+def intake_item_suggestions_payload(view: ItemSuggestions) -> dict[str, Any]:
+    """一张卡片这一轮的建议。
+
+    `conflicts` 是**被纸面证据压住**的建议：这一页纸上写着别家，所以同文件/外观
+    的建议不生效。它不是错误，而是第 3.2 节要求的行为，必须看得见而不是静默发生。
+    """
+    return {
+        "item_id": view.item_id,
+        "kind": view.kind,
+        "page_no": view.page_no,
+        "row_no": view.row_no,
+        "original_name": view.original_name,
+        "paper_source": view.paper_source,
+        "resolved": view.resolved,
+        "suggestions": [
+            intake_suggestion_payload(item) for item in view.suggestions
+        ],
+        "conflicts": [dict(item) for item in view.conflicts],
+        "notes": list(view.notes),
+    }
+
+
+def intake_pile_payload(view: PileView) -> dict[str, Any]:
+    """一堆版式相同、读不出商家的内容。
+
+    `basis_detail` 把两种堆分开：`layout_template` 量到了模板特征（格线行数、
+    字号集合），`layout_unknown` 没量出来——后者只够让人扫视缩略图，系统不会
+    据此给商家建议。`excluded_item_ids` 是人一张张排除的例外，它们不在
+    `item_ids` 里，也拿不到这一堆的建议。
+    """
+    return {
+        "fingerprint": view.fingerprint,
+        "content_class": view.content_class,
+        "basis_detail": view.basis_detail,
+        "template_evidence": view.template_evidence,
+        "features": view.features,
+        "item_ids": list(view.item_ids),
+        "item_count": view.item_count,
+        "excluded_item_ids": list(view.excluded_item_ids),
+        "confirmed_sources": [dict(item) for item in view.confirmed_sources],
+        "notes": list(view.notes),
+    }
+
+
+def intake_pile_board_payload(board: PileBoard) -> dict[str, Any]:
+    return {
+        "batch_id": board.batch_id,
+        "piles": [intake_pile_payload(pile) for pile in board.piles],
+        "unprofiled_item_ids": list(board.unprofiled_item_ids),
+        "notes": list(board.notes),
+    }
+
+
+def intake_suggestion_run_payload(run: SuggestionRun) -> dict[str, Any]:
+    """一次建议重算的结果。
+
+    ⚠️ `model_calls` 恒为 0，而且是**结构上**的 0：建议服务没有识别器依赖。
+    `layout_pending` 不为 0 时再调一次接着量版式，已量过的不会重量。
+    """
+    return {
+        "batch_id": run.batch_id,
+        "items": [intake_item_suggestions_payload(item) for item in run.items],
+        "piles": [intake_pile_payload(pile) for pile in run.piles],
+        "aliases_recorded": [
+            intake_alias_payload(alias) for alias in run.aliases_recorded
+        ],
+        "layout_profiled": run.layout_profiled,
+        "layout_pending": run.layout_pending,
+        "total": run.total_items,
+        "limit": run.limit,
+        "offset": run.offset,
+        "model_calls": run.model_calls,
+        "notes": list(run.notes),
     }

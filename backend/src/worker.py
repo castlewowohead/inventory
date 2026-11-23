@@ -178,6 +178,34 @@ def start_in_process(app, config: Config) -> "ExtractionWorker | None":
     return worker
 
 
+def start_intake_ingest(app) -> "BackgroundIngest":
+    """给整理批次的切页装一个后台线程池（多文件计划 M03）。
+
+    装上它之后，上传请求只做「存字节 + 登记」就返回，切页在请求之外进行：浏览器
+    关掉、网络断掉都不影响已经收下的字节。
+
+    为什么**不放进 `create_app()`**：创建应用不该产生副作用（见 `src/factory.py`
+    的组装规则）。没装调度器时 `build_intake_services` 用的是 `InlineIngest`
+    ——当场切完，测试因此不会悄悄起线程，也不会出现"切页跑在哪一刻说不清"。
+
+    为什么**不是一个轮询 worker**：`intake_batch_files.status` 的 `pending` 本身
+    就是队列，切页是本地计算（数页数、解一张图），没有 `running` 中间态，重跑也
+    不花钱。所以这里只把切页挪出请求，不做轮询、也**不在启动时扫一遍库**——
+    启动不连数据库是本项目守着的一条性质（README 第 10 节）。上次没切完的文件
+    停在 `pending`，一个 `POST /api/intake-batches/<id>/process` 就接着切，
+    恢复批次时顺手调一次即可。
+    """
+    from src.factory import INGEST_SCHEDULER_KEY  # 延迟导入：避免与工厂互相 import
+    from src.services.intake_ingest import BackgroundIngest
+
+    scheduler = BackgroundIngest()
+    app.config[INGEST_SCHEDULER_KEY] = scheduler
+    # 停下时让正在切的那一个切完：切到一半被掐断会留下 `pending`，下次照样能接着切。
+    atexit.register(scheduler.shutdown)
+    app.logger.info("intake ingest scheduler installed (background thread)")
+    return scheduler
+
+
 def build_service(config: Config) -> ExtractionService:
     """按配置组装一套提取服务（与应用工厂同一套依赖，只是不带 Flask）。"""
     database = Database.from_config(config)
@@ -256,4 +284,11 @@ if __name__ == "__main__":
     sys.exit(main())
 
 
-__all__ = ["ExtractionWorker", "POLL_INTERVAL_SECONDS", "build_service", "main"]
+__all__ = [
+    "ExtractionWorker",
+    "POLL_INTERVAL_SECONDS",
+    "build_service",
+    "main",
+    "start_in_process",
+    "start_intake_ingest",
+]

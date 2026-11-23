@@ -122,7 +122,7 @@ async function remove(id: number) {
       </template>
       <text v-if="rowError[category.id]" class="field-error" role="alert">{{ rowError[category.id] }}</text>
       <view v-if="confirmDeleteId === category.id" class="delete-check">
-        <text>确定删除「{{ category.name_zh || category.name }}」？仍被食材引用时服务端会拒绝。</text>
+        <text>确定删除「{{ category.name_zh || category.name }}」？如果还有食材属于这个分类，需要先调整这些食材。</text>
         <view class="row-actions"><button class="ui-button secondary" @click="confirmDeleteId = null">取消</button><button class="ui-button danger-solid" :disabled="busy" @click="remove(category.id)">确认删除</button></view>
       </view>
     </view>

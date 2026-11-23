@@ -33,13 +33,15 @@ function noteText(value: string) {
 
 function blockerLocation(blocker: MergePlan['blockers'][number]) {
   const d = blocker.details
+  const item = preview.value?.sources.find((source) => source.food_item.id === d.food_item_id)?.food_item
+  const name = item?.name_zh || item?.name || '所选食材'
   if (blocker.code === 'pack_spec_conflict') {
-    return `食材 #${d.food_item_id} · ${d.source_name || '不限来源'} · ${d.purchase_unit}；保留项箱规 #${d.target_pack_spec_id}，被并项箱规 #${d.source_pack_spec_id}`
+    return `${name} 的旧单位换算记录需要先处理。`
   }
   if (blocker.code === 'incompatible_base_unit') {
-    return `食材 #${d.food_item_id} · ${d.from_unit} → ${d.to_unit}`
+    return `${name} 的单位是 ${d.from_unit}，保留的食材单位是 ${d.to_unit}。`
   }
-  return d.food_item_id ? `食材 #${d.food_item_id}` : ''
+  return d.food_item_id ? name : ''
 }
 
 function invalidatePreview() {
@@ -130,7 +132,7 @@ void load(true)
 <template>
   <view class="merge-panel">
     <view class="merge-head"><text class="merge-title">合并重复食材</text><button class="text-button" @click="emit('close')">关闭</button></view>
-    <text>把下面选中的食材并入 <strong>{{ target.name }}（#{{ target.id }}）</strong>，保留它的名称与基础单位 {{ target.base_unit }}。</text>
+    <text>把下面选中的食材并入 <strong>{{ target.name_zh || target.name }}</strong>，保留它的名称与单位 {{ target.base_unit }}。</text>
     <template v-if="!completed">
       <view class="search-row">
         <input v-model="search" class="ui-input" placeholder="按名称搜索要并掉的食材" aria-label="搜索被并掉的食材" @confirm="load(true)" />
@@ -139,7 +141,7 @@ void load(true)
       <text v-if="searchError" class="error-state" role="alert">{{ searchError }}</text>
       <view v-if="results.length" class="results" aria-label="可选择的食材">
         <button v-for="item in results" :key="item.id" class="source-choice" :disabled="item.id === target.id" :aria-pressed="selectedIds.includes(item.id)" @click="toggle(item)">
-          <text>{{ selectedIds.includes(item.id) ? '☑' : '□' }} {{ item.name }}（#{{ item.id }}） · {{ item.base_unit }}</text>
+          <text>{{ selectedIds.includes(item.id) ? '☑' : '□' }} {{ item.name_zh || item.name }} · {{ item.base_unit }}</text>
           <text v-if="item.id === target.id">保留项</text>
         </button>
       </view>
@@ -148,20 +150,20 @@ void load(true)
       <text v-if="selectError" class="error-state" role="alert">{{ selectError }}</text>
       <view v-if="selected.length" class="selected-list">
         <text>将并入 {{ target.name }}：{{ selected.length }} / {{ MAX_SOURCES }} 条</text>
-        <button v-for="item in selected" :key="item.id" class="selected-chip" @click="toggle(item)">{{ item.name }}（#{{ item.id }}） ×</button>
+        <button v-for="item in selected" :key="item.id" class="selected-chip" @click="toggle(item)">{{ item.name_zh || item.name }} ×</button>
       </view>
       <button class="ui-button secondary" :disabled="!selected.length || previewing || merging" @click="requestPreview">{{ previewing ? '预览中…' : '预览合并影响' }}</button>
       <text v-if="previewError" class="error-state" role="alert">{{ previewError }}</text>
       <view v-if="preview" class="plan" role="status">
         <text class="plan-title">{{ preview.can_merge ? '合并预览' : '合并被拦住' }}</text>
-        <text>将搬动：采购记录 {{ preview.moved_purchase_count }} 条、发票行 {{ preview.moved_invoice_line_count }} 条、箱规 {{ preview.moved_pack_spec_count }} 条。</text>
-        <text v-for="source in preview.sources" :key="source.food_item.id">{{ source.food_item.name }}（#{{ source.food_item.id }}）：采购 {{ source.purchase_count }}、发票行 {{ source.invoice_line_count }}、箱规 {{ source.pack_spec_count }}<template v-if="source.duplicate_pack_spec_count">（其中完全相同 {{ source.duplicate_pack_spec_count }} 条不搬）</template></text>
+        <text>将归并 {{ preview.moved_purchase_count }} 条采购记录和 {{ preview.moved_invoice_line_count }} 条单据明细。</text>
+        <text v-for="source in preview.sources" :key="source.food_item.id">{{ source.food_item.name_zh || source.food_item.name }}：{{ source.purchase_count }} 条采购记录、{{ source.invoice_line_count }} 条单据明细</text>
         <view v-for="(blocker, index) in preview.blockers" :key="index" class="blocker" role="alert">
-          <text>{{ blocker.message }}</text><text v-if="blockerLocation(blocker)">位置：{{ blockerLocation(blocker) }}</text>
+          <text>{{ blocker.message }}</text><text v-if="blockerLocation(blocker)">{{ blockerLocation(blocker) }}</text>
         </view>
-        <text v-for="(note, index) in preview.notes.filter(note => !note.includes('不可逆'))" :key="index">{{ noteText(note) }}</text>
+        <text v-for="(note, index) in preview.notes.filter(note => !note.includes('无法撤销'))" :key="index">{{ noteText(note) }}</text>
         <view class="confirm-area">
-          <text class="irreversible">{{ noteText(preview.notes.find(note => note.includes('不可逆')) || '合并不可逆。') }}</text>
+          <text class="irreversible">{{ noteText(preview.notes.find(note => note.includes('无法撤销')) || '合并后无法撤销。') }}</text>
           <button class="ui-button" :disabled="!preview.can_merge || merging" @click="executeMerge">{{ merging ? '合并中…' : '确认合并' }}</button>
         </view>
       </view>
@@ -169,7 +171,7 @@ void load(true)
     </template>
     <view v-else class="success" role="status">
       <text class="plan-title">已并入 {{ completed.target.name }}</text>
-      <text>实际搬动：采购记录 {{ completed.moved_purchase_count }} 条、发票行 {{ completed.moved_invoice_line_count }} 条、箱规 {{ completed.moved_pack_spec_count }} 条。</text>
+      <text>已归并 {{ completed.moved_purchase_count }} 条采购记录和 {{ completed.moved_invoice_line_count }} 条单据明细。</text>
       <button class="ui-button" @click="emit('close')">完成</button>
     </view>
   </view>

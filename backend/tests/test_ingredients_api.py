@@ -685,7 +685,7 @@ def test_merge_preview_then_merge(migrated_client: FlaskClient) -> None:
     assert plan["blockers"] == []
     assert plan["target"]["id"] == keep["id"]
     assert [row["food_item"]["id"] for row in plan["sources"]] == [dupe["id"]]
-    assert any("不可逆" in note for note in plan["notes"])
+    assert any("无法撤销" in note for note in plan["notes"])
     # 预览是只读的：那条食材还在。
     assert migrated_client.get(f"/api/food-items/{dupe['id']}").status_code == 200
 

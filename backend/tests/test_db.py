@@ -364,8 +364,8 @@ def test_probe_tables_are_not_business_tables() -> None:
     assert not set(PROBE_METADATA.tables) & set(Base.metadata.tables)
 
 
-def test_declared_business_tables_are_exactly_the_step_10_ones() -> None:
-    """到步骤 10 为止共十二张业务表。
+def test_declared_business_tables_are_exactly_the_expected_ones() -> None:
+    """到步骤 10 为止共十二张业务表，加多文件计划 M02 的五张。
 
     分类、标准食材（03），采购记录与它的修改日志（04），单据、单据文件与行项目
     （05），提取任务与供应商提取路径（08），箱规与涨价提醒设置（09），
@@ -382,6 +382,17 @@ def test_declared_business_tables_are_exactly_the_step_10_ones() -> None:
 
     ⚠️ 步骤 10 的 `food_item_merges` **不是别名表**（步骤 03 的决定不变）：
     它记的是**发生过的合并**，只在合并真的发生时才长一行，没人能往里手工添叫法。
+
+    ⚠️ M07 的 `intake_source_aliases` **也不是供应商表**：它只有「纸面上这种写法 →
+    人确认过的哪一家」一个映射，没有联系人、地址、账期。M07 的另两样记忆**都没有
+    表**——「这一家现在叫什么」由最近一次人工确认聚合出来，「这个版式属于哪一家」
+    由 `intake_items.layout_fingerprint` 加那一页上的确认派生。
+
+    多文件计划 M02 加五张 `intake_*`：整理批次、按内容摘要一行一份的原件字节、
+    批次对原件的引用、可归类内容（PDF 的一页 / 表格的一行）与分类候选。
+    ⚠️ **没有「日期/商家组」表**——组由内容上的人工决定值派生，另存一张就会与
+    内容打架。⚠️ **`invoice_files` 一个字都没改**：它的 `sha256` 全局唯一是
+    步骤 05「完全相同的文件不许重复上传」的落点，整理批次另立一套表而不是放宽它。
     """
     assert set(Base.metadata.tables) == {
         "categories",
@@ -396,6 +407,15 @@ def test_declared_business_tables_are_exactly_the_step_10_ones() -> None:
         "pack_specs",
         "price_alert_settings",
         "food_item_merges",
+        "intake_batches",
+        "intake_files",
+        "intake_batch_files",
+        "intake_items",
+        "intake_item_candidates",
+        "intake_moves",
+        "intake_move_entries",
+        "intake_review_links",
+        "intake_source_aliases",
     }
 
 

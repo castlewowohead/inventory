@@ -1,9 +1,10 @@
 import { apiRequest, apiRequestBinary, type BinaryResponse } from './request'
 import type {
-  Category, ExtractionJob, Health, ItemList, Page, FoodItem, FoodItemSuggestions, MergePlan, Invoice, InvoiceLine, MatchCandidate, Purchase, PriceUnits, PriceHistory, PackSpec, PendingPackSpec, MonthlyPrices, SourcePrices, PriceAlerts, AlertSettings
+  Category, ExtractionJob, Health, ItemList, Page, FoodItem, FoodItemSuggestions, MergePlan, Invoice, InvoiceLine, MatchCandidate, Purchase, PriceUnits, PriceHistory, MonthlyPrices, WeeklyPrices, SourcePrices, PriceAlerts, AlertSettings, IntakeBatch, IntakeGroupPage, IntakeItem,
+  IntakeMoveResult
 } from './types'
 
-export { ApiError, errorMessage } from './errors'
+export { ApiError, errorMessage, userMessage } from './errors'
 export { apiRequestBinary } from './request'
 export type { BinaryResponse } from './request'
 export { apiRequest } from './request'
@@ -77,6 +78,100 @@ export type CropField = 'item_description' | 'quantity' | 'unit' | 'unit_price' 
 /** The original bytes of one uploaded file, exactly as they were stored. */
 export const getInvoiceFileContent = (invoiceId: number, fileId: number) =>
   apiRequestBinary(`/api/invoices/${invoiceId}/files/${fileId}/content`)
+
+export const getIntakeItemOriginal = (batchId: number, itemId: number) =>
+  apiRequestBinary(`/api/intake-batches/${batchId}/items/${itemId}/original`)
+
+export const createIntakeBatch = () =>
+  apiRequest<IntakeBatch>('/api/intake-batches', { method: 'POST' })
+export const getCurrentIntakeBatch = () =>
+  apiRequest<IntakeBatch>('/api/intake-batches/current')
+export const getIntakeBatch = (id: number) =>
+  apiRequest<IntakeBatch>(`/api/intake-batches/${id}`)
+export const getIntakeBatchFileOriginal = (batchId: number, fileId: number) =>
+  apiRequestBinary(`/api/intake-batches/${batchId}/files/${fileId}/original`)
+export const processIntakeBatch = (id: number, retryFailed = false) =>
+  apiRequest<{ batch: IntakeBatch }>(`/api/intake-batches/${id}/process`, {
+    method: 'POST', data: { retry_failed: retryFailed }
+  })
+
+/** Every classifiable content in the batch, newest decisions included. */
+export interface IntakeItemFilters {
+  purchaseDate?: string
+  sourceName?: string
+  missing?: 'any' | 'both' | 'date' | 'source' | 'date_any' | 'source_any' | 'recognition_failed'
+}
+export const getIntakeItems = (batchId: number, limit = 50, offset = 0, filters: IntakeItemFilters = {}) => {
+  const params = new URLSearchParams({ limit: String(limit), offset: String(offset) })
+  if (filters.purchaseDate) params.set('purchase_date', filters.purchaseDate)
+  if (filters.sourceName) params.set('source_name', filters.sourceName)
+  if (filters.missing) params.set('missing', filters.missing)
+  return apiRequest<Page<IntakeItem>>(`/api/intake-batches/${batchId}/items?${params}`)
+}
+
+/** The derived (date, supplier) groups, unclassified bucket included. */
+export const getIntakeGroups = (batchId: number, limit = 50, offset = 0) =>
+  apiRequest<IntakeGroupPage>(`/api/intake-batches/${batchId}/groups?limit=${limit}&offset=${offset}`)
+
+/**
+ * The contents of one group. Leaving a parameter out addresses the null side:
+ * no arguments at all is the unclassified bucket, a date alone is 商家待定.
+ */
+export const getIntakeGroupItems = (
+  batchId: number,
+  target: { purchaseDate?: string | null; sourceName?: string | null },
+  limit = 50, offset = 0
+) => {
+  const params = new URLSearchParams({ limit: String(limit), offset: String(offset) })
+  if (target.purchaseDate) params.set('purchase_date', target.purchaseDate)
+  if (target.sourceName) params.set('source_name', target.sourceName)
+  return apiRequest<Page<IntakeItem>>(`/api/intake-batches/${batchId}/groups/items?${params}`)
+}
+
+/**
+ * The one move command behind dragging, multi-select and tapping a target
+ * (docs/multifiles.md section 4): `date` writes only the date, `group` writes
+ * both, `clear` sends contents back to 待归类. `requestKey` makes a repeated
+ * submission return the first result instead of moving twice.
+ */
+export const moveIntakeItems = (
+  batchId: number,
+  body: {
+    request_key: string
+    action: 'date' | 'group' | 'source' | 'clear'
+    items: { id: number; version: number }[]
+    purchase_date?: string
+    source_name?: string
+  }
+) => apiRequest<IntakeMoveResult>(`/api/intake-batches/${batchId}/moves`, { method: 'POST', data: { ...body } })
+
+/** Undoes the most recent move that has not been undone yet. */
+export const undoIntakeMove = (batchId: number, moveId: number) =>
+  apiRequest<IntakeMoveResult>(`/api/intake-batches/${batchId}/moves/${moveId}/undo`, { method: 'POST' })
+
+/**
+ * M08 的送审命令：把**明确选中的**内容做成一张待审核草稿（M12 把闭环接起来时
+ * 卡片页与财务表格共用它）。
+ *
+ * 服务端的边界要照着说给用户听，而不是等 409：一次 1—20 条、同日期同商家、
+ * 页与表格行不能混、纸面单号/总额不一致要分开送。重复送审返回原草稿
+ * （`created: false`），所以重复点一下不会多出一张单据。
+ */
+export const handOffIntakeItems = (
+  batchId: number,
+  items: { id: number; version: number }[],
+  targetInvoiceId?: number
+) => apiRequest<{ invoice_id: number; item_ids: number[]; created: boolean }>(
+  `/api/intake-batches/${batchId}/reviews`,
+  { method: 'POST', data: { items, ...(targetInvoiceId ? { target_invoice_id: targetInvoiceId } : {}) } }
+)
+
+export const reviseIntakeReviewClassification = (
+  batchId: number, invoiceId: number, items: { id: number; version: number }[],
+  purchaseDate: string, sourceName: string
+) => apiRequest(`/api/intake-batches/${batchId}/reviews/${invoiceId}/classification`, {
+  method: 'PATCH', data: { scope: 'invoice', items, purchase_date: purchaseDate, source_name: sourceName }
+})
 
 function headerJson(value: string | undefined): unknown {
   if (!value) return null
@@ -204,6 +299,9 @@ export const completeInvoice = (invoiceId: number) =>
     `/api/invoices/${invoiceId}/complete`, { method: 'POST' }
   )
 
+export const reopenInvoice = (invoiceId: number) =>
+  apiRequest<Invoice>(`/api/invoices/${invoiceId}/reopen`, { method: 'POST' })
+
 // --- F11：表格预览、创建与采购明细下载 --------------------------------------
 export interface ImportIssue {
   field: string
@@ -236,46 +334,34 @@ export type ImportOptions = Record<string, unknown>
 export const getPurchaseExport = (format: 'csv' | 'xlsx') =>
   apiRequestBinary(`/api/purchases/export?format=${format}`)
 
-// --- F19：价格历史、单位目录与箱规 -----------------------------------------
+// --- 价格历史与基础单位目录 ------------------------------------------------
 export const getPriceUnits = () => apiRequest<PriceUnits>('/api/prices/units')
 export const getPriceHistory = (foodItemId: number, currency: string | null, offset = 0) => {
   const params = new URLSearchParams({ limit: '20', offset: String(offset) })
   if (currency) params.set('currency', currency)
   return apiRequest<PriceHistory>(`/api/prices/food-items/${foodItemId}/history?${params}`)
 }
-export const getPendingPackSpecs = () =>
-  apiRequest<ItemList<PendingPackSpec>>('/api/prices/pack-specs/pending?limit=100')
-export const getPackSpecs = (foodItemId: number, offset = 0) =>
-  apiRequest<Page<PackSpec>>(`/api/prices/pack-specs?food_item_id=${foodItemId}&limit=100&offset=${offset}`)
-export interface PackSpecInput {
-  food_item_id: number
-  source_name: string | null
-  purchase_unit: string
-  pack_size: string
-  pack_unit: string
-  spec_text: string | null
-  note: string | null
+// --- 价格趋势、来源与提醒 -----------------------------------------------
+export const getWeeklyPrices = (foodItemId: number, currency: string | null, weeks = 6) => {
+  const params = new URLSearchParams({ weeks: String(weeks) })
+  if (currency) params.set('currency', currency)
+  return apiRequest<WeeklyPrices>(`/api/prices/food-items/${foodItemId}/weekly?${params}`)
 }
-export const savePackSpec = (data: PackSpecInput) =>
-  apiRequest<PackSpec & { created: boolean; affected_purchase_count: number; notice: string }>(
-    '/api/prices/pack-specs', { method: 'POST', data: { ...data } })
-export const deletePackSpec = (id: number) =>
-  apiRequest<{ status: 'deleted'; affected_purchase_count: number; message: string }>(
-    `/api/prices/pack-specs/${id}`, { method: 'DELETE' })
-
-// --- F20：月度、来源与提醒 -----------------------------------------------
 export const getMonthlyPrices = (foodItemId: number, currency: string | null, months = 6) => {
   const params = new URLSearchParams({ months: String(months) })
   if (currency) params.set('currency', currency)
   return apiRequest<MonthlyPrices>(`/api/prices/food-items/${foodItemId}/monthly?${params}`)
 }
-export const getSourcePrices = (foodItemId: number, currency: string | null) => {
-  const params = new URLSearchParams()
+export const getSourcePrices = (foodItemId: number, currency: string | null, period: 'week' | 'month' = 'week') => {
+  const params = new URLSearchParams({ period })
   if (currency) params.set('currency', currency)
   return apiRequest<SourcePrices>(`/api/prices/food-items/${foodItemId}/sources?${params}`)
 }
-export const getPriceAlerts = (threshold: string | null = null) =>
-  apiRequest<PriceAlerts>(`/api/prices/alerts${threshold === null ? '' : `?threshold=${encodeURIComponent(threshold)}`}`)
+export const getPriceAlerts = (threshold: string | null = null, period: 'week' | 'month' = 'week') => {
+  const params = new URLSearchParams({ period })
+  if (threshold !== null) params.set('threshold', threshold)
+  return apiRequest<PriceAlerts>(`/api/prices/alerts?${params}`)
+}
 export const getAlertSettings = () => apiRequest<AlertSettings>('/api/prices/alert-settings')
 export const putAlertSettings = (data: { enabled: boolean; threshold_percent: string }) =>
   apiRequest<AlertSettings>('/api/prices/alert-settings', { method: 'PUT', data })

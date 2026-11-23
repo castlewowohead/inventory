@@ -68,15 +68,53 @@ def test_entry_registers_only_the_implemented_routes(
     entry_module: ModuleType,
 ) -> None:
     """入口拿到的应用与工厂装出来的一致：健康检查 + 食材/分类 + 采购记录 + 发票
-    与提取接口 + 价格统计。"""
+    与提取接口 + 价格统计 + 混合上传的整理批次。"""
     rules = {rule.rule for rule in entry_module.app.url_map.iter_rules()}
 
     assert rules == {
         "/health",
+        # --- 多文件计划 M03：图片 / PDF 的批次摄入 ---
+        "/api/intake-batches",
+        "/api/intake-batches/current",
+        "/api/intake-batches/<int:batch_id>",
+        "/api/intake-batches/<int:batch_id>/items",
+        "/api/intake-batches/<int:batch_id>/items/<int:item_id>/original",
+        "/api/intake-batches/<int:batch_id>/files",
+        "/api/intake-batches/<int:batch_id>/files/<int:file_id>",
+        "/api/intake-batches/<int:batch_id>/files/<int:file_id>/original",
+        "/api/intake-batches/<int:batch_id>/process",
+        # --- 多文件计划 M05：日期/商家候选与日期重解析 ---
+        # ⚠️ 与 `/process` 分开是因为**代价不同**：切页是本地计算，识别每页要花钱。
+        "/api/intake-batches/<int:batch_id>/recognize",
+        "/api/intake-batches/<int:batch_id>/items/<int:item_id>/reparse-date",
+        "/api/intake-batches/<int:batch_id>/groups",
+        "/api/intake-batches/<int:batch_id>/groups/items",
+        "/api/intake-batches/<int:batch_id>/moves",
+        "/api/intake-batches/<int:batch_id>/moves/<int:move_id>/undo",
+        "/api/intake-batches/<int:batch_id>/reviews",
+        "/api/intake-batches/<int:batch_id>/review-suggestions",
+        "/api/intake-batches/<int:batch_id>/reviews/<int:invoice_id>/classification",
+        "/api/intake-batches/<int:batch_id>/reviews/<int:invoice_id>/reassign",
+        # --- 多文件计划 M07：商家记忆与相似堆（建议，**不花钱**） ---
+        # ⚠️ 商家记忆不在批次下：它跨批次复用，而且**不是**应付账款的供应商模块。
+        "/api/intake-batches/<int:batch_id>/suggest-sources",
+        "/api/intake-batches/<int:batch_id>/piles",
+        "/api/source-memory",
+        "/api/source-memory/aliases",
+        "/api/source-memory/aliases/<int:alias_id>",
+        # --- 多文件计划 M04：CSV / XLSX 的批次摄入（另行开发，这里只登记路由） ---
+        "/api/intake-batches/<int:batch_id>/spreadsheets",
+        "/api/intake-batches/<int:batch_id>/spreadsheets/preview",
+        "/api/intake-batches/<int:batch_id>/spreadsheets/rows",
+        "/api/intake-batches/<int:batch_id>/spreadsheets/rows/<int:item_id>",
+        "/api/intake-batches/<int:batch_id>/spreadsheets/groups",
+        "/api/intake-batches/<int:batch_id>/spreadsheets/<int:batch_file_id>",
+        "/api/intake-batches/<int:batch_id>/spreadsheets/<int:batch_file_id>/original",
         # --- 步骤 09：标准化价格与价格统计 ---
         "/api/prices/units",
         "/api/prices/food-items/<int:food_item_id>/history",
         "/api/prices/food-items/<int:food_item_id>/monthly",
+        "/api/prices/food-items/<int:food_item_id>/weekly",
         "/api/prices/food-items/<int:food_item_id>/sources",
         "/api/prices/alerts",
         "/api/prices/alert-settings",
@@ -105,6 +143,7 @@ def test_entry_registers_only_the_implemented_routes(
         "/api/invoices/match",
         "/api/invoices/<int:invoice_id>",
         "/api/invoices/<int:invoice_id>/complete",
+        "/api/invoices/<int:invoice_id>/reopen",
         "/api/invoices/<int:invoice_id>/confirm",
         "/api/invoices/<int:invoice_id>/files",
         "/api/invoices/<int:invoice_id>/files/<int:file_id>",

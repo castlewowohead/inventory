@@ -11,6 +11,7 @@ from src.factory import get_config, get_database, get_file_storage, get_recogniz
 from src.services.invoices import InvoiceService, UploadedFile
 from src.services.purchases import PurchaseService
 from src.services.spreadsheets import SpreadsheetService, template
+from src.services.intake_spreadsheets import IntakeSpreadsheetService
 
 spreadsheets_bp = Blueprint("spreadsheets", __name__, url_prefix="/api")
 
@@ -24,19 +25,84 @@ def service() -> SpreadsheetService:
     return SpreadsheetService(invoices, PurchaseService(database), max_bytes=config.upload_max_bytes)
 
 
+def intake_service() -> IntakeSpreadsheetService:
+    app = current_app
+    return IntakeSpreadsheetService(get_database(app), get_file_storage(app),
+                                    max_bytes=get_config(app).upload_max_bytes)
+
+
 def _input():
     items = request.files.getlist("file")
     if len(items) != 1 or set(request.files) != {"file"}:
-        raise ValidationError("请用 file 字段上传一个 CSV / XLSX 文件。", details={"field": "file"})
+        raise ValidationError("请选择一个 CSV 或 XLSX 表格文件。", details={"field": "file"})
     if set(request.form) - {"options"} or len(request.form.getlist("options")) > 1:
-        raise ValidationError("导入选项请放在唯一的 options JSON 对象中。", details={"field": "options"})
+        raise ValidationError("表格导入设置有误，请重新选择文件并重试。", details={"field": "options"})
     try:
         options = json.loads(request.form.get("options", "{}"))
     except (ValueError, TypeError) as exc:
-        raise ValidationError("options 不是有效 JSON。", details={"field": "options"}) from exc
+        raise ValidationError("表格导入设置有误，请重新选择文件并重试。", details={"field": "options"}) from exc
     item = items[0]
     content = item.read(get_config(current_app).upload_max_bytes + 1)
     return UploadedFile(content, item.filename or "", item.mimetype), options
+
+
+def _intake_input(*, allow_confirmation: bool = False):
+    allowed = {"options", "confirm_duplicate"} if allow_confirmation else {"options"}
+    if set(request.form) - allowed or any(len(request.form.getlist(k)) > 1 for k in allowed):
+        raise ValidationError("表格导入设置有误。", details={"field": "options"})
+    if len(request.files.getlist("file")) != 1 or set(request.files) != {"file"}:
+        raise ValidationError("请选择一个 CSV 或 XLSX 表格文件。", details={"field": "file"})
+    try:
+        options = json.loads(request.form.get("options", "{}"))
+    except (ValueError, TypeError) as exc:
+        raise ValidationError("表格导入设置不是有效 JSON。", details={"field": "options"}) from exc
+    confirmation = request.form.get("confirm_duplicate", "false")
+    if confirmation not in ("true", "false"):
+        raise ValidationError("confirm_duplicate 必须是 true 或 false。", details={"field": "confirm_duplicate"})
+    item = request.files["file"]
+    content = item.read(get_config(current_app).upload_max_bytes + 1)
+    return UploadedFile(content, item.filename or "", item.mimetype), options, confirmation == "true"
+
+
+@spreadsheets_bp.post("/intake-batches/<int:batch_id>/spreadsheets/preview")
+def preview_intake_spreadsheet(batch_id: int):
+    upload, options, _ = _intake_input()
+    return jsonify(intake_service().preview(batch_id, upload, options,
+        limit=query_int(request.args, "limit", 50), offset=query_int(request.args, "offset", 0))), 200
+
+
+@spreadsheets_bp.post("/intake-batches/<int:batch_id>/spreadsheets")
+def upload_intake_spreadsheet(batch_id: int):
+    upload, options, confirmed = _intake_input(allow_confirmation=True)
+    return jsonify(intake_service().upload(batch_id, upload, options,
+                                           confirm_duplicate=confirmed)), 201
+
+
+@spreadsheets_bp.get("/intake-batches/<int:batch_id>/spreadsheets/rows")
+def intake_spreadsheet_rows(batch_id: int):
+    return jsonify(intake_service().list_rows(batch_id,
+        limit=query_int(request.args, "limit", 50), offset=query_int(request.args, "offset", 0)))
+
+
+@spreadsheets_bp.get("/intake-batches/<int:batch_id>/spreadsheets/rows/<int:item_id>")
+def intake_spreadsheet_row(batch_id: int, item_id: int):
+    return jsonify(intake_service().get_row(batch_id, item_id))
+
+
+@spreadsheets_bp.get("/intake-batches/<int:batch_id>/spreadsheets/groups")
+def intake_spreadsheet_groups(batch_id: int):
+    return jsonify({"groups": intake_service().groups(batch_id)})
+
+
+@spreadsheets_bp.get("/intake-batches/<int:batch_id>/spreadsheets/<int:batch_file_id>")
+def intake_spreadsheet_file(batch_id: int, batch_file_id: int):
+    return jsonify(intake_service().get_file(batch_id, batch_file_id))
+
+
+@spreadsheets_bp.get("/intake-batches/<int:batch_id>/spreadsheets/<int:batch_file_id>/original")
+def intake_spreadsheet_original(batch_id: int, batch_file_id: int):
+    key, name = intake_service().original(batch_id, batch_file_id)
+    return send_file(get_file_storage(current_app).path_for(key), as_attachment=True, download_name=name)
 
 
 def _download(content: bytes, extension: str, name: str):

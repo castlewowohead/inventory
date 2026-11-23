@@ -9,6 +9,9 @@ __pycache__/
 .env.*
 !.env.example
 
+# 本机跑服务留下的日志：含本机绝对路径，不进交付
+/*.log
+
 # 运行期数据：SQLite 数据库、上传文件、导出文件
 var/*
 !var/.gitkeep

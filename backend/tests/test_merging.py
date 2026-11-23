@@ -275,7 +275,7 @@ def test_different_units_of_the_same_dimension_are_allowed_but_announced(
     preview = merge_service.preview(keep.id, [dupe.id])
 
     assert preview.can_merge is True
-    assert any("基础单位是 lb" in note for note in preview.notes)
+    assert any("原来按 lb" in note for note in preview.notes)
 
 
 def test_merging_an_item_into_itself_is_refused(
@@ -291,7 +291,7 @@ def test_every_plan_says_the_merge_cannot_be_undone(
 ) -> None:
     preview = merge_service.preview(duplicates["keep"], [duplicates["dupe"]])
 
-    assert any("不可逆" in note for note in preview.notes)
+    assert any("无法撤销" in note for note in preview.notes)
 
 
 def test_an_unknown_source_is_a_not_found(

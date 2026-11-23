@@ -221,18 +221,18 @@ defineExpose({ refresh: () => load(false) })
 <template>
   <view v-if="!hidden" class="ui-card section">
     <view class="section-heading">
-      <text class="section-title">识别任务</text>
+      <text class="section-title">识别进度</text>
       <text v-if="isFake" class="demo-tag">演示识别结果</text>
     </view>
 
-    <view v-if="state === 'loading'" class="muted" role="status" aria-live="polite">正在读取识别任务…</view>
+    <view v-if="state === 'loading'" class="muted" role="status" aria-live="polite">正在查看识别进度…</view>
     <template v-else-if="state === 'error'">
-      <text class="field-error" role="alert">识别任务读取失败：{{ failure }}</text>
+      <text class="field-error" role="alert">暂时无法查看识别进度：{{ failure }}</text>
       <button class="ui-button secondary" @click="load(false)">重试读取</button>
     </template>
     <template v-else>
       <text v-if="jobs.length === 0" class="muted">
-        这张单据还没有识别任务。{{ readOnly ? '单据已完成，可回看原件与已入账行。' : recognizableFiles.length ? '可以现在启动识别，也可以对着原件手工录入。' : '当前没有可识别的原件（表格导入批次不走识别）。' }}
+        {{ readOnly ? '单据已完成，可回看原件与已入账行。' : recognizableFiles.length ? '可以开始识别，也可以对着原件手工录入。' : '请先上传可识别的单据文件。' }}
       </text>
 
       <view v-for="job in visibleJobs" :key="job.id" class="job" :class="job.status">
@@ -245,21 +245,18 @@ defineExpose({ refresh: () => load(false) })
           产出 {{ job.lines_created }} 条待核对行{{ job.pages_total ? ` · 处理 ${job.pages_done}/${job.pages_total} 页` : '' }}
         </text>
         <text v-else-if="job.status === 'failed'" class="field-error">
-          {{ job.error_message || '识别失败，原因未记录。' }}
+          识别没有完成。请重试；如果仍然失败，可以对着原件手工录入。
         </text>
         <text v-else class="muted">
-          识别在后台进行，可以先离开这张单据；回来时会重新查询。原件还在，不会因为识别未完成而丢失。
+          正在识别。可以先离开，稍后再回来查看。
         </text>
         <view v-if="job.id === latestJob?.id && alerts.length" class="alerts" role="status">
           <text class="alert-lead">识别没有把单据上的行全部收进来。请对着原件核对，缺的行用「加一行」补上。</text>
         </view>
         <view v-if="showDiagnostics" class="diagnostics">
-          <text>任务 #{{ job.id }} · 第 {{ job.attempt }} 次尝试 · provider={{ job.provider || '未记录' }}</text>
-          <text>models={{ job.models.length ? job.models.join(', ') : '未记录' }} · prompt_sha12={{ job.prompt_sha12 || '未记录' }}</text>
-          <text>doc_class={{ job.doc_class || '未判定' }} · route_source={{ job.route_source || '未记录' }}</text>
-          <text v-if="job.error_code">error_code={{ job.error_code }}</text>
-          <text>created={{ formatClock(job.created_at) || '未记录' }} · started={{ formatClock(job.started_at) || '—' }} · finished={{ formatClock(job.finished_at) || '—' }}</text>
-          <text v-for="(warning, index) in job.warnings" :key="index" class="warning">· {{ warning }}</text>
+          <text>第 {{ job.attempt }} 次识别</text>
+          <text>开始：{{ formatClock(job.started_at) || '尚未开始' }} · 结束：{{ formatClock(job.finished_at) || '尚未结束' }}</text>
+          <text v-if="job.warnings.length" class="warning">识别结果可能不完整，请对照原件核对每一行。</text>
         </view>
       </view>
 
@@ -272,7 +269,7 @@ defineExpose({ refresh: () => load(false) })
         <button v-if="canStart" class="ui-button" @click="start">{{ starting ? '启动中…' : '开始识别' }}</button>
         <button v-if="jobs.length > 0" class="ui-button secondary" @click="load(true)">刷新状态</button>
         <button v-if="jobs.length > 0" class="ui-button ghost" :aria-pressed="showDiagnostics" @click="showDiagnostics = !showDiagnostics">
-          {{ showDiagnostics ? '收起诊断详情' : '诊断详情' }}
+          {{ showDiagnostics ? '收起识别记录' : '识别记录' }}
         </button>
       </view>
     </template>

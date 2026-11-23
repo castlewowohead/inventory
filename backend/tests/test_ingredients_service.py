@@ -895,11 +895,7 @@ def test_a_voided_purchase_still_counts_as_purchased(
     purchase_service,
     meat_category_id: int,
 ) -> None:
-    """⚠️ 判据刻意**包含已作废的采购记录**。
-
-    作废是软删，那条记录仍然是一个外键引用——带着它的食材删不掉。把它算成
-    "从没买过"只会让老板在删除时撞 409，而这个筛选的全部用处是"要清随时清"。
-    """
+    """从没买过筛选保留历史口径，删除食材时则清理独立的作废记录。"""
     item = ingredient_service.create_food_item(
         name="Returned Item", category_id=meat_category_id, base_unit="lb"
     )
@@ -913,8 +909,9 @@ def test_a_voided_purchase_still_counts_as_purchased(
     purchase_service.void_purchase(purchase.id)
 
     assert ingredient_service.search_food_items(never_purchased=True).total == 0
-    with pytest.raises(ConflictError):
-        ingredient_service.delete_food_item(item.id)
+    ingredient_service.delete_food_item(item.id)
+    with pytest.raises(NotFoundError):
+        purchase_service.get_purchase(purchase.id)
 
 
 def test_never_purchased_combines_with_the_other_filters(

@@ -68,6 +68,7 @@ export interface LineEvidenceView {
   /** 'ocr' | 'spreadsheet' | 'manual' — which of the three shapes this is. */
   origin: 'ocr' | 'spreadsheet' | 'manual'
   fileId: number | null
+  intakeItemId: number | null
   /** Page the line sits on, from the evidence or the line's own `page`. */
   page: number | null
   printedRow: number | null
@@ -169,6 +170,7 @@ export function readLineEvidence(line: InvoiceLine): LineEvidenceView {
   return {
     origin,
     fileId: asInteger(raw.file_id),
+    intakeItemId: asInteger(raw.intake_item_id),
     page: asInteger(raw.page) ?? parsed.find((item) => item.page !== null)?.page ?? line.page,
     printedRow: asInteger(raw.printed_row),
     rowBand: asInteger(raw.row_band),
@@ -226,6 +228,9 @@ export const FIELD_STATUS_LABEL: Record<string, string> = {
 /** The five invoice-header cells (backend `src/contracts.py` DOCUMENT_FIELDS). */
 const DOCUMENT_FIELDS = [
   { key: 'supplier', label: '来源' },
+  { key: 'supplier_english', label: '纸面英文商家名' },
+  { key: 'supplier_chinese', label: '纸面中文商家名' },
+  { key: 'supplier_evidence', label: '模型摘录的商家原文线索' },
   { key: 'invoice_date', label: '日期' },
   { key: 'invoice_number', label: '单号' },
   { key: 'invoice_total', label: '总额' },
@@ -238,6 +243,8 @@ export interface DocumentFieldEvidence {
   status: string | null
   rawText: string | null
   page: number | null
+  modelValues: string[]
+  agreement: string | null
 }
 
 export interface DocumentEvidenceView {
@@ -270,7 +277,9 @@ export function readDocumentEvidence(raw: unknown): DocumentEvidenceView | null 
         label: entry.label,
         status: asText(found.status),
         rawText: typeof found.raw_text === 'string' ? found.raw_text : null,
-        page: asInteger(found.page)
+        page: asInteger(found.page),
+        modelValues: asStringList(found.model_values),
+        agreement: asText(found.agreement)
       }
     }).filter((item) => item.status !== null || item.rawText !== null)
   }

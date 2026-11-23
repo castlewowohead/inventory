@@ -17,8 +17,9 @@ export interface UploadProgress {
 }
 
 export interface UploadOptions {
-  /** multipart field name. The invoice endpoints expect `files`. */
+  /** Multipart field name: legacy invoices use `files`, intake uses `file`. */
   fieldName: string
+  context?: 'invoice' | 'batch'
   formData?: Record<string, string>
   onProgress?: (progress: UploadProgress) => void
 }
@@ -29,14 +30,14 @@ export interface UploadHandle<T> {
   abort: () => void
 }
 
-function parse(status: number, body: string): unknown {
+function parse(status: number, body: string, context: 'invoice' | 'batch'): unknown {
   if (!body) return null
   try {
     return JSON.parse(body)
   } catch {
     throw new ApiError({
       code: 'invalid_response',
-      message: `服务端返回了无法解析的内容（HTTP ${status}）。请检查后端日志。`
+      message: context === 'batch' ? '暂时无法确认上传结果，请返回整理批次查看文件是否已保存，再重试。' : '暂时无法确认上传结果，请返回单据查看文件是否已保存，再重试。'
     }, status)
   }
 }
@@ -46,20 +47,21 @@ function parse(status: number, body: string): unknown {
  * the page) and a timeout are different events and must read differently, or the
  * page would blame the backend for something the user did.
  */
-function uploadFailure(reason: unknown): ApiError {
+function uploadFailure(reason: unknown, context: 'invoice' | 'batch'): ApiError {
+  const destination = context === 'batch' ? '整理批次' : '单据'
   const message = reason && typeof reason === 'object' && 'errMsg' in reason
     ? String((reason as { errMsg?: unknown }).errMsg ?? '')
     : ''
   if (message.includes('abort')) {
     return new ApiError({
       code: 'upload_aborted',
-      message: '上传已中断。已经保存成功的页仍然留在单据上，可以继续补传剩下的页。'
+      message: `上传已中断。已经保存成功的文件仍留在${destination}中，可以继续上传。`
     })
   }
   if (message.includes('timeout')) {
     return new ApiError({
       code: 'upload_timeout',
-      message: '上传超时。文件可能已经部分发送，请打开这张单据核对已有的页，再补传缺的页。'
+      message: `上传超时。文件可能已经部分发送，请打开${destination}核对已保存的文件，再上传缺少的文件。`
     })
   }
   // ⚠️ An oversized upload usually arrives here, not in the 413 branch: the
@@ -71,8 +73,8 @@ function uploadFailure(reason: unknown): ApiError {
   const cause = networkError(reason).details?.cause
   return new ApiError({
     code: 'upload_failed',
-    message: '上传没有收到服务端的回应。两种常见原因：文件超过服务端允许的大小（服务端会直接断开连接），'
-      + '或者后端没有启动、网络中断。请确认 Flask 在 127.0.0.1:5000 运行，再压缩照片或把多页 PDF 拆开重试。',
+    message: '上传没有完成。请检查网络；如果文件较大，可压缩照片或把多页 PDF 拆开后重试。'
+      + `重试前请先查看${destination}，确认文件是否已经保存。`,
     details: cause ? { cause } : undefined
   })
 }
@@ -82,8 +84,7 @@ function tooLargeError(status: number, data: unknown): ApiError {
   const fallback = responseError(status, data)
   return new ApiError({
     code: fallback.code,
-    message: `${fallback.message} 单个文件默认上限 20 MB，实际上限由后端 `
-      + 'UPLOAD_MAX_BYTES 决定；请压缩照片或把多页 PDF 拆开再传。',
+    message: '文件太大，无法上传。请压缩照片或把多页 PDF 拆开后重试。',
     details: fallback.details
   }, status)
 }
@@ -108,7 +109,7 @@ export function uploadOne<T>(path: `/${string}`, file: PickedFile, options: Uplo
         const status = result.statusCode
         let body: unknown
         try {
-          body = parse(status, typeof result.data === 'string' ? result.data : '')
+          body = parse(status, typeof result.data === 'string' ? result.data : '', options.context ?? 'invoice')
         } catch (error) {
           reject(error)
           return
@@ -121,7 +122,7 @@ export function uploadOne<T>(path: `/${string}`, file: PickedFile, options: Uplo
           reject(responseError(status, body))
         }
       },
-      fail: (reason) => reject(uploadFailure(reason))
+      fail: (reason) => reject(uploadFailure(reason, options.context ?? 'invoice'))
     })
     if (options.onProgress) {
       const onProgress = options.onProgress

@@ -661,19 +661,25 @@ class IngredientService:
             return FoodItemView.of(food_item)
 
     def delete_food_item(self, food_item_id: int) -> None:
-        """删除食材。被采购记录或发票行引用时拒绝（引用从步骤 04 起出现）。"""
+        """没有单据入库关联时，连同独立采购历史一起删除食材。"""
         with self._database.unit_of_work() as session:
             repository = FoodItemRepository(session)
             food_item = self._load_food_item(session, food_item_id)
-            name = food_item.name
+            references = repository.reference_counts(food_item_id)
+            if (
+                references["confirmed_invoice_lines"]
+                or references["invoice_linked_purchases"]
+            ):
+                raise ConflictError(
+                    "这项食材已有单据入库记录，不能删除。",
+                    details=references,
+                )
             try:
+                repository.clear_unlinked_history(food_item_id)
                 repository.delete(food_item)
             except IntegrityError as exc:
-                # 步骤 04/05 的采购记录与发票行引用本表时，由数据库外键拦住删除
-                # （SQLite 的 PRAGMA foreign_keys=ON 已在 src/db.py 统一打开）。
                 raise ConflictError(
-                    f"食材 {name!r} 已被采购记录或发票引用，不能删除；"
-                    "重复食材用 POST /api/food-items/<保留的那条>/merge 合并。"
+                    "这项食材仍有关联记录，不能直接删除。"
                 ) from exc
 
     # --- 内部辅助 ---

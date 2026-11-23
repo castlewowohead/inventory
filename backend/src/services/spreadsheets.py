@@ -30,8 +30,13 @@ class SpreadsheetService:
         self._max_bytes = max_bytes
 
     def _parse(self, upload: UploadedFile, raw_options: object) -> tuple[ParsedTable, dict, dict]:
-        if not upload.content or len(upload.content) > self._max_bytes:
-            raise ValidationError("文件为空或超过上传大小限制。", details={"field": "file", "max_bytes": self._max_bytes})
+        return self.parse_upload(upload, raw_options, max_bytes=self._max_bytes)
+
+
+    @staticmethod
+    def parse_upload(upload: UploadedFile, raw_options: object, *, max_bytes: int) -> tuple[ParsedTable, dict, dict]:
+        if not upload.content or len(upload.content) > max_bytes:
+            raise ValidationError("文件为空或超过上传大小限制。", details={"field": "file", "max_bytes": max_bytes})
         if len(upload.original_name) > 255:
             raise ValidationError("文件名最多 255 字符。", details={"field": "file"})
         options = options_for(raw_options)
@@ -51,7 +56,7 @@ class SpreadsheetService:
         header["source_name_normalized"] = normalize_name(source) if source else None
         number = options.get("invoice_number")
         if number and len(number) > 100:
-            raise ValidationError("invoice_number 最多 100 字符。", details={"field": "invoice_number"})
+            raise ValidationError("单号最多填写 100 个字符。", details={"field": "invoice_number"})
         header["invoice_number"] = number or None
         header["invoice_number_normalized"] = normalize_name(number) if number else None
         if options.get("invoice_total") is not None:
@@ -66,7 +71,7 @@ class SpreadsheetService:
                 "mapping": {field: index + 1 for field, index in parsed.mapping.items()},
                 "row_count": len(parsed.rows), "blank_rows_ignored": parsed.blank_rows,
                 "encoding": parsed.table.encoding,
-                "notice": "修改数据请在程序里完成；修改文件后重传不会更新旧记录，可能重复录入。"}
+                "notice": "需要修改时，请打开导入后的单据编辑。重新上传同一份表格可能产生重复记录。"}
 
     def preview(self, upload: UploadedFile, options: object) -> dict:
         parsed, normalized_options, header = self._parse(upload, options)
@@ -92,7 +97,7 @@ class SpreadsheetService:
 
     def export(self, extension: str, **filters) -> bytes:
         if extension not in ("csv", "xlsx"):
-            raise ValidationError("format 必须是 csv 或 xlsx。", details={"field": "format"})
+            raise ValidationError("请选择 CSV 或 XLSX 格式。", details={"field": "format"})
         records = self._purchases.export_purchases(**filters)
         rows = []
         for item in records:

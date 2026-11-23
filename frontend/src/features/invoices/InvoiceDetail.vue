@@ -15,22 +15,23 @@
  * F07 adds the draft form: the invoice header stays here, and LineEditor owns
  * one line. F08 keeps counts and line states from the server after each action.
  */
-import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
+import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import {
   addInvoiceLine, ApiError, completeInvoice, deleteInvoiceFile, errorMessage, getInvoice,
   getInvoiceFileContent,
-  startExtraction, updateInvoice, voidInvoice,
-  type ExtractionJob, type Invoice, type InvoiceHeaderInput, type InvoiceLine
+  getIntakeItemOriginal,
+  startExtraction, voidInvoice,
+  type ExtractionJob, type Invoice, type InvoiceLine
 } from '../../shared/api'
 import { formatBytes } from '../../shared/format'
 import { downloadAttachment } from '../../shared/platform/download'
-import { registerLeaveGuard } from '../../shared/platform/leaveGuard'
 import { isNarrowViewport, watchViewport } from '../../shared/platform/viewport'
-import { readDocumentEvidence, readLineEvidence } from './evidence'
+import { readLineEvidence } from './evidence'
 import ExtractionStatus from './ExtractionStatus.vue'
 import CompletedInvoiceView from './CompletedInvoiceView.vue'
 import InvoiceUpload from './InvoiceUpload.vue'
 import LineEditor from './LineEditor.vue'
+import InvoiceHeaderEditor from './InvoiceHeaderEditor.vue'
 import LineTable from './LineTable.vue'
 import OriginalDocumentViewer from './OriginalDocumentViewer.vue'
 
@@ -40,22 +41,13 @@ const invoice = ref<Invoice | null>(null)
 const state = ref<'loading' | 'ready' | 'error'>('loading')
 const failure = ref('')
 const saving = ref(false)
-const editing = ref(false)
-const saveError = ref('')
-const fieldError = ref<Record<string, string>>({})
-const form = ref({ source_name: '', invoice_number: '', invoice_date: '', currency: 'USD', invoice_total: '' })
 const appending = ref(false)
 const narrow = ref(isNarrowViewport())
 const panel = ref<'document' | 'form'>('form')
 const selectedLineId = ref<number | null>(null)
 /** Page the user asked the viewer to show, overriding the line's own page. */
 const pageOverride = ref<number | null>(null)
-const showHeaderEvidence = ref(false)
-/**
- * 第一眼只看识别结果。单据头、原件清单、每行的原文证据、识别诊断都折起来，
- * 老板主动点才展开——他打开这一页是来核对单子的，不是来读系统状态的。
- */
-const headerOpen = ref(false)
+/** 原件清单与识别诊断保留折叠；单据信息始终展开。 */
 const filesOpen = ref(false)
 const diagnosticsOpen = ref(false)
 /** 识别任务卡自己报它有没有话说；只有 'done' 可以藏起来。 */
@@ -72,6 +64,7 @@ let waitTimer: ReturnType<typeof setTimeout> | null = null
  * to it, and the plan requires that switching lines save or prompt first.
  */
 const lineEditor = ref<{ confirmLeaveLine: () => Promise<boolean> } | null>(null)
+const headerEditor = ref<{ hasUnsavedChanges: () => boolean; savePending: () => Promise<boolean> } | null>(null)
 const addingLine = ref(false)
 const addLineError = ref('')
 const closeoutOpen = ref(false)
@@ -99,16 +92,6 @@ const extractionGate = computed<'loading' | 'busy' | 'failed' | 'error' | null>(
   if (extractionActivity.value === 'failed' && !manualAfterFailure.value && invoice.value.lines.length === 0) return 'failed'
   return null
 })
-const failedExtraction = computed(() => {
-  const files = new Set(invoice.value?.files.map((file) => file.id) ?? [])
-  const seen = new Set<number>()
-  return extractionJobs.value.find((job) => {
-    const id = job.invoice_file_id
-    if (id === null || !files.has(id) || seen.has(id)) return false
-    seen.add(id)
-    return job.status === 'failed'
-  }) ?? null
-})
 const waitingText = computed(() => extractionJobs.value.some((job) => job.status === 'running')
   ? '正在识别原件，完成后会显示完整的待核对行。'
   : '原件已保存，正在等待识别。完成后会显示完整的待核对行。')
@@ -123,19 +106,20 @@ const statusLabel: Record<Invoice['status'], string> = {
   draft: '草稿', in_review: '审核中', ready_to_complete: '待完成', completed: '已完成', voided: '已作废'
 }
 const lineStatusLabel = { pending: '待核对', confirmed: '已入账', skipped: '已跳过' }
-const hasConfirmed = computed(() => (invoice.value?.reconciliation.confirmed_count ?? 0) > 0)
 const canManage = computed(() => invoice.value?.status !== 'completed' && invoice.value?.status !== 'voided')
 const canComplete = computed(() => {
   const item = invoice.value
   return !!item && item.status === 'ready_to_complete'
     && item.reconciliation.line_count > 0 && item.reconciliation.pending_count === 0
+    && !!item.invoice_date
 })
 /** 「完成单据」为什么还是灰的。没有理由就是能点了。 */
 const blockedReason = computed(() => {
   const item = invoice.value
   if (!item || canComplete.value) return ''
   const pending = item.reconciliation.pending_count
-  if (pending > 0) return `还有 ${pending} 行待核对`
+  if (pending > 0) return `还有 ${pending} 行待核对${item.invoice_date ? '' : '；请填写单据日期'}`
+  if (!item.invoice_date) return '请填写单据日期'
   if (item.reconciliation.line_count === 0) return '这张单据还没有行'
   return '暂时不能完成，请重新读取详情'
 })
@@ -158,58 +142,28 @@ const reconciliationNote = computed(() => {
   }
 })
 
-/** 折叠时也看得见的一行：不展开就知道单据头填没填。 */
-const headerSummary = computed(() => {
-  const item = invoice.value
-  if (!item) return ''
-  const parts = [item.source_name, item.invoice_date, item.invoice_number]
-    .filter((value): value is string => !!value)
-  const total = item.invoice_total === null ? null : `合计 ${item.invoice_total}`
-  if (total) parts.push(total)
-  return parts.length ? parts.join(' · ') : '来源、日期、单号、总额都还没填'
-})
-
 const lines = computed<InvoiceLine[]>(() => invoice.value?.lines ?? [])
 const selectedLine = computed<InvoiceLine | null>(() =>
   lines.value.find((line) => line.id === selectedLineId.value) ?? null)
-const headerEvidence = computed(() =>
-  invoice.value ? readDocumentEvidence(invoice.value.recognition.raw_document_fields) : null)
 
 /** Where the viewer should look: the selected line's evidence, unless the user moved. */
 const viewerFocus = computed(() => {
   const line = selectedLine.value
   if (!line) return pageOverride.value === null ? null : { fileId: null, page: pageOverride.value }
   const evidence = readLineEvidence(line)
-  return { fileId: evidence.fileId, page: pageOverride.value ?? evidence.page }
+  return { fileId: evidence.fileId ?? (evidence.intakeItemId === null ? null : -evidence.intakeItemId), page: pageOverride.value ?? evidence.page }
 })
 const documentVisible = computed(() => !narrow.value || panel.value === 'document')
 const formVisible = computed(() => !narrow.value || panel.value === 'form')
 
-function setForm(item: Invoice) {
-  form.value = {
-    source_name: item.source_name ?? '', invoice_number: item.invoice_number ?? '',
-    invoice_date: item.invoice_date ?? '', currency: item.currency ?? 'USD', invoice_total: item.invoice_total ?? ''
-  }
+const headerDirty = computed(() => headerEditor.value?.hasUnsavedChanges() ?? false)
+async function saveHeaderBeforeConfirm(): Promise<boolean> {
+  const saved = await headerEditor.value?.savePending() ?? true
+  if (saved) await nextTick()
+  return saved
 }
-
-/** True while the edit form differs from what the server last returned. */
-const headerDirty = computed(() => {
-  const item = invoice.value
-  if (!editing.value || !item) return false
-  return form.value.source_name !== (item.source_name ?? '')
-    || form.value.invoice_number !== (item.invoice_number ?? '')
-    || form.value.invoice_date !== (item.invoice_date ?? '')
-    || form.value.currency !== (item.currency ?? 'USD')
-    || form.value.invoice_total !== (item.invoice_total ?? '')
-})
-
-// Leaving the detail with an unsaved header edit asks first (plan section 6).
-const stopGuard = registerLeaveGuard(
-  () => (headerDirty.value ? '单据头的修改还没有保存。离开会丢掉这些修改。' : null),
-  () => { editing.value = false; if (invoice.value) setForm(invoice.value) }
-)
 onUnmounted(() => {
-  stopGuard(); stopViewport()
+  stopViewport()
   if (waitTimer !== null) clearTimeout(waitTimer)
 })
 onMounted(() => { stopViewport = watchViewport((value) => { narrow.value = value }) })
@@ -236,7 +190,6 @@ async function load() {
     if (sequence !== requestSequence) return
     invoice.value = item
     keepSelection(item)
-    if (!editing.value) setForm(item)
     state.value = 'ready'
   } catch (error) {
     if (sequence !== requestSequence) return
@@ -263,7 +216,6 @@ async function refreshQuiet() {
     if (sequence !== requestSequence) return
     invoice.value = item
     keepSelection(item)
-    if (!editing.value) setForm(item)
     state.value = 'ready'
     addLineError.value = ''
     emit('saved')
@@ -336,59 +288,6 @@ async function addLine() {
   } finally { addingLine.value = false }
 }
 
-function beginEdit() {
-  if (!invoice.value) return
-  setForm(invoice.value)
-  fieldError.value = {}
-  saveError.value = ''
-  editing.value = true
-}
-
-function cancelEdit() {
-  editing.value = false
-  saveError.value = ''
-  fieldError.value = {}
-  if (invoice.value) setForm(invoice.value)
-}
-
-function nullable(value: string): string | null { return value.trim() || null }
-
-async function save() {
-  if (!invoice.value || saving.value) return
-  fieldError.value = {}
-  saveError.value = ''
-  const data: InvoiceHeaderInput = {
-    source_name: nullable(form.value.source_name), invoice_number: nullable(form.value.invoice_number),
-    invoice_date: nullable(form.value.invoice_date), currency: form.value.currency || 'USD',
-    invoice_total: nullable(form.value.invoice_total)
-  }
-  if (data.invoice_total !== null && !/^\d+(?:\.\d{1,2})?$/.test(data.invoice_total)) {
-    fieldError.value = { invoice_total: '请输入非负金额，最多两位小数；留空表示未知。' }
-    return
-  }
-  saving.value = true
-  try {
-    await updateInvoice(invoice.value.id, data)
-    // The edit is committed: drop the dirty state before reading back, so a slow
-    // re-read cannot raise a "unsaved changes" prompt for changes already saved.
-    editing.value = false
-    await load()
-    if (state.value === 'ready') {
-      emit('saved')
-    } else {
-      saveError.value = `保存请求已返回，但重新读取失败：${failure.value}。请重试读取。`
-    }
-  } catch (error) {
-    saveError.value = errorMessage(error)
-    if (error instanceof ApiError && typeof error.details?.field === 'string') {
-      fieldError.value = { [error.details.field]: error.message }
-    }
-    if (error instanceof ApiError && error.status === 409) {
-      saveError.value += ' 请重新读取单据，再核对修改。'
-    }
-  } finally { saving.value = false }
-}
-
 /** Files added from the detail view: re-read so page order and counts are the server's. */
 async function filesStored() {
   await load()
@@ -429,7 +328,6 @@ async function extractionFinished() {
     if (sequence !== requestSequence) return
     invoice.value = item
     keepSelection(item)
-    if (!editing.value) setForm(item)
     emit('saved')
   } catch (error) {
     if (sequence === requestSequence) extractionSettleError.value = errorMessage(error)
@@ -441,14 +339,14 @@ async function extractionFinished() {
 async function retryExtraction() {
   if (!await prepareAction() || !invoice.value) return
   const id = invoice.value.id
-  if (!await confirmAction('重新提取', '重新提取会替换未修改的识别草稿；已修改但未入账的行会保留，仍需再次核对。已有任务运行或已入账行时，服务端会拒绝。')) return
+  if (!await confirmAction('重新识别', '重新识别会更新尚未修改的内容。你已经修改的行会保留，但仍需核对；如果已有明细入账，请先处理这些明细。')) return
   actionBusy.value = true
   extractionSettling.value = true
   originalOnly.value = false
   manualAfterFailure.value = false
   try {
     await startExtraction(id)
-    actionNote.value = '已请求重新提取。请查看识别任务状态，完成后逐行核对。'
+    actionNote.value = '已开始重新识别。识别完成后，请逐行核对。'
   } catch (error) {
     actionError.value = `${errorMessage(error)} 请按最新状态处理后再试。`
   } finally {
@@ -467,7 +365,7 @@ async function enterManualReview() {
 async function removeFile(fileId: number, name: string) {
   if (!await prepareAction() || !invoice.value) return
   const id = invoice.value.id
-  if (!await confirmAction('删除原件', `确定删除「${name}」？文件字节会删除，已有草稿行和识别任务历史仍保留。请先确认这不是最后一份原件。`)) return
+  if (!await confirmAction('删除原件', `确定删除「${name}」？删除后无法查看这份文件，请先确认单据还有其他原件。`)) return
   actionBusy.value = true
   try {
     invoice.value = await deleteInvoiceFile(id, fileId)
@@ -494,7 +392,7 @@ async function cancelInvoice() {
   try {
     const result = await voidInvoice(id, bookedIds.length ? bookedIds : undefined)
     invoice.value = result.invoice
-    if (result.status !== 'voided') throw new Error('服务端未确认作废，请重新读取单据。')
+    if (result.status !== 'voided') throw new Error('暂时无法确认删除结果，请重新读取单据。')
     moreOpen.value = false
     actionNote.value = '单据已删除。'
     emit('saved')
@@ -518,8 +416,10 @@ function locatePending(item: Invoice, numbers?: unknown) {
 
 function closeoutValues(item: Invoice): string {
   return JSON.stringify({
-    files: item.files.map((file) => [file.id, file.page_order]),
+    files: [...item.files.map((file) => [file.id, file.page_order]),
+      ...item.intake_sources.map((source) => [source.item_id, source.page_no ?? source.row_no])],
     lines: item.lines.map((line) => [line.id, line.status, line.version]),
+    header: [item.invoice_date, item.invoice_total, item.currency, item.header_reviewed_fields],
     reconciliation: item.reconciliation
   })
 }
@@ -541,7 +441,7 @@ async function openCloseout() {
       locatePending(item)
       closeoutError.value = item.reconciliation.pending_count > 0
         ? `还有 ${item.reconciliation.pending_count} 行待核对，请逐行确认或跳过。`
-        : '单据尚不能完成；请先添加并处理至少一行。'
+        : !item.invoice_date ? '请先填写单据日期。' : '单据尚不能完成；请先添加并处理至少一行。'
       return
     }
     checkedOriginal.value = false
@@ -562,7 +462,7 @@ async function finishInvoice() {
       closeoutOpen.value = false
       checkedOriginal.value = false
       locatePending(latest)
-      closeoutError.value = '单据状态已变化，请处理待核对行后重新检查收口摘要。'
+      closeoutError.value = latest.invoice_date ? '单据状态已变化，请处理待核对行后重新检查收口摘要。' : '请先填写单据日期。'
       return
     }
     if (closeoutValues(latest) !== closeoutSnapshot.value) {
@@ -574,7 +474,7 @@ async function finishInvoice() {
     const outcome = await completeInvoice(latest.id)
     invoice.value = outcome.invoice
     if (outcome.status !== 'completed' || outcome.invoice.status !== 'completed') {
-      throw new Error('服务端未确认完成，请重新读取单据。')
+      throw new Error('暂时无法确认单据是否完成，请重新读取单据。')
     }
     emit('completed')
   } catch (error) {
@@ -610,6 +510,13 @@ async function downloadOriginal(fileId: number, filename: string) {
   } catch (error) { originalDownloadError.value = errorMessage(error) }
 }
 
+async function downloadIntakeOriginal(batchId: number, itemId: number, filename: string) {
+  originalDownloadError.value = ''
+  try {
+    downloadAttachment(await getIntakeItemOriginal(batchId, itemId), filename)
+  } catch (error) { originalDownloadError.value = errorMessage(error) }
+}
+
 watch(() => props.invoiceId, () => {
   extractionActivity.value = 'loading'
   extractionJobs.value = []
@@ -618,13 +525,11 @@ watch(() => props.invoiceId, () => {
   waitingLong.value = false
   originalOnly.value = false
   manualAfterFailure.value = false
-  editing.value = false
   appending.value = false
   selectedLineId.value = null
   pageOverride.value = null
   panel.value = 'form'
   closeoutOpen.value = false
-  headerOpen.value = false
   filesOpen.value = false
   diagnosticsOpen.value = false
   checkedOriginal.value = false
@@ -637,7 +542,7 @@ watch(() => props.invoiceId, () => {
 </script>
 
 <template>
-  <CompletedInvoiceView v-if="invoice && state === 'ready' && invoice.status === 'completed'" :invoice="invoice" @back="emit('back')" @open-existing="emit('openExisting', $event)" @currency-changed="applyStoredInvoice($event, false)" />
+  <CompletedInvoiceView v-if="invoice && state === 'ready' && invoice.status === 'completed'" :invoice="invoice" @back="emit('back')" @open-existing="emit('openExisting', $event)" @currency-changed="applyStoredInvoice($event, false)" @reopened="applyStoredInvoice($event, false)" />
   <view v-else class="detail-layout" :class="{ narrow }">
     <view class="detail-heading">
       <view class="heading-primary"><button class="back-link" @click="emit('back')">← 返回单据</button><text class="page-title">单据{{ invoice ? ` #${invoice.id}` : '' }}</text></view>
@@ -645,8 +550,8 @@ watch(() => props.invoiceId, () => {
         <button class="ui-button ghost" :aria-expanded="moreOpen" @click="moreOpen = !moreOpen">单据更多操作</button>
         <view v-if="moreOpen" class="ui-card section more-menu">
           <view class="form-actions">
-            <button v-if="invoice.entry_source !== 'import'" class="ui-button secondary" :disabled="actionBusy" @click="retryExtraction">重新提取 / 失败重试</button>
-            <button v-if="invoice.entry_source !== 'import'" class="ui-button secondary" :aria-pressed="diagnosticsOpen" @click="diagnosticsOpen = !diagnosticsOpen">{{ diagnosticsOpen ? '收起识别任务' : '识别任务与诊断' }}</button>
+            <button v-if="invoice.entry_source !== 'import' && !invoice.intake_sources.length" class="ui-button secondary" :disabled="actionBusy" @click="retryExtraction">重新提取 / 失败重试</button>
+            <button v-if="invoice.entry_source !== 'import'" class="ui-button secondary" :aria-pressed="diagnosticsOpen" @click="diagnosticsOpen = !diagnosticsOpen">{{ diagnosticsOpen ? '收起识别记录' : '查看识别记录' }}</button>
             <button class="ui-button ghost" :disabled="actionBusy" @click="cancelInvoice">删除整张单据</button>
           </view>
           <view v-if="invoice.files.length" class="file-delete-list">
@@ -675,12 +580,12 @@ watch(() => props.invoiceId, () => {
       <view v-if="extractionGate" class="extraction-screen">
         <template v-if="originalOnly && (extractionGate === 'busy' || extractionGate === 'failed')">
           <view class="escape-actions"><button class="ui-button secondary" @click="originalOnly = false">返回识别状态</button></view>
-          <view class="ui-card original-only"><OriginalDocumentViewer :invoice-id="invoice.id" :files="invoice.files" :is-fake="invoice.recognition.is_fake" :focus="null" :visible="true" /></view>
+          <view class="ui-card original-only"><OriginalDocumentViewer :invoice-id="invoice.id" :files="invoice.files" :sources="invoice.intake_sources" :is-fake="invoice.recognition.is_fake" :focus="null" :visible="true" /></view>
         </template>
         <view v-else-if="extractionGate === 'busy'" class="extraction-wait" role="status" aria-live="polite">
           <view class="wait-indicator" aria-hidden="true" />
           <text class="wait-title">{{ waitingText }}</text>
-          <text class="muted">{{ invoice.source_name || '来源待填' }} · {{ invoice.files.length }} 个原件文件</text>
+          <text class="muted">{{ invoice.source_name || '来源待填' }} · {{ invoice.files.length + invoice.intake_sources.length }} 个原件内容</text>
           <view v-if="waitingLong" class="wait-escape">
             <text>先去忙别的，识别完会留在待办里。</text>
             <view class="escape-actions">
@@ -692,8 +597,8 @@ watch(() => props.invoiceId, () => {
         </view>
         <view v-else-if="extractionGate === 'failed'" class="extraction-wait failed-screen" role="alert">
           <text class="wait-title">原件识别失败</text>
-          <text>{{ failedExtraction?.error_message || '识别未完成，原件已保存。' }}</text>
-          <text class="muted">{{ invoice.source_name || '来源待填' }} · {{ invoice.files.length }} 个原件文件</text>
+          <text>请重试识别；如果仍然失败，可以对照原件手工录入。</text>
+          <text class="muted">{{ invoice.source_name || '来源待填' }} · {{ invoice.files.length + invoice.intake_sources.length }} 个原件内容</text>
           <view class="escape-actions">
             <button class="ui-button secondary" @click="originalOnly = true">查看原件</button>
             <button class="ui-button secondary" @click="enterManualReview">加一行</button>
@@ -709,7 +614,7 @@ watch(() => props.invoiceId, () => {
       </view>
       <template v-else>
       <view v-if="extractionActivity === 'failed' && invoice.lines.length > 0" class="ui-card section failed-review" role="alert">
-        <text>有原件识别失败：{{ failedExtraction?.error_message || '请核对已有行与原件。' }}</text>
+        <text>有原件没有识别完成。请核对已有明细与原件。</text>
         <view class="escape-actions">
           <button class="ui-button secondary" @click="panel = 'document'">查看原件</button>
           <button class="ui-button secondary" @click="addLine">加一行</button>
@@ -733,12 +638,14 @@ watch(() => props.invoiceId, () => {
             <text class="section-title">原始表格</text>
             <text class="muted">表格没有原图，下载原始文件核对。</text>
             <button v-for="file in invoice.files" :key="file.id" class="ui-button secondary" @click="downloadOriginal(file.id, file.original_name)">下载 {{ file.original_name }}</button>
+            <button v-for="source in invoice.intake_sources" :key="source.item_id" class="ui-button secondary" @click="downloadIntakeOriginal(source.batch_id, source.item_id, source.original_name)">下载 {{ source.original_name }} · 第 {{ source.row_no }} 行</button>
             <text v-if="originalDownloadError" class="field-error" role="alert">{{ originalDownloadError }}</text>
           </view>
           <OriginalDocumentViewer
             v-else
             :invoice-id="invoice.id"
             :files="invoice.files"
+            :sources="invoice.intake_sources"
             :is-fake="invoice.recognition.is_fake"
             :focus="viewerFocus"
             :visible="documentVisible"
@@ -762,6 +669,7 @@ watch(() => props.invoiceId, () => {
                 :key="line.id"
                 :invoice="invoice"
                 :line="line"
+                :before-confirm="saveHeaderBeforeConfirm"
                 @applied="applyLine"
                 @stored="applyStoredInvoice"
                 @reload="refreshQuiet"
@@ -771,6 +679,8 @@ watch(() => props.invoiceId, () => {
           <text v-if="addLineError" class="field-error" role="alert">{{ addLineError }}</text>
 
           <!-- 收口：对账数字只在真要完成时出现，平时不占地方。 -->
+          <InvoiceHeaderEditor ref="headerEditor" :invoice="invoice" :can-manage="canManage" @stored="applyStoredInvoice($event, false)" />
+
           <view v-if="invoice.reconciliation.line_count > 0" class="ui-card section" role="region" aria-label="完成单据">
             <text v-if="invoice.status === 'completed'" class="muted">单据已完成。</text>
             <text v-else-if="invoice.status === 'voided'" class="muted">单据已作废。</text>
@@ -781,7 +691,7 @@ watch(() => props.invoiceId, () => {
               <view v-if="closeoutOpen && canComplete" class="closeout-panel">
                 <text class="section-title">最后核对</text>
                 <view class="summary-grid">
-                  <view><text class="label">原件文件</text><text>{{ invoice.files.length }} 个</text></view>
+                  <view><text class="label">原件内容</text><text>{{ invoice.files.length + invoice.intake_sources.length }} 个</text></view>
                   <view><text class="label">已入账 / 已跳过</text><text>{{ invoice.reconciliation.confirmed_count }} / {{ invoice.reconciliation.skipped_count }} 行</text></view>
                   <view><text class="label">单据总额</text><text>{{ invoice.reconciliation.invoice_total ?? '未知' }}</text></view>
                   <view><text class="label">已入账金额</text><text>{{ invoice.reconciliation.confirmed_amount ?? '无法汇总' }}</text></view>
@@ -818,56 +728,11 @@ watch(() => props.invoiceId, () => {
             <text v-if="closeoutError" class="field-error" role="alert">{{ closeoutError }}</text>
           </view>
 
-          <!-- 单据头：老板不改就不用看。折叠成一行。 -->
-          <view class="ui-card section fold">
-            <button class="fold-toggle" :aria-expanded="headerOpen" @click="headerOpen = !headerOpen">
-              {{ headerOpen ? '收起单据信息' : '单据信息' }}
-              <text class="fold-summary">{{ headerSummary }}</text>
-            </button>
-            <template v-if="headerOpen">
-              <text v-if="invoice.entry_source === 'import'" class="history-note">表格导入批次，原始文件已保存。</text>
-              <text v-if="invoice.recognition.is_fake" class="history-note">演示识别结果：草稿内容来自 Fake 识别器，请按原件核对。</text>
-              <view v-if="!editing" class="header-grid">
-                <view><text class="label">来源</text><text>{{ invoice.source_name || '待填' }}</text></view>
-                <view><text class="label">单号</text><text>{{ invoice.invoice_number || '待填' }}</text></view>
-                <view><text class="label">日期</text><text>{{ invoice.invoice_date || '待填' }}</text></view>
-                <view><text class="label">币种</text><text>{{ invoice.currency || 'USD（默认）' }}</text></view>
-                <view><text class="label">总额</text><text>{{ invoice.invoice_total === null ? '待填' : invoice.invoice_total }}</text></view>
-              </view>
-              <button v-if="!editing && canManage" class="ui-button secondary" @click="beginEdit">修改单据信息</button>
-              <view v-else-if="editing" class="edit-form">
-                <view class="header-grid">
-                  <view class="field"><text class="label">来源</text><input v-model="form.source_name" class="ui-input" aria-label="来源" placeholder="待填" /><text v-if="fieldError.source_name" class="field-error">{{ fieldError.source_name }}</text></view>
-                  <view class="field"><text class="label">单号</text><input v-model="form.invoice_number" class="ui-input" aria-label="单号" placeholder="待填" /><text v-if="fieldError.invoice_number" class="field-error">{{ fieldError.invoice_number }}</text></view>
-                  <view class="field"><text class="label">日期（YYYY-MM-DD）</text><input v-model="form.invoice_date" class="ui-input" aria-label="日期" placeholder="YYYY-MM-DD；留空表示未知" /><text v-if="fieldError.invoice_date" class="field-error">{{ fieldError.invoice_date }}</text></view>
-                  <view class="field"><text class="label">币种（默认美元，可修改）</text><picker :range="['USD', 'CNY']" :value="['USD', 'CNY'].indexOf(form.currency)" @change="form.currency = ['USD', 'CNY'][Number($event.detail.value)]"><view class="ui-input picker-text">{{ form.currency }}</view></picker><text v-if="fieldError.currency" class="field-error">{{ fieldError.currency }}</text></view>
-                  <view class="field"><text class="label">总额</text><input v-model="form.invoice_total" class="ui-input" aria-label="总额" inputmode="decimal" placeholder="待填" /><text v-if="fieldError.invoice_total" class="field-error">{{ fieldError.invoice_total }}</text></view>
-                </view>
-                <text v-if="hasConfirmed" class="history-note">改这里不会影响已经入账的行。</text>
-                <text v-if="headerDirty" class="muted" role="status">有未保存的修改。</text>
-                <text v-if="saveError" class="field-error" role="alert">{{ saveError }}</text>
-                <view class="form-actions"><button class="ui-button" :disabled="saving" @click="save">{{ saving ? '保存中…' : '保存并重新读取' }}</button><button class="ui-button secondary" :disabled="saving" @click="cancelEdit">取消</button></view>
-              </view>
-
-              <template v-if="headerEvidence && headerEvidence.fields.length">
-                <button class="ui-button ghost evidence-toggle" :aria-pressed="showHeaderEvidence" @click="showHeaderEvidence = !showHeaderEvidence">
-                  {{ showHeaderEvidence ? '收起单据头原文' : '单据头原文' }}
-                </button>
-                <view v-if="showHeaderEvidence" class="header-evidence">
-                  <view v-for="field in headerEvidence.fields" :key="field.key" class="row">
-                    <text>{{ field.label }}：{{ field.rawText === null ? '原文为空' : field.rawText }}</text>
-                    <text>{{ field.status === 'recognized' ? '识别出内容' : field.status === 'unreadable' ? '认不出' : '单据上没有' }}</text>
-                  </view>
-                </view>
-              </template>
-            </template>
-          </view>
-
           <!-- 原件文件清单与补传：也折起来。原件本身在左边一直看得见。 -->
           <view class="ui-card section fold">
             <button class="fold-toggle" :aria-expanded="filesOpen" @click="filesOpen = !filesOpen">
               {{ filesOpen ? '收起原件文件' : '原件文件' }}
-              <text class="fold-summary">{{ invoice.files.length }} 个</text>
+              <text class="fold-summary">{{ invoice.files.length + invoice.intake_sources.length }} 个</text>
             </button>
             <template v-if="filesOpen">
               <view v-if="invoice.files.length" class="rows">
@@ -877,7 +742,13 @@ watch(() => props.invoiceId, () => {
                   <button v-if="invoice.entry_source === 'import'" class="ui-button secondary" @click="downloadOriginal(file.id, file.original_name)">下载原始表格</button>
                 </view>
               </view>
-              <text v-else class="muted">暂无原件文件。</text>
+              <view v-if="invoice.intake_sources.length" class="rows">
+                <view v-for="source in invoice.intake_sources" :key="source.item_id" class="row">
+                  <text>{{ source.original_name }} · {{ source.kind === 'page' ? `第 ${source.page_no} 页` : `第 ${source.row_no} 行` }}</text>
+                  <button class="ui-button secondary" @click="downloadIntakeOriginal(source.batch_id, source.item_id, source.original_name)">下载原件</button>
+                </view>
+              </view>
+              <text v-if="!invoice.files.length && !invoice.intake_sources.length" class="muted">暂无原件文件。</text>
               <text v-if="originalDownloadError" class="field-error" role="alert">{{ originalDownloadError }}</text>
               <button v-if="canManage" class="ui-button secondary" :aria-pressed="appending" @click="appending = !appending">{{ appending ? '收起补传' : '补传文件' }}</button>
               <InvoiceUpload

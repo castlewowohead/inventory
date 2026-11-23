@@ -156,6 +156,27 @@ export function patchBody(draft: LineDraft, line: InvoiceLine): InvoiceLinePatch
 export const BLANK_LINE_INPUT = { line_kind: 'purchase' } as const
 
 /**
+ * 把识别出来的纸面金额写成这些输入框收得下的样子（多文件计划 M12）。
+ *
+ * 纸上印的是「$1,040.00」，而金额框只收 `1040.00`——这是上面第 1 条规则的延伸，
+ * 也是校验里写明的「不要带货币符号、千分位逗号」。问题出在「此数据正确」上：
+ * 它接受的是**模型读到的纸面原文**，照单收下就会存不进去，而失败只会在别处
+ * 显示成「请先检查并保存单据信息」，人看不出到底哪里不对。真实 OCR 跑这条链路
+ * 时就是这样卡住的。
+ *
+ * 只去掉货币符号、空格和**千分位**逗号。去不干净的（例如欧式写法「1.040,00」）
+ * 原样返回，让字段自己的报错照常出现——这里宁可让人自己决定，也不替人猜一个
+ * 金额。
+ */
+export function plainAmount(value: string): string {
+  const stripped = value
+    .normalize('NFKC')
+    .replace(/[\s$¥￥€£]/g, '')
+    .replace(/,(?=\d{3}(?:\D|$))/g, '')
+  return DECIMAL.test(stripped) ? stripped : value
+}
+
+/**
  * How one value should read in the form.
  *
  * `unknown` and `zero` are different states on purpose: the first means nobody

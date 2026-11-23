@@ -552,18 +552,27 @@ def test_unknown_food_item_is_a_bad_request_not_a_missing_resource(
     assert caught.value.details["field"] == "food_item_id"
 
 
-def test_food_item_in_use_cannot_be_deleted(
+def test_food_item_with_standalone_purchase_and_revision_can_be_deleted(
     purchase_service: PurchaseService,
     ingredient_service: IngredientService,
     food_item: FoodItemView,
+    migrated_database: Database,
 ) -> None:
-    """步骤 03 的「无引用才可删」现在真的有引用方了，由外键拦住。"""
-    record(purchase_service, food_item)
+    """独立采购不锁住食材，修改历史也随采购一起清理。"""
+    purchase = record(purchase_service, food_item)
+    purchase_service.update_purchase(purchase.id, source_name="Test source")
 
-    with pytest.raises(ConflictError) as caught:
-        ingredient_service.delete_food_item(food_item.id)
+    ingredient_service.delete_food_item(food_item.id)
 
-    assert "已被采购记录或发票引用" in caught.value.message
+    with pytest.raises(NotFoundError):
+        ingredient_service.get_food_item(food_item.id)
+    with pytest.raises(NotFoundError):
+        purchase_service.get_purchase(purchase.id)
+    with migrated_database.unit_of_work() as session:
+        assert session.execute(
+            text("SELECT COUNT(*) FROM purchase_revisions WHERE purchase_id=:id"),
+            {"id": purchase.id},
+        ).scalar_one() == 0
 
 
 # --- 纠错：直接修改 + 修改日志（04.6）---------------------------------------

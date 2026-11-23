@@ -10,13 +10,13 @@
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, timedelta
 from typing import Any
 
 import pytest
 from flask.testing import FlaskClient
 
-from src.services.prices import month_start, previous_month_start
+from src.services.prices import month_start, previous_month_start, week_start
 
 
 def this_month_day_one() -> str:
@@ -146,6 +146,61 @@ def test_history_for_a_missing_food_item_is_404(migrated_client: FlaskClient) ->
 
 
 # --- 月度统计 ---------------------------------------------------------------
+
+
+def test_weekly_endpoint_returns_weeks_and_keeps_monthly_endpoint(
+    migrated_client: FlaskClient, item_id: int
+) -> None:
+    post_purchase(
+        migrated_client, item_id,
+        purchase_date=week_start(date.today()).isoformat(),
+    )
+    weekly = migrated_client.get(
+        f"/api/prices/food-items/{item_id}/weekly?weeks=6"
+    )
+    monthly = migrated_client.get(
+        f"/api/prices/food-items/{item_id}/monthly?months=6"
+    )
+    assert weekly.status_code == 200
+    assert monthly.status_code == 200
+    assert len(weekly.get_json()["weeks"]) == 6
+    assert weekly.get_json()["weeks"][-1]["weighted_average_unit_price"] == "6.00"
+    assert len(monthly.get_json()["months"]) == 6
+
+
+def test_weekly_alerts_compare_with_previous_week(
+    migrated_client: FlaskClient, item_id: int
+) -> None:
+    this_week = week_start(date.today())
+    post_purchase(migrated_client, item_id,
+                  purchase_date=(this_week - timedelta(weeks=1)).isoformat(),
+                  quantity="10", unit_price="4", line_amount="40")
+    post_purchase(migrated_client, item_id,
+                  purchase_date=this_week.isoformat(),
+                  quantity="10", unit_price="6", line_amount="60")
+    response = migrated_client.get("/api/prices/alerts?period=week")
+    assert response.status_code == 200
+    body = response.get_json()
+    assert body["current_period"]["date_from"] == this_week.isoformat()
+    assert body["alerts"][0]["comparison"]["change_percent"] == "50.00"
+
+
+def test_source_comparison_can_use_recent_twelve_weeks(
+    migrated_client: FlaskClient, item_id: int
+) -> None:
+    start = week_start(date.today()) - timedelta(weeks=11)
+    post_purchase(migrated_client, item_id,
+                  purchase_date=(start - timedelta(days=1)).isoformat(),
+                  source_name="Earlier")
+    post_purchase(migrated_client, item_id,
+                  purchase_date=start.isoformat(), source_name="Recent")
+    response = migrated_client.get(
+        f"/api/prices/food-items/{item_id}/sources?period=week"
+    )
+    assert response.status_code == 200
+    body = response.get_json()
+    assert body["period"]["date_from"] == start.isoformat()
+    assert [source["source_name"] for source in body["sources"]] == ["Recent"]
 
 
 def test_monthly_returns_the_series_and_the_comparison(

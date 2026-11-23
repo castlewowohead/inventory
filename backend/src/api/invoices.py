@@ -21,6 +21,7 @@
 | POST   | /api/invoices/<id>/confirm                        | 确认选定行或全部待确认行                |
 | POST   | /api/invoices/<id>/lines/<line_id>/unconfirm      | 撤销一行的确认                          |
 | POST   | /api/invoices/<id>/complete                       | 收口确认：这张单据处理完了              |
+| POST   | /api/invoices/<id>/reopen                         | 已完成单据回到审核页                    |
 | GET    | /api/invoices/match                               | 问「这句描述以前确认到哪个食材」        |
 
 三处与别处不同的约定：
@@ -241,8 +242,7 @@ def void_invoice(invoice_id: int) -> tuple[Response, int]:
         jsonify(
             {
                 "status": "voided",
-                "message": "单据已作废；原始文件已删除，入账记录已作废并保留修改日志。"
-                "`include_voided=true` 能查到这张单据。",
+                "message": "单据已删除，相关入库记录已撤销。修改历史会保留。",
                 "invoice": invoice_payload(view),
             }
         ),
@@ -273,6 +273,12 @@ def complete_invoice(invoice_id: int) -> tuple[Response, int]:
         ),
         200,
     )
+
+
+@invoices_bp.post("/invoices/<int:invoice_id>/reopen")
+def reopen_invoice(invoice_id: int) -> tuple[Response, int]:
+    view = service().reopen_invoice(invoice_id)
+    return jsonify(invoice_payload(view)), 200
 
 
 # --- 文件 -------------------------------------------------------------------

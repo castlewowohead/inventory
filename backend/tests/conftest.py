@@ -30,6 +30,10 @@ from src.factory import create_app
 from src.integrations.file_storage import LocalFileStorage
 from src.integrations.ocr import FakeRecognizer
 from src.services.ingredients import FoodItemView, IngredientService
+from src.services.intake import IntakeService
+from src.services.intake_ingest import IntakeIngestService
+from src.services.intake_recognition import IntakeRecognitionService
+from src.services.intake_suggestions import IntakeSuggestionService
 from src.services.invoices import InvoiceService
 from src.services.prices import PriceService
 from src.services.purchases import PurchaseService
@@ -214,6 +218,81 @@ def invoice_service(
         file_storage=storage,
         recognizer=recognizer,
         upload_max_bytes=UPLOAD_MAX_BYTES_FOR_TESTS,
+    )
+
+
+@pytest.fixture
+def intake_service(migrated_database: Database) -> IntakeService:
+    """整理批次服务（多文件计划 M02）。
+
+    与 `invoice_service` 共用同一个 `migrated_database`：M02 要验证的一件事正是
+    「新加的五张表不影响旧发票照常回读」，两边用同一个库才看得出来。
+
+    这里**不注入文件存储**：M02 的服务不保存字节，只登记「字节已经存好了」这个
+    事实（谁保存、怎么切页是 M03）。
+    """
+    return IntakeService(migrated_database)
+
+
+@pytest.fixture
+def intake_ingest_service(
+    intake_service: IntakeService, storage: LocalFileStorage
+) -> IntakeIngestService:
+    """整理批次的摄入服务（多文件计划 M03）。
+
+    与 `intake_service` 共用同一个库、与 `invoice_service` 共用同一个 `storage`：
+    「同一份字节在批次路径与旧单张上传路径各自怎么判重」要两边用同一个存储才看得出来。
+
+    **调度器留空**，即 `InlineIngest`：切页当场跑完，测试结果确定，不起线程。
+    后台线程另有专门的用例（见 `test_intake_ingest.py`）。
+    """
+    return IntakeIngestService(
+        intake_service,
+        file_storage=storage,
+        upload_max_bytes=UPLOAD_MAX_BYTES_FOR_TESTS,
+    )
+
+
+@pytest.fixture
+def intake_recognition_service(
+    intake_service: IntakeService,
+    migrated_database: Database,
+    storage: LocalFileStorage,
+    recognizer: FakeRecognizer,
+) -> IntakeRecognitionService:
+    """整理批次的日期/商家识别服务（多文件计划 M05）。
+
+    与 `intake_service` / `intake_ingest_service` 共用同一个库和同一个 `storage`：
+    「切出来的页能不能被识别、识别过的页会不会被再送一遍」要在同一套数据上才看
+    得出来。
+
+    **识别器是明确标识的 Fake**，所以这个夹具一次网络请求都不会发。要控制读出来的
+    具体内容（歧义日期、读不出的商家、两个模型分歧）的用例自己换一个测试替身——
+    Fake 识别器的产出是固定的，撑不起那些分支。
+    """
+    return IntakeRecognitionService(
+        intake_service,
+        database=migrated_database,
+        file_storage=storage,
+        recognizer=recognizer,
+    )
+
+
+@pytest.fixture
+def intake_suggestion_service(
+    intake_service: IntakeService,
+    migrated_database: Database,
+    storage: LocalFileStorage,
+) -> IntakeSuggestionService:
+    """商家记忆与相似堆（多文件计划 M07）。
+
+    ⚠️ **没有识别器参数**，这不是漏写：M07 的三层线索（同文件参考、历史别名、
+    版式相似）全是本地计算与数据库查询，服务结构上拿不到任何能发网络请求的对象。
+    与 `intake_service` / `intake_ingest_service` 共用同一个库和 `storage`：
+    版式要从真正落盘的那份字节上量出来。
+    """
+    return IntakeSuggestionService(
+        intake_service, database=migrated_database, file_storage=storage
     )
 
 

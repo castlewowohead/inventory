@@ -309,8 +309,7 @@ class SuggestionService:
         )
         if len(rows) >= FUZZY_SCAN_LIMIT:
             notes.append(
-                f"食材库超过 {FUZZY_SCAN_LIMIT} 条，模糊匹配只比较了按 id 排序的"
-                f"前 {FUZZY_SCAN_LIMIT} 条——候选可能不完整。精确与包含匹配不受影响。"
+                "食材较多，搜索建议可能不完整。找不到时请试试更准确的名称。"
             )
         scored: list[tuple[float, int]] = []
         for row in rows:

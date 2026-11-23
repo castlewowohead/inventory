@@ -30,6 +30,13 @@ from src.errors import register_error_handlers
 from src.integrations.file_storage import LocalFileStorage
 from src.integrations.ocr import Recognizer, build_recognizer
 from src.services.extraction import ExtractionService
+from src.services.intake import IntakeService
+from src.services.intake_ingest import IngestScheduler, IntakeIngestService
+from src.services.intake_recognition import (
+    IntakeRecognitionProcessor,
+    IntakeRecognitionService,
+)
+from src.services.intake_suggestions import IntakeSuggestionService
 from src.services.invoices import InvoiceService
 
 LOG_FORMAT = "%(asctime)s %(levelname)s [%(name)s] %(message)s"
@@ -47,6 +54,14 @@ CONFIG_KEY = "APP_CONFIG"
 
 # 基础设施依赖在 app.config 中的键。
 DEPENDENCIES_KEY = "APP_DEPENDENCIES"
+
+# 整理批次切页的调度器在 app.config 中的键（多文件计划 M03）。
+#
+# ⚠️ **默认不装后台线程**：创建应用不该产生副作用（见本模块开头的组装规则），
+# 否则每个测试用例都会悄悄起几个线程，切页跑在哪一刻也就说不清了。真正要后台跑的
+# 进程由入口装一个 `BackgroundIngest` 进来（见 `src/worker.py` 的
+# `start_intake_ingest`），与「worker 不放进 create_app」是同一条。
+INGEST_SCHEDULER_KEY = "INTAKE_INGEST_SCHEDULER"
 
 
 @dataclass(frozen=True)
@@ -206,6 +221,61 @@ def build_services(app: Flask) -> tuple[InvoiceService, ExtractionService]:
     )
     invoices.attach_extraction(extraction)
     return invoices, extraction
+
+
+def get_ingest_scheduler(app: Flask) -> IngestScheduler | None:
+    """取出入口装进来的切页调度器；没装就是 None（当场切完）。"""
+    return app.config.get(INGEST_SCHEDULER_KEY)
+
+
+def build_intake_services(
+    app: Flask,
+) -> tuple[IntakeService, IntakeIngestService, IntakeRecognitionService]:
+    """造出整理批次的三个服务（多文件计划 M02 + M03 + M05）。
+
+    三者是**分层**而不是互相需要：摄入与识别都调用 `IntakeService` 落库，反过来
+    不会——M02 那一层不读磁盘、不认识 PDF、不调模型（见 `services/intake.py` 的
+    模块说明）。所以这里不需要 `build_services` 那种「先各造一个、再把钩子装上」。
+
+    **摄入服务拿到的处理器只负责排队**（`IntakeRecognitionProcessor`）：切完页写一
+    条「等识别」的状态，不在切页那一步直接跑模型——理由写在那个类上。识别本身由
+    `POST /api/intake-batches/<id>/recognize` 驱动，重复驱动安全且免费。
+    """
+    config = get_config(app)
+    dependencies = get_dependencies(app)
+    intake = IntakeService(dependencies.database)
+    ingest = IntakeIngestService(
+        intake,
+        file_storage=dependencies.file_storage,
+        upload_max_bytes=config.upload_max_bytes,
+        item_processor=IntakeRecognitionProcessor(intake),
+        scheduler=get_ingest_scheduler(app),
+    )
+    recognition = IntakeRecognitionService(
+        intake,
+        database=dependencies.database,
+        file_storage=dependencies.file_storage,
+        recognizer=dependencies.recognizer,
+    )
+    return intake, ingest, recognition
+
+
+def build_intake_suggestion_service(app: Flask) -> IntakeSuggestionService:
+    """造出商家记忆与相似堆的服务（多文件计划 M07）。
+
+    **单独一个构造函数，不塞进 `build_intake_services` 的元组**：那个元组有好几处
+    调用方在按位置解包，为一个新服务改掉它们是没必要的连带改动。
+
+    ⚠️ **注意这里没有 `recognizer`**。M07 的三层线索（同文件参考、历史别名、
+    版式相似）全部是本地计算与数据库查询，所以本服务**结构上**拿不到任何能发网络
+    请求的对象——「建议不花钱」因此是个可以断言的事实，而不是一句承诺。
+    """
+    dependencies = get_dependencies(app)
+    return IntakeSuggestionService(
+        IntakeService(dependencies.database),
+        database=dependencies.database,
+        file_storage=dependencies.file_storage,
+    )
 
 
 def configure_log_output(

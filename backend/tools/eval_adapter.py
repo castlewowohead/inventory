@@ -22,7 +22,7 @@
     python tools/eval_adapter.py live --limit 6
 
 ⚠️ **回放只能验「解析与转换」这一段**，验不了调用、超时、限流与媒体类型。
-实跑才算端到端。两者都要跑：回放是每次改代码的快速回归，实跑是交付前的验收。
+实跑才算端到端。M01 回放仍属于旧 SHA；新提示词的实跑需要明确授权将真实原件发送到配置的 OCR 服务。两种结果分别记录。
 
 ### 文档要求的回归项（`stru_dev.md` 步骤 08「回归验收清单」）
 
@@ -40,12 +40,15 @@ from __future__ import annotations
 
 import argparse
 import glob
+import hashlib
 import json
 import os
 import sys
 from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
+
+from dotenv import load_dotenv
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -73,6 +76,7 @@ DIGITAL_PDF = SAMPLES / "real" / "sample_grocery_supplier_invoices.pdf"
 TEXT_LAYOUTS = SAMPLES / "synthetic" / "text_layouts"
 
 DEFAULT_MODELS = ("qwen3.5-ocr", "qwen3-vl-plus")
+LEGACY_PROMPT_SHA12 = "12e0246b0377"
 
 NUMERIC_FIELDS = frozenset({"quantity", "unit_price", "line_amount", "invoice_total"})
 
@@ -177,7 +181,7 @@ def _recognition_from(stem: str, models: tuple[str, ...]):
             continue
         call = ModelCall(
             model=model,
-            prompt_sha12=CONTENT_PROMPT_SHA12,
+            prompt_sha12=hashlib.sha256(payload["prompt"].encode("utf-8")).hexdigest()[:12],
             content=payload["content"],
             elapsed_seconds=float(payload.get("elapsed_seconds") or 0.0),
             usage=payload.get("usage"),
@@ -225,6 +229,9 @@ def score_ground_truth(report: Report, recognize) -> None:
         is_printed = stem.startswith(PRINTED_SAMPLES)
 
         for name, entry in gt.get("document", {}).items():
+            if name == "supplier":
+                # Legacy GT was not reviewed as M01 seller truth.
+                continue
             found = result.document_field(name)
             got = found.raw_text if found and found.is_recognized else None
             before = report.score(name)
@@ -463,10 +470,11 @@ def main(argv: list[str] | None = None) -> int:
     if args.mode == "replay":
         recognize = lambda stem: _recognition_from(stem, models)  # noqa: E731
         report.notes.append(
-            "回放模式：喂的是步骤 07 落盘的原始响应，**验不了调用、超时、限流与"
+            f"回放模式：旧提示词 SHA {LEGACY_PROMPT_SHA12}；不计商家准确率。喂的是步骤 07 落盘的原始响应，**验不了调用、超时、限流与"
             "媒体类型**，只验解析与转换这一段。"
         )
     else:
+        load_dotenv(SAMPLES.parent / ".env")
         api_key = os.environ.get("OCR_API_KEY") or os.environ.get("DASHSCOPE_API_KEY", "")
         base_url = os.environ.get("OCR_BASE_URL") or os.environ.get("DASHSCOPE_BASE_URL", "")
         if not api_key or not base_url:
@@ -518,7 +526,7 @@ def main(argv: list[str] | None = None) -> int:
                 {
                     "mode": args.mode,
                     "models": list(models),
-                    "prompt_sha12": CONTENT_PROMPT_SHA12,
+                    "prompt_sha12": LEGACY_PROMPT_SHA12 if args.mode == "replay" else CONTENT_PROMPT_SHA12,
                     "checks": report.checks,
                     "fields": {
                         name: {

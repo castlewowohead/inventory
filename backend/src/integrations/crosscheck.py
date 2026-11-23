@@ -50,6 +50,9 @@ from src.contracts import (
     LINE_FIELDS,
     FieldEvidence,
     FieldStatus,
+    FIELD_SUPPLIER,
+    FIELD_SUPPLIER_ENGLISH,
+    FIELD_SUPPLIER_CHINESE,
     RecognitionResult,
     RecognizedField,
     RecognizedLine,
@@ -88,6 +91,10 @@ def _comparable(name: str, value: str | None) -> str | None:
     """把一个原文变成可比较的形式。比不出来就返回原文的归一化文本。"""
     if value is None:
         return None
+    if name in {"supplier", "supplier_english", "supplier_chinese"}:
+        # OCR often appends a full stop to a printed company heading. Ignore
+        # boundary punctuation for agreement only; raw_text stays untouched.
+        return _text_key(value.strip(" \t\r\n.,，。:：;；"))
     if name in _NUMERIC_FIELDS:
         normalized = normalize_number_text(value)
         if normalized.ok and normalized.text is not None:
@@ -209,6 +216,21 @@ def combine(results: Sequence[RecognitionResult], *, models: Sequence[str]) -> C
     document: dict[str, FieldVerdict] = {}
     for name in DOCUMENT_FIELDS:
         document[name] = judge(name, [result.document_field(name) for result in results])
+    # A shared display name is insufficient when the models disagree on whether
+    # another paper spelling is present. Keep all readings, request human review.
+    name_fields = (FIELD_SUPPLIER_ENGLISH, FIELD_SUPPLIER_CHINESE)
+    has_name_readings = any(
+        result.document_field(name) is not None
+        for result in results for name in name_fields
+    )
+    if has_name_readings and not all(document[name].agreed for name in name_fields):
+        chosen = document[FIELD_SUPPLIER]
+        document[FIELD_SUPPLIER] = FieldVerdict(
+            RecognizedField.unreadable(FIELD_SUPPLIER, evidence=chosen.field.evidence),
+            agreed=False,
+            values=chosen.values,
+            note="模型对纸面英文或中文商家名有分歧，来源须人工确认",
+        )
 
     counts = [len(result.lines) for result in results]
     line_total = max(counts)

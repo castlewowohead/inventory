@@ -16,6 +16,11 @@ from PIL import Image, ImageDraw
 from src.config import Config
 from src.contracts import (
     FIELD_ITEM_DESCRIPTION,
+    FIELD_INVOICE_DATE,
+    FIELD_SUPPLIER,
+    FIELD_SUPPLIER_ENGLISH,
+    FIELD_SUPPLIER_CHINESE,
+    FIELD_SUPPLIER_EVIDENCE,
     FIELD_LINE_AMOUNT,
     FIELD_QUANTITY,
     FIELD_UNIT,
@@ -26,8 +31,10 @@ from src.contracts import (
     RecognizedPage,
 )
 from src.db import Database
+from src.api.schemas import invoice_payload
 from src.documents.grid import detect_grid
 from src.errors import ConflictError, NotFoundError
+from src.integrations.crosscheck import combine
 from src.integrations.dashscope import OcrServiceError, StructureAnswer
 from src.integrations.file_storage import LocalFileStorage
 from src.models import (
@@ -124,11 +131,13 @@ class _StubRecognizer:
     provider = "dashscope"
     is_fake = False
 
-    def __init__(self, lines, *, models=("qwen3.5-ocr", "qwen3-vl-plus"), structure=None, fail=None):
+    def __init__(self, lines, *, models=("qwen3.5-ocr", "qwen3-vl-plus"), structure=None, fail=None,
+                 document_fields=None):
         self._lines = lines
         self.models = tuple(models)
         self._structure = structure
         self._fail = fail
+        self._document_fields = document_fields or {}
         self.structure_calls = 0
         self.content_calls = 0
 
@@ -142,7 +151,7 @@ class _StubRecognizer:
             model="+".join(self.models),
             recognized_at=datetime.now(timezone.utc),
             pages=(RecognizedPage(number=1),),
-            document_fields={},
+            document_fields=self._document_fields,
             lines=tuple(self._lines),
             raw_response="{}",
             warnings=(),
@@ -215,6 +224,71 @@ def test_printed_pages_are_prefilled_from_agreeing_models(
     assert str(line.unit_price) == "6.0000"
 
 
+def test_seller_readings_reach_draft_and_api_without_overwriting_raw_names(
+    migrated_database: Database, storage: LocalFileStorage, config: Config
+) -> None:
+    recognizer = _StubRecognizer(
+        [_line(1, item_description="Rice")],
+        document_fields={
+            FIELD_SUPPLIER: RecognizedField.recognized(FIELD_SUPPLIER, "Paper Seller"),
+            FIELD_SUPPLIER_ENGLISH: RecognizedField.recognized(FIELD_SUPPLIER_ENGLISH, "Paper Seller"),
+            FIELD_SUPPLIER_CHINESE: RecognizedField.recognized(FIELD_SUPPLIER_CHINESE, "纸面商家"),
+            FIELD_SUPPLIER_EVIDENCE: RecognizedField.recognized(FIELD_SUPPLIER_EVIDENCE, "Seller: Paper Seller / 纸面商家"),
+        },
+    )
+    invoices, _ = _services(migrated_database, storage, recognizer, config)
+    view = _upload(invoices, _printed_page(), "seller.jpg")
+    payload = invoice_payload(view)
+    assert payload["source_name"] == "Paper Seller"
+    fields = payload["recognition"]["raw_document_fields"]["fields"]
+    assert fields["supplier_english"]["raw_text"] == "Paper Seller"
+    assert fields["supplier_chinese"]["raw_text"] == "纸面商家"
+    assert fields["supplier_evidence"]["raw_text"] == "Seller: Paper Seller / 纸面商家"
+
+
+def test_seller_model_disagreement_is_saved_in_header_evidence(
+    migrated_database: Database, storage: LocalFileStorage, config: Config
+) -> None:
+    def reading(model: str, seller: str) -> RecognitionResult:
+        return RecognitionResult(
+            provider="dashscope", is_fake=False, model=model,
+            recognized_at=datetime.now(timezone.utc),
+            pages=(RecognizedPage(number=2),),
+            document_fields={
+                FIELD_SUPPLIER: RecognizedField.recognized(FIELD_SUPPLIER, seller),
+                FIELD_SUPPLIER_ENGLISH: RecognizedField.recognized(FIELD_SUPPLIER_ENGLISH, seller),
+                FIELD_SUPPLIER_CHINESE: RecognizedField.missing(FIELD_SUPPLIER_CHINESE),
+            },
+        )
+
+    models = ("qwen3.5-ocr", "qwen3-vl-plus")
+    outcome = combine((reading(models[0], "Paper Seller"), reading(models[1], "Other Seller")), models=models)
+    invoices, extraction = _services(migrated_database, storage, _StubRecognizer([]), config)
+    evidence = json.loads(extraction._raw_document_json(outcome.result, doc_class=DOC_CLASS_PRINTED_SCAN, outcome=outcome))
+    fields = evidence["fields"]
+    assert fields["supplier"]["status"] == "unreadable"
+    assert fields["supplier"]["model_values"] == ["Paper Seller", "Other Seller"]
+    assert fields["supplier_english"]["model_values"] == ["Paper Seller", "Other Seller"]
+    assert fields["supplier"]["agreement"]
+
+
+def test_ocr_prefills_a_clear_two_digit_year_date(
+    migrated_database: Database, storage: LocalFileStorage, config: Config
+) -> None:
+    recognizer = _StubRecognizer(
+        [_line(1, item_description="Rice")],
+        document_fields={
+            FIELD_INVOICE_DATE: RecognizedField.recognized(FIELD_INVOICE_DATE, "6/29/26")
+        },
+    )
+    invoices, _ = _services(migrated_database, storage, recognizer, config)
+
+    view = _upload(invoices, _printed_page(), "printed.jpg")
+
+    assert view.invoice_date.isoformat() == "2026-06-29"
+    assert view.raw_document_fields["fields"]["invoice_date"]["raw_text"] == "6/29/26"
+
+
 def test_handwritten_pages_are_never_prefilled(
     migrated_database: Database, storage: LocalFileStorage, config: Config
 ) -> None:
@@ -253,7 +327,7 @@ def test_the_models_readings_are_still_preserved_on_handwriting(
     evidence = view.lines[0].raw_fields
     payload = evidence if isinstance(evidence, dict) else json.loads(evidence)
     assert payload["fields"]["quantity"]["raw_text"] == "8"
-    assert payload["prompt_sha12"] == "12e0246b0377"
+    assert payload["prompt_sha12"] == "67fb7df1217b"
 
 
 def test_handwriting_asks_for_structure_first(

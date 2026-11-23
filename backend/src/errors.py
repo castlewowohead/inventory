@@ -87,15 +87,15 @@ class FeatureNotImplementedError(AppError):
 
 # 框架级错误的对外文案。与业务异常保持同一种语言，且不回显请求 URL 与内部细节。
 HTTP_MESSAGES: dict[int, str] = {
-    400: "请求格式不正确。",
+    400: "内容有误，请检查后重试。",
     401: "需要身份验证。",
     403: "没有访问权限。",
-    404: "请求的资源不存在。",
-    405: "该路径不支持此 HTTP 方法。",
+    404: "找不到这项内容，请刷新后重试。",
+    405: "当前操作暂时无法完成，请刷新后重试。",
     413: "上传内容超过大小限制。",
-    415: "不支持的请求内容类型。",
+    415: "文件格式不支持，请换一个文件重试。",
     429: "请求过于频繁，请稍后再试。",
-    500: "服务器内部错误，请查看服务端日志。",
+    500: "暂时无法完成操作，请稍后重试。",
 }
 
 
@@ -167,4 +167,4 @@ def register_error_handlers(app: Flask) -> None:
     def handle_unexpected_error(exc: Exception) -> tuple[Response, int]:
         # 未预期异常：完整堆栈只进日志，响应里不暴露内部细节。
         app.logger.exception("unhandled error path=%s", _current_path())
-        return _error_response(500, "internal_error", "服务器内部错误，请查看服务端日志。")
+        return _error_response(500, "internal_error", "暂时无法完成操作，请稍后重试。")

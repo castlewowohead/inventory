@@ -15,6 +15,7 @@ from src.normalization import (
     NUMBER_FORMAT_DOT,
     NUMBER_FORMAT_STRICT,
     _TRAILING_UNIT_WORDS,
+    date_text_readings,
     normalize_date_text,
     normalize_number_text,
 )
@@ -174,9 +175,100 @@ def test_date_order_resolves_the_ambiguity_once_per_supplier() -> None:
     assert normalize_date_text("6/11/2026", date_order=DATE_ORDER_DMY).text == "2026-11-06"
 
 
+def test_ocr_short_year_is_expanded_when_month_and_day_are_clear() -> None:
+    assert normalize_date_text("6/29/26", allow_short_year=True).text == "2026-06-29"
+    assert normalize_date_text("29/6/26", allow_short_year=True).text == "2026-06-29"
+    assert normalize_date_text("6/11/26", allow_short_year=True).text is None
+    assert normalize_date_text("6/11/26", date_order=DATE_ORDER_MDY, allow_short_year=True).text == "2026-06-11"
+    assert normalize_date_text("6/29/26").text is None
+
+
 def test_impossible_dates_are_refused() -> None:
     assert normalize_date_text("2026-02-30").text is None
 
 
 def test_auto_is_the_default_for_the_ocr_path() -> None:
     assert normalize_number_text("$1,991.38", number_format=NUMBER_FORMAT_AUTO).text == "1991.38"
+
+
+# --- 歧义日期的两种读法（多文件计划 M05） -----------------------------------
+#
+# `normalize_date_text` 回答「能不能定死一个日期」，定不死就拒绝——写进采购记录的
+# 日期必须走它。`date_text_readings` 回答「定不死的时候到底有哪几种可能」，整理阶段
+# 的**分类候选**走它：把两种可能摆出来让人挑一个，比留一个空格子有用得多，而且
+# **两条都只是候选，没有一条会自己变成决定**。
+
+
+def test_an_unambiguous_date_has_exactly_one_reading() -> None:
+    result = date_text_readings("2026-11-08")
+
+    assert [item.text for item in result.readings] == ["2026-11-08"]
+    assert result.ambiguous is False
+    assert result.certain is not None
+
+
+def test_an_ambiguous_numeric_date_has_both_readings_and_no_preference() -> None:
+    """⚠️ 顺序只是为了让界面有稳定次序，**不表示 mdy 更可能**。"""
+    result = date_text_readings("6/11/2026")
+
+    assert result.ambiguous is True
+    assert [(item.text, item.order) for item in result.readings] == [
+        ("2026-06-11", DATE_ORDER_MDY),
+        ("2026-11-06", DATE_ORDER_DMY),
+    ]
+    assert result.certain is None  # 没有「那一条」答案
+    assert result.problem  # 为什么定不死，原话留着
+
+
+def test_a_confirmed_date_order_collapses_the_ambiguity_to_one_reading() -> None:
+    """这家商家说过它写月/日/年之后，同一段原文只剩一条读法。"""
+    assert [item.text for item in date_text_readings("6/11/2026", date_order=DATE_ORDER_MDY).readings] == ["2026-06-11"]
+    assert [item.text for item in date_text_readings("6/11/2026", date_order=DATE_ORDER_DMY).readings] == ["2026-11-06"]
+
+
+def test_a_date_whose_day_is_over_twelve_is_not_ambiguous() -> None:
+    """`13/11/2026` 只有一种读法：13 不可能是月份。文本本身定死了，不需要商家。"""
+    result = date_text_readings("13/11/2026")
+
+    assert result.ambiguous is False
+    assert [item.text for item in result.readings] == ["2026-11-13"]
+
+
+def test_the_same_number_twice_is_not_ambiguous() -> None:
+    """`3/3/2026` 两种顺序读出同一天，所以它不是歧义，只有一条读法。"""
+    result = date_text_readings("3/3/2026")
+
+    assert result.ambiguous is False
+    assert [item.text for item in result.readings] == ["2026-03-03"]
+
+
+def test_something_that_is_not_a_date_has_no_readings_at_all() -> None:
+    """认不出就是零条读法，**不是**两条瞎猜的。"""
+    result = date_text_readings("商家留的手写备注")
+
+    assert result.readings == ()
+    assert result.ambiguous is False
+    assert result.problem
+
+
+def test_an_impossible_date_is_refused_in_both_orders() -> None:
+    """`2/30/2026` 与 `30/2/2026` 两种读法都不存在 → 零条，而不是挑一个。"""
+    assert date_text_readings("2/30/2026").readings == ()
+
+
+def test_a_two_digit_year_is_still_ambiguous_on_the_day_month_order() -> None:
+    """OCR 通路允许两位年份，但日/月顺序仍然要人（或商家路由）来定。"""
+    result = date_text_readings("11/08/26", allow_short_year=True)
+
+    assert result.ambiguous is True
+    assert sorted(item.text for item in result.readings) == [
+        "2026-08-11",
+        "2026-11-08",
+    ]
+    # 不允许两位年份时一条都不给——不会偷偷按 2026 年读。
+    assert date_text_readings("11/08/26").readings == ()
+
+
+def test_an_invalid_date_order_is_a_programming_error() -> None:
+    with pytest.raises(ValueError, match="date_order"):
+        date_text_readings("2026-11-08", date_order="whatever")

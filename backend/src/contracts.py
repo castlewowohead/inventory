@@ -53,6 +53,9 @@ LINE_FIELDS: tuple[str, ...] = (
 
 # 单据级字段的标准名。
 FIELD_SUPPLIER = "supplier"
+FIELD_SUPPLIER_ENGLISH = "supplier_english"
+FIELD_SUPPLIER_CHINESE = "supplier_chinese"
+FIELD_SUPPLIER_EVIDENCE = "supplier_evidence"
 FIELD_INVOICE_DATE = "invoice_date"
 FIELD_INVOICE_NUMBER = "invoice_number"
 FIELD_INVOICE_TOTAL = "invoice_total"
@@ -60,6 +63,9 @@ FIELD_CURRENCY = "currency"
 
 DOCUMENT_FIELDS: tuple[str, ...] = (
     FIELD_SUPPLIER,
+    FIELD_SUPPLIER_ENGLISH,
+    FIELD_SUPPLIER_CHINESE,
+    FIELD_SUPPLIER_EVIDENCE,
     FIELD_INVOICE_DATE,
     FIELD_INVOICE_NUMBER,
     FIELD_INVOICE_TOTAL,
@@ -435,6 +441,9 @@ __all__ = [
     "FIELD_LINE_AMOUNT",
     "FIELD_QUANTITY",
     "FIELD_SUPPLIER",
+    "FIELD_SUPPLIER_ENGLISH",
+    "FIELD_SUPPLIER_CHINESE",
+    "FIELD_SUPPLIER_EVIDENCE",
     "FIELD_UNIT",
     "FIELD_UNIT_PRICE",
 ]

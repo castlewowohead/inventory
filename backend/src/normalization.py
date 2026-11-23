@@ -5,7 +5,8 @@
 步骤 06 已经把「表格里的一格文本怎么变成精确数值」想清楚了：货币符号剥掉、括号
 记负、**逗号含义不明时拒绝而不是猜**、日/月顺序不明时拒绝。步骤 08 的 OCR 通路
 需要**同一套**规则——否则同一张单据走表格导入和走拍照识别会得到不同的数值，
-而这种不一致不会报错。
+而这种不一致不会报错。OCR 单据日期可单独启用两位年份转换：本应用只接受
+2000 年起的采购日期，且月/日顺序能确定时才转换；表格导入的默认规则保持严格。
 
 于是把纯文本的那部分抽到这里，`services/spreadsheet_parsing.py` 与
 `services/extraction.py` 都调它。步骤 04 的 `parse_decimal` 仍是最后一道闸门
@@ -349,7 +350,9 @@ def _is_digits(text: str) -> bool:
     return bool(text) and text.isdigit() and text.isascii()
 
 
-def normalize_date_text(raw: str, *, date_order: str = DATE_ORDER_STRICT) -> Normalized:
+def normalize_date_text(
+    raw: str, *, date_order: str = DATE_ORDER_STRICT, allow_short_year: bool = False
+) -> Normalized:
     """把一个日期原文变成 `YYYY-MM-DD`。认不出就返回 None，**绝不编造日期**。
 
     认不出日期的代价已经被设计掉了：步骤 04 允许 `purchase_date` 为空，
@@ -371,9 +374,16 @@ def normalize_date_text(raw: str, *, date_order: str = DATE_ORDER_STRICT) -> Nor
     if iso:
         return _build_date(*(int(part) for part in iso.groups()), notes=notes, raw=raw)
 
-    numeric = re.fullmatch(r"(\d{1,2})[-/.](\d{1,2})[-/.](\d{4})", text)
+    numeric = re.fullmatch(r"(\d{1,2})[-/.](\d{1,2})[-/.](\d{2}|\d{4})", text)
     if numeric:
-        first, second, year = (int(part) for part in numeric.groups())
+        first_text, second_text, year_text = numeric.groups()
+        first, second = int(first_text), int(second_text)
+        if len(year_text) == 2 and not allow_short_year:
+            return Normalized(None, tuple(notes), f"{text!r} 使用两位年份，请填写完整年份")
+        # 本应用只接收 2000 年起的采购日期；未来日期仍由保存时的日期校验拒绝。
+        year = 2000 + int(year_text) if len(year_text) == 2 else int(year_text)
+        if len(year_text) == 2:
+            notes.append(f"两位年份 {year_text} 按 {year} 年读取")
         if date_order == DATE_ORDER_STRICT and first <= 12 and second <= 12 and first != second:
             return Normalized(
                 None,
@@ -388,14 +398,6 @@ def normalize_date_text(raw: str, *, date_order: str = DATE_ORDER_STRICT) -> Nor
             month, day = first, second
             notes.append(f"按「月/日/年」读 {text!r}")
         return _build_date(year, month, day, notes=notes, raw=raw)
-
-    # 两位年份（`11/08/26`）一律不认：世纪靠猜，而且这种写法日/月顺序通常也不明。
-    if re.fullmatch(r"\d{1,2}[-/.]\d{1,2}[-/.]\d{2}", text):
-        return Normalized(
-            None,
-            tuple(notes),
-            f"{text!r} 是两位年份，世纪与日/月顺序都定不下来，请人工填写",
-        )
 
     english = re.fullmatch(
         r"([A-Za-z]+)\.?\s+(\d{1,2})(?:st|nd|rd|th)?,?\s+(\d{4})", text
@@ -415,6 +417,125 @@ def normalize_date_text(raw: str, *, date_order: str = DATE_ORDER_STRICT) -> Nor
         )
 
     return Normalized(None, tuple(notes), f"认不出日期写法 {raw!r}")
+
+
+@dataclass(frozen=True)
+class DateReading:
+    """一个日期原文的**一种**读法。
+
+    `order` 是这条读法按什么顺序读出来的：`strict` 表示文本本身就定死了
+    （ISO、英文月份、或者第一个数大于 12），`mdy` / `dmy` 表示日/月顺序**定不死**，
+    这是其中一种可能。
+    """
+
+    text: str
+    """ISO 日期文本 `YYYY-MM-DD`。"""
+
+    order: str
+    """`strict` / `mdy` / `dmy`，取自本模块的 `DATE_ORDER_*`。"""
+
+    note: str = ""
+
+
+@dataclass(frozen=True)
+class DateReadings:
+    """一个日期原文**所有能成立的读法**。
+
+    与 `normalize_date_text` 的关系：那个函数回答「能不能定死一个日期」，定不死就
+    拒绝；本函数回答「定不死的时候，到底有哪几种可能」。
+
+    两者的使用场合不同，所以不是两套口径：
+    - **要写进采购记录的日期**用 `normalize_date_text`——宁可留空让人填，也不猜。
+    - **整理阶段的分类候选**用本函数——`6/11/2026` 的两种可能都摆出来让人挑一个，
+      比留一个空格子有用得多，而且**两条都只是候选，没有一条会自己变成决定**
+      （docs/multifiles.md 第 4 节）。
+
+    `ambiguous` 为 True 时 `readings` 恰好有两条（mdy 与 dmy），顺序是 mdy 在前
+    ——⚠️ 这个顺序**不表示 mdy 更可能**，只是为了让界面有稳定次序。谁对要么看
+    纸面上别的线索，要么等这家商家的 `date_order` 定下来。
+    """
+
+    readings: tuple[DateReading, ...] = dataclass_field(default_factory=tuple)
+    ambiguous: bool = False
+    notes: tuple[str, ...] = dataclass_field(default_factory=tuple)
+    problem: str | None = None
+
+    @property
+    def ok(self) -> bool:
+        return bool(self.readings)
+
+    @property
+    def certain(self) -> DateReading | None:
+        """唯一一条读法；有歧义或读不出来时是 None。"""
+        return self.readings[0] if len(self.readings) == 1 else None
+
+
+def date_text_readings(
+    raw: str, *, date_order: str = DATE_ORDER_STRICT, allow_short_year: bool = False
+) -> DateReadings:
+    """一个日期原文能成立的全部读法。**一个字都不猜，但也不把歧义丢掉。**
+
+    三种结果：
+
+    | 原文 | `date_order` | 结果 |
+    | --- | --- | --- |
+    | `2026-11-08` | 任意 | 一条读法，`ambiguous=False` |
+    | `6/11/2026` | `strict` | **两条**读法（6 月 11 日 / 11 月 6 日），`ambiguous=True` |
+    | `6/11/2026` | `mdy` | 一条读法（6 月 11 日）——这家商家说过它写月/日/年 |
+    | `这是什么` | 任意 | 零条读法，`problem` 说明原因 |
+
+    ⚠️ **`date_order` 只能来自人工确认过的商家**（docs/multifiles.md M05）：拿一个
+    还没人确认的商家候选去套它的日/月顺序，等于用相似度决定了一个日历日，而那种
+    错误不报错——它只是把这笔采购算进了错误的月份。
+    """
+    if date_order not in DATE_ORDERS:
+        raise ValueError(f"date_order={date_order!r} 无效，可选：{DATE_ORDERS}")
+
+    direct = normalize_date_text(
+        raw, date_order=date_order, allow_short_year=allow_short_year
+    )
+    if direct.ok and direct.text is not None:
+        return DateReadings(
+            readings=(DateReading(direct.text, date_order, _last_note(direct.notes)),),
+            notes=direct.notes,
+        )
+
+    # 读不出来的原因可能是「日/月顺序定不死」，也可能是「根本不是个日期」。
+    # 前者有两种可能要摆出来，后者一条也没有——所以这里不看错误文案，直接把两种
+    # 顺序各试一次：两种都成立才是歧义。
+    if date_order != DATE_ORDER_STRICT:
+        return DateReadings(notes=direct.notes, problem=direct.problem)
+
+    as_mdy = normalize_date_text(
+        raw, date_order=DATE_ORDER_MDY, allow_short_year=allow_short_year
+    )
+    as_dmy = normalize_date_text(
+        raw, date_order=DATE_ORDER_DMY, allow_short_year=allow_short_year
+    )
+    if not (as_mdy.ok and as_dmy.ok) or as_mdy.text == as_dmy.text:
+        # 一种顺序都读不出来（不是日期写法、两位年份、日期不存在……），或者两种
+        # 顺序读出同一天（`3/3/2026`）——后者在 strict 下本来就不该被拒，真被拒了
+        # 也说明问题不在日/月顺序上。原因原样透出。
+        return DateReadings(notes=direct.notes, problem=direct.problem)
+
+    assert as_mdy.text is not None and as_dmy.text is not None
+    return DateReadings(
+        readings=(
+            DateReading(as_mdy.text, DATE_ORDER_MDY, f"按「月/日/年」读 {raw!r}"),
+            DateReading(as_dmy.text, DATE_ORDER_DMY, f"按「日/月/年」读 {raw!r}"),
+        ),
+        ambiguous=True,
+        notes=tuple(direct.notes) + (
+            f"{raw!r} 的日/月顺序文本本身定不死，两种读法都留着等人确认；"
+            "确认商家并给这家设 date_order 之后可以用保存的原文重新解析。",
+        ),
+        problem=direct.problem,
+    )
+
+
+def _last_note(notes: tuple[str, ...]) -> str:
+    """取最后一条改动说明当这条读法的说明。没有就是空串（ISO 原文不需要解释）。"""
+    return notes[-1] if notes else ""
 
 
 def _build_date(
@@ -437,7 +558,10 @@ __all__ = [
     "NUMBER_FORMAT_COMMA",
     "NUMBER_FORMAT_DOT",
     "NUMBER_FORMAT_STRICT",
+    "DateReading",
+    "DateReadings",
     "Normalized",
+    "date_text_readings",
     "fold_width",
     "normalize_date_text",
     "normalize_number_text",

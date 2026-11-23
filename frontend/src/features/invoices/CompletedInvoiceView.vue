@@ -1,11 +1,11 @@
 <script setup lang="ts">
 import { computed, onUnmounted, ref, watch } from 'vue'
-import { errorMessage, getInvoiceFileContent, getPurchase, updateInvoice, type Invoice, type InvoiceLine, type Purchase } from '../../shared/api'
+import { errorMessage, getIntakeItemOriginal, getInvoiceFileContent, getPurchase, reopenInvoice, updateInvoice, type Invoice, type InvoiceLine, type Purchase } from '../../shared/api'
 import { downloadAttachment } from '../../shared/platform/download'
 import OriginalDocumentViewer from './OriginalDocumentViewer.vue'
 
 const props = defineProps<{ invoice: Invoice }>()
-const emit = defineEmits<{ back: []; openExisting: [id: number]; currencyChanged: [invoice: Invoice] }>()
+const emit = defineEmits<{ back: []; openExisting: [id: number]; currencyChanged: [invoice: Invoice]; reopened: [invoice: Invoice] }>()
 const purchases = ref<Record<number, Purchase>>({})
 const failedIds = ref<number[]>([])
 const loading = ref(false)
@@ -15,12 +15,14 @@ const editingCurrency = ref(false)
 const currencyChoice = ref<'USD' | 'CNY'>('USD')
 const currencySaving = ref(false)
 const currencyError = ref('')
+const reopening = ref(false)
+const reopenError = ref('')
 let requestSequence = 0
 onUnmounted(() => { requestSequence += 1 })
 
 const confirmed = computed(() => props.invoice.lines.filter((line) => line.status === 'confirmed'))
 const skipped = computed(() => props.invoice.lines.filter((line) => line.status === 'skipped'))
-const fileCount = computed(() => props.invoice.files.length)
+const fileCount = computed(() => props.invoice.files.length + props.invoice.intake_sources.length)
 const receiptCurrency = computed(() => props.invoice.currency || 'USD')
 const hasRevisions = computed(() => Object.values(purchases.value).some((purchase) => purchase.revision_count > 0 || !!purchase.voided_at))
 
@@ -104,6 +106,15 @@ async function downloadOriginal(fileId: number, name: string) {
   }
 }
 
+async function downloadIntakeOriginal(batchId: number, itemId: number, name: string) {
+  downloadError.value = ''
+  try {
+    downloadAttachment(await getIntakeItemOriginal(batchId, itemId), name)
+  } catch (error) {
+    downloadError.value = errorMessage(error)
+  }
+}
+
 function beginCurrencyEdit() {
   currencyChoice.value = props.invoice.currency === 'CNY' ? 'CNY' : 'USD'
   currencyError.value = ''
@@ -124,6 +135,19 @@ async function saveCurrency() {
     currencySaving.value = false
   }
 }
+
+async function reopenForEditing() {
+  if (reopening.value || currencySaving.value) return
+  reopening.value = true
+  reopenError.value = ''
+  try {
+    emit('reopened', await reopenInvoice(props.invoice.id))
+  } catch (error) {
+    reopenError.value = errorMessage(error)
+  } finally {
+    reopening.value = false
+  }
+}
 </script>
 
 <template>
@@ -141,7 +165,8 @@ async function saveCurrency() {
           </view>
         </view>
         <view class="total-block">
-          <view class="badges"><text class="status">已完成</text><text v-if="invoice.recognition.is_fake" class="demo">演示识别结果</text></view>
+          <view class="badges"><text class="status">已完成</text><text v-if="invoice.recognition.is_fake" class="demo">演示识别结果</text><button class="edit-receipt" :disabled="reopening || currencySaving" @click="reopenForEditing">{{ reopening ? '正在打开…' : '修改' }}</button></view>
+          <text v-if="reopenError" class="load-error reopen-error" role="alert">{{ reopenError }}</text>
           <text class="field-label">单据总额</text>
           <text class="grand-total">{{ money(invoice.invoice_total, receiptCurrency) }}</text>
           <button v-if="!editingCurrency" class="currency-edit" @click="beginCurrencyEdit">币种 {{ receiptCurrency }} · 修改</button>
@@ -165,6 +190,7 @@ async function saveCurrency() {
 
       <view v-if="invoice.entry_source === 'import' && fileCount" class="import-files">
         <button v-for="file in invoice.files" :key="file.id" class="ui-button secondary" @click="downloadOriginal(file.id, file.original_name)">下载原始表格 · {{ file.original_name }}</button>
+        <button v-for="source in invoice.intake_sources" :key="source.item_id" class="ui-button secondary" @click="downloadIntakeOriginal(source.batch_id, source.item_id, source.original_name)">下载原始表格 · {{ source.original_name }} · 第 {{ source.row_no }} 行</button>
         <text v-if="downloadError" class="load-error" role="alert">{{ downloadError }}</text>
       </view>
 
@@ -217,7 +243,7 @@ async function saveCurrency() {
     <view v-if="originalOpen" class="original-overlay" @click.self="originalOpen = false" @keydown.esc="originalOpen = false">
       <view class="original-drawer" role="dialog" aria-modal="true" aria-label="单据原件">
         <view class="drawer-head"><text>单据原件</text><button class="ui-button secondary" @click="originalOpen = false">关闭</button></view>
-        <OriginalDocumentViewer :invoice-id="invoice.id" :files="invoice.files" :is-fake="invoice.recognition.is_fake" :focus="null" :visible="true" />
+        <OriginalDocumentViewer :invoice-id="invoice.id" :files="invoice.files" :sources="invoice.intake_sources" :is-fake="invoice.recognition.is_fake" :focus="null" :visible="true" />
       </view>
     </view>
   </view>
@@ -239,6 +265,9 @@ async function saveCurrency() {
 .badges { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 7px; margin-bottom: 13px; }
 .status, .demo { padding: 5px 10px; border-radius: 99px; background: #e7f3eb; color: var(--green); font-size: 13px; font-weight: 700; }
 .demo { background: #fff2d8; color: #7b4a03; }
+.edit-receipt { width: auto; min-height: 40px; margin: -6px -8px 0 8px; padding: 6px 8px; border: 0; background: transparent; color: var(--green); font-size: 16px; font-weight: 700; cursor: pointer; }
+.edit-receipt::after { border: 0; }
+.reopen-error { margin: 0; text-align: left; }
 .grand-total { font-size: clamp(30px, 3.5vw, 43px); font-weight: 750; line-height: 1.15; white-space: nowrap; }
 .currency-edit { min-height: 44px; margin: 0 -8px 0 0; padding: 8px; border: 0; background: transparent; color: var(--green); font-size: 14px; cursor: pointer; }
 .currency-edit::after { border: 0; }
