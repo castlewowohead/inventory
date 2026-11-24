@@ -15,3 +15,18 @@ export function formatClock(value: string | null): string {
   if (!match) return value
   return `${match[2]}-${match[3]} ${match[4]}:${match[5]}`
 }
+
+/**
+ * `2026-11-24T03:04:11+00:00` → `11-24 11:04`, **in the viewer's own timezone**.
+ *
+ * ⚠️ Not `formatClock`: that one slices the ISO text, so it prints UTC. A time
+ * stamp that disagrees with the wall clock is worse than none when the question
+ * it answers is 「这一行是我刚才传的那一份吗」(plan section 15 ①).
+ */
+export function formatLocalClock(value: string | null): string {
+  if (!value) return ''
+  const when = new Date(value)
+  if (Number.isNaN(when.getTime())) return value
+  const two = (part: number) => String(part).padStart(2, '0')
+  return `${two(when.getMonth() + 1)}-${two(when.getDate())} ${two(when.getHours())}:${two(when.getMinutes())}`
+}

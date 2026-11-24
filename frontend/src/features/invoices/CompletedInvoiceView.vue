@@ -152,7 +152,7 @@ async function reopenForEditing() {
 
 <template>
   <view class="receipt-page">
-    <button class="back-link" @click="emit('back')">← 返回单据</button>
+    <button class="back-link" @click="emit('back')">← {{ invoice.intake_sources.length ? '返回分类页面' : '返回单据' }}</button>
     <view class="receipt ui-card">
       <view class="receipt-header">
         <view class="supplier-block">
@@ -203,7 +203,7 @@ async function reopenForEditing() {
       <view v-if="hasRevisions" class="revision-note" role="status">下方明细显示当前采购记录；完成时的入账金额保留在回执底部。</view>
 
       <view class="items-heading"><text>采购明细</text><text class="item-count">{{ confirmed.length }} 项</text></view>
-      <view class="table-head" aria-hidden="true"><text>商品 / 记录描述</text><text>数量</text><text>单价</text><text>行金额</text></view>
+      <view class="table-head" aria-hidden="true"><text>商品 / 记录描述</text><text>数量</text><text>单价</text><text>金额</text></view>
       <view v-if="loading" class="loading-row" role="status">正在读取当前采购记录…</view>
       <view v-else-if="confirmed.length === 0" class="loading-row">这张单据没有已入账明细。</view>
       <view v-else class="item-list">
@@ -214,7 +214,7 @@ async function reopenForEditing() {
               <text v-if="description(purchaseFor(line)!)" class="description">记录描述 · {{ description(purchaseFor(line)!) }}</text>
               <text v-if="purchaseFor(line)!.line_kind === 'adjustment'" class="row-note">调整项</text>
               <text v-if="purchaseFor(line)!.voided_at" class="row-note">这条采购记录已作废</text>
-              <text v-else-if="purchaseFor(line)!.amount_mismatch" class="row-note">已确认按行金额入账</text>
+              <text v-else-if="purchaseFor(line)!.amount_mismatch" class="row-note">已确认按纸面金额入账</text>
             </view>
             <text class="item-quantity">{{ quantity(purchaseFor(line)!) }}</text>
             <text class="item-price">{{ money(purchaseFor(line)!.unit_price, purchaseFor(line)!.currency) }}<text v-if="purchaseFor(line)!.purchase_unit" class="per-unit"> / {{ purchaseFor(line)!.purchase_unit }}</text></text>

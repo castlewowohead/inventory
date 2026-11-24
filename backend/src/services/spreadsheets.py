@@ -95,10 +95,10 @@ class SpreadsheetService:
         return self._invoices.create_import(upload, header=header,
             metadata=self._metadata(parsed, normalized_options), rows=rows)
 
-    def export(self, extension: str, **filters) -> bytes:
+    def export(self, extension: str, invoice_ids: object) -> bytes:
         if extension not in ("csv", "xlsx"):
             raise ValidationError("请选择 CSV 或 XLSX 格式。", details={"field": "format"})
-        records = self._purchases.export_purchases(**filters)
+        records = self._purchases.export_selected_invoices(invoice_ids)
         rows = []
         for item in records:
             food, source = item.food_item, item.source_invoice

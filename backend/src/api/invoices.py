@@ -24,7 +24,7 @@
 | POST   | /api/invoices/<id>/reopen                         | 已完成单据回到审核页                    |
 | GET    | /api/invoices/match                               | 问「这句描述以前确认到哪个食材」        |
 
-三处与别处不同的约定：
+四处与别处不同的约定：
 
 1. **上传走 `multipart/form-data`**，文件字段名是 `files`（可重复，一次多页）。
    表单字段 `recognize=false` 可以只存文件不识别——老板对着照片手工加行，这是真实
@@ -32,7 +32,12 @@
 2. **批量确认返回 200，哪怕有的行失败。** 响应里每一行各自带成功或失败的原因
    （`results`），因为"三行确认两行、第三行报错"是**正常结果**而不是请求失败。
    整个请求级别的错误（单据不存在、整张单作废）才用 4xx。
-3. **数值一律是字符串**（与步骤 04 一致）：JSON 的小数是双精度浮点，前端
+3. **列表按采购日期筛，不按上传时间。** `date_from` / `date_to` 是闭区间的
+   `YYYY-MM-DD`，界面上选定的时间范围落到这一对参数上（区间排除没有日期的
+   单据）。`order` 选 `created_at`（默认，录入时间
+   倒序）或 `invoice_date`（单据上的采购日期倒序，日期待填排最前）——六月一日
+   补录一张五月二十二日的单子，两者差着十天。
+4. **数值一律是字符串**（与步骤 04 一致）：JSON 的小数是双精度浮点，前端
    `JSON.parse` 会把 `1234567.89` 变成 double。请求也请用字符串，传 JSON 小数会被
    明确拒绝。
 """
@@ -60,6 +65,7 @@ from src.api.schemas import (
 from src.errors import ValidationError
 from src.factory import build_services
 from src.services.extraction import ExtractionService
+from src.repositories.invoices import ORDER_BY_CREATED_AT
 from src.services.invoices import ConfirmOption, InvoiceService, UploadedFile
 from src.services.ingredients import DEFAULT_LIMIT, UNSET
 
@@ -179,6 +185,9 @@ def search_invoices() -> tuple[Response, int]:
     page = service().search_invoices(
         completed=query_bool(request.args, "completed"),
         source=query_text(request.args, "source"),
+        date_from=query_text(request.args, "date_from"),
+        date_to=query_text(request.args, "date_to"),
+        order=query_text(request.args, "order") or ORDER_BY_CREATED_AT,
         include_voided=bool(query_bool(request.args, "include_voided")),
         limit=query_int(request.args, "limit", DEFAULT_LIMIT),
         offset=query_int(request.args, "offset", 0),
@@ -227,7 +236,11 @@ def update_invoice(invoice_id: int) -> tuple[Response, int]:
 
 @invoices_bp.delete("/invoices/<int:invoice_id>")
 def void_invoice(invoice_id: int) -> tuple[Response, int]:
-    """作废单据；已入账行的 ID 必须与当前状态完全一致。"""
+    """作废单据；已入账行的 ID 必须与当前状态完全一致。
+
+    批次来的单据连它在整理页上的那几页内容一起删（第 17 节 ④），所以删完之后
+    那张卡片不会再出现在整理页上。原件字节不删——同一份文件的其它页可能还在。
+    """
     confirmed_line_ids = None
     if request.data:
         payload = json_object(request)

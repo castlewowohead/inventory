@@ -73,6 +73,8 @@ def test_no_open_batch_is_a_404_not_an_empty_object(
     assert missing.status_code == 404
 
     batch_id = new_batch(migrated_client)
+    assert migrated_client.get(f"{INTAKE}/current").status_code == 404
+    upload(migrated_client, batch_id, "resume.pdf", pdf_bytes(1))
     found = migrated_client.get(f"{INTAKE}/current")
     assert found.status_code == 200
     assert found.get_json()["id"] == batch_id
@@ -136,6 +138,28 @@ def test_the_status_has_no_fake_percentage(migrated_client: FlaskClient) -> None
     rendered = repr(batch)
     for forbidden in ("percent", "progress", "eta"):
         assert forbidden not in rendered
+
+
+def test_delete_one_unreviewed_page_and_reupload_after_last_page(migrated_client: FlaskClient) -> None:
+    batch_id = new_batch(migrated_client)
+    content = pdf_bytes(2)
+    assert upload(migrated_client, batch_id, "two.pdf", content).status_code == 201
+    items = migrated_client.get(f"{INTAKE}/{batch_id}/items").get_json()["items"]
+    first, second = items
+    url = f"{INTAKE}/{batch_id}/items/{first['id']}"
+
+    assert migrated_client.delete(url, json={"version": first["version"] + 1}).status_code == 409
+    assert migrated_client.delete(url, json={"version": first["version"]}).status_code == 200
+    remaining = migrated_client.get(f"{INTAKE}/{batch_id}/items").get_json()
+    assert [item["id"] for item in remaining["items"]] == [second["id"]]
+    assert migrated_client.get(f"{INTAKE}/{batch_id}").get_json()["files"][0]["item_count"] == 1
+    assert upload(migrated_client, batch_id, "same.pdf", content).status_code == 409
+
+    assert migrated_client.delete(
+        f"{INTAKE}/{batch_id}/items/{second['id']}", json={"version": second["version"]}
+    ).status_code == 200
+    assert migrated_client.get(f"{INTAKE}/{batch_id}/items").get_json()["total"] == 0
+    assert upload(migrated_client, batch_id, "again.pdf", content).status_code == 201
 
 
 def test_one_file_per_request(migrated_client: FlaskClient) -> None:
@@ -275,13 +299,18 @@ def test_process_rejects_unknown_fields(migrated_client: FlaskClient) -> None:
     ).status_code == 400
 
 
-# --- 撤掉文件 ---------------------------------------------------------------
+# --- 移除文件 ---------------------------------------------------------------
 
 
-def test_discarding_a_file_says_whether_the_bytes_are_still_referenced(
+def test_removing_a_file_says_whether_the_bytes_are_still_referenced(
     migrated_client: FlaskClient,
 ) -> None:
-    """撤掉文件不等于能删盘上的字节——别的批次可能还在用同一份。"""
+    """移除文件不等于能删盘上的字节——别的批次可能还在用同一份。
+
+    第 16 节：这个批次里的记录是**真删**（引用、页、分类、撤销日志一起走），
+    但 `intake_files` 那行字节与磁盘上的原件不动，`bytes_still_referenced`
+    回答「现在还有没有人用它」。
+    """
     content = pdf_bytes(2)
     first_batch = new_batch(migrated_client)
     second_batch = new_batch(migrated_client)
@@ -294,13 +323,18 @@ def test_discarding_a_file_says_whether_the_bytes_are_still_referenced(
 
     assert response.status_code == 200
     body = response.get_json()
-    assert body["file"]["status"] == "discarded"
+    assert body["file"]["original_name"] == "x.pdf"  # 删掉之前那条引用的样子
+    assert body["removed_item_count"] == 2
     assert body["bytes_still_referenced"] is True
-    # 撤掉之后这个批次的卡片里不再有它的页。
+    # 移除之后这个批次的卡片里不再有它的页，别的批次一页不少。
     assert migrated_client.get(f"{INTAKE}/{first_batch}/items").get_json()["total"] == 0
     assert migrated_client.get(f"{INTAKE}/{second_batch}/items").get_json()["total"] == 2
     batch = migrated_client.get(f"{INTAKE}/{first_batch}").get_json()
     assert batch["files"] == []
+    # 同一份文件再传回来：全新的一份，照常切出两页。
+    again = upload(migrated_client, first_batch, "x.pdf", content)
+    assert again.status_code == 201, again.get_json()
+    assert migrated_client.get(f"{INTAKE}/{first_batch}/items").get_json()["total"] == 2
 
 
 # --- 路径里的归属 -----------------------------------------------------------

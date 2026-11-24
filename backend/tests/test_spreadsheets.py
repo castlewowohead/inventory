@@ -293,7 +293,7 @@ def test_invalid_options_fail_as_400(migrated_client, options):
 
 
 @pytest.mark.parametrize("extension", ["csv", "xlsx"])
-def test_export_contains_current_confirmed_details_filters_and_source_links(
+def test_export_contains_only_selected_completed_invoice_details(
     migrated_client, spreadsheets, invoice_service, purchase_service, food_item, extension
 ):
     view = spreadsheets.create(upload(csv_bytes([ROW, ROW])), {})
@@ -302,7 +302,18 @@ def test_export_contains_current_confirmed_details_filters_and_source_links(
     purchase_service.update_purchase(purchase_id, unit_price="7.00", line_amount="14.00")
     purchase_service.create_purchase(line_kind="adjustment", quantity="1", purchase_unit="each",
                                      unit_price="-2", line_amount="-2", source_name="Costco")
-    response = migrated_client.get(f"/api/purchases/export?format={extension}&source=costco")
+    payload = {"format": extension, "invoice_ids": [view.id]}
+    assert migrated_client.post("/api/invoices/export", json=payload).status_code == 409
+    invoice_service.update_line(view.id, view.lines[1].id, status="skipped", skip_reason="不是采购行")
+    invoice_service.update_invoice(view.id, invoice_date="2026-10-01")
+    invoice_service.complete_invoice(view.id)
+    other_row = ROW.copy()
+    other_row[0] = "另一张单据"
+    other = spreadsheets.create(upload(csv_bytes([other_row]), "other.csv"), {})
+    invoice_service.confirm_lines(other.id, options=[ConfirmOption(other.lines[0].id, food_item_id=food_item.id)])
+    invoice_service.update_invoice(other.id, invoice_date="2026-10-01")
+    invoice_service.complete_invoice(other.id)
+    response = migrated_client.post("/api/invoices/export", json=payload)
     assert response.status_code == 200
     assert "attachment" in response.headers["Content-Disposition"]
     if extension == "csv":
@@ -312,32 +323,45 @@ def test_export_contains_current_confirmed_details_filters_and_source_links(
         values = list(book.active.values)
         rows = [dict(zip(values[0], row)) for row in values[1:]]
         book.close()
-    assert len(rows) == 1  # Pending and adjustment rows are excluded by default.
+    assert len(rows) == 1  # Other invoice, skipped row, and adjustment are excluded.
     assert rows[0]["line_amount"] == "14.00"
     assert rows[0]["revision_count"] == "1"
     assert rows[0]["invoice_id"] == str(view.id)
     assert rows[0]["entry_source"] == "import"
-    all_rows = migrated_client.get("/api/purchases/export?format=csv&kind=all")
-    assert len(list(csv.DictReader(io.StringIO(all_rows.data.decode("utf-8-sig"))))) == 2
+    both = migrated_client.post("/api/invoices/export", json={"format": "csv", "invoice_ids": [view.id, other.id]})
+    assert len(list(csv.DictReader(io.StringIO(both.data.decode("utf-8-sig"))))) == 2
     purchase_service.void_purchase(purchase_id)
-    assert len(list(csv.DictReader(io.StringIO(migrated_client.get("/api/purchases/export?format=csv").data.decode("utf-8-sig"))))) == 0
-    assert len(list(csv.DictReader(io.StringIO(migrated_client.get("/api/purchases/export?format=csv&include_voided=true").data.decode("utf-8-sig"))))) == 1
+    after_void = migrated_client.post("/api/invoices/export", json={"format": "csv", "invoice_ids": [view.id]})
+    assert len(list(csv.DictReader(io.StringIO(after_void.data.decode("utf-8-sig"))))) == 0
+    invoice_service.reopen_invoice(view.id)
+    assert migrated_client.post("/api/invoices/export", json=payload).status_code == 409
 
 
-def test_export_is_all_pages_and_escapes_formula_text(migrated_client, purchase_service, food_item):
-    for _ in range(105):
-        purchase_service.create_purchase(food_item_id=food_item.id, quantity="1", purchase_unit="lb",
-                                         unit_price="0.07", line_amount="0.07", original_description="=HYPERLINK(1)")
-    response = migrated_client.get("/api/purchases/export?format=csv")
+def test_selected_export_escapes_formula_text_and_requires_selection(
+    migrated_client, spreadsheets, invoice_service, food_item
+):
+    formula_row = ROW.copy()
+    formula_row[0] = "=HYPERLINK(1)"
+    view = spreadsheets.create(upload(csv_bytes([formula_row] * 25)), {})
+    outcome = invoice_service.confirm_lines(view.id, options=[
+        ConfirmOption(line.id, food_item_id=food_item.id) for line in view.lines
+    ])
+    assert outcome.confirmed_count == 25
+    invoice_service.update_invoice(view.id, invoice_date="2026-10-01")
+    invoice_service.complete_invoice(view.id)
+    response = migrated_client.post("/api/invoices/export", json={"format": "csv", "invoice_ids": [view.id]})
     rows = list(csv.DictReader(io.StringIO(response.data.decode("utf-8-sig"))))
-    assert len(rows) == 105
+    assert len(rows) == 25
     assert rows[0]["original_description"] == "'=HYPERLINK(1)"
-    response = migrated_client.get("/api/purchases/export?format=xlsx")
+    response = migrated_client.post("/api/invoices/export", json={"format": "xlsx", "invoice_ids": [view.id]})
     book = load_workbook(io.BytesIO(response.data))
     assert book.active["I2"].data_type == "s"
     assert book.active["I2"].value == "=HYPERLINK(1)"
     book.close()
-    assert migrated_client.get("/api/purchases/export?limit=20").status_code == 400
+    assert migrated_client.post("/api/invoices/export", json={"format": "csv", "invoice_ids": []}).status_code == 400
+    assert migrated_client.post("/api/invoices/export", json={"format": "csv", "invoice_ids": [view.id, view.id]}).status_code == 400
+    assert migrated_client.post("/api/invoices/export", json={"format": "csv", "invoice_ids": [view.id, 999999]}).status_code == 409
+    assert migrated_client.get("/api/purchases/export").status_code == 404
 
 
 @pytest.mark.parametrize("extension", ["csv", "xlsx"])

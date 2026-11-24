@@ -6,6 +6,7 @@ export interface RequestOptions {
   method?: Method
   data?: Record<string, unknown>
   headers?: Record<string, string>
+  timeout?: number
 }
 
 /** Same-origin paths are proxied by Vite during H5 development. */
@@ -17,6 +18,7 @@ export function apiRequest<T>(path: `/${string}`, options: RequestOptions = {}):
       method: (options.method ?? 'GET') as UniApp.RequestOptions['method'],
       data: options.data,
       header: options.headers,
+      timeout: options.timeout,
       success: (response) => {
         if (response.statusCode >= 200 && response.statusCode < 300) {
           resolve(response.data as T)
@@ -66,16 +68,19 @@ function decodeErrorBody(bytes: ArrayBuffer): unknown {
 }
 
 /**
- * GET raw bytes (original files, field crops).
+ * Request raw bytes (original files, field crops, selected-invoice exports).
  *
  * Response headers are handed back because the crop endpoint puts its evidence
  * there: `X-Field`, `X-Page`, `X-Model-Values` and `X-Agreement`.
  */
-export function apiRequestBinary(path: `/${string}`): Promise<BinaryResponse> {
+export function apiRequestBinary(path: `/${string}`, options: RequestOptions = {}): Promise<BinaryResponse> {
   return new Promise<BinaryResponse>((resolve, reject) => {
     uni.request({
       url: path,
-      method: 'GET',
+      method: (options.method ?? 'GET') as UniApp.RequestOptions['method'],
+      data: options.data,
+      header: options.headers,
+      timeout: options.timeout,
       responseType: 'arraybuffer',
       success: (response) => {
         const headers = lowerCaseHeaders(response.header)

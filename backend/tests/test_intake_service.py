@@ -298,26 +298,38 @@ def test_the_same_file_twice_in_one_batch_is_rejected(
     assert "batch_file_id" in error.value.details
 
 
-def test_discarded_file_comes_back_with_its_items_when_re_registered(
+def test_a_removed_file_comes_back_as_a_brand_new_one(
     intake_service: IntakeService,
 ) -> None:
-    """撤掉文件是可以反悔的：再传一次同一份文件，页与已有分类原样回来。"""
+    """移除就当没传过：同一份字节再传一次是**全新的一份**（第 16 节）。
+
+    2026-11-24 之前这里是「可反悔」——撤掉只是软删，重传会连同已有分类一起复活。
+    用户的决定是反过来：一份传错的文件留着一份看不见的旧分类，下次传回来时会无声
+    地带着它，那比丢掉分类更难查。
+    """
     batch = intake_service.create_batch()
     registered = register(intake_service, batch.id, "oops-removed")
     (item,) = intake_service.record_items(registered.ref.id, pages=[1])
     intake_service.classify_item(item.id, purchase_date=date(2026, 11, 8))
 
-    discarded = intake_service.discard_file(registered.ref.id)
-    assert discarded.ref.status == INTAKE_FILE_STATUS_DISCARDED
-    assert discarded.bytes_still_referenced is False
+    removed = intake_service.discard_file(registered.ref.id)
+    assert removed.ref.id == registered.ref.id  # 删掉之前那条引用的样子
+    assert removed.removed_item_count == 1
+    assert removed.bytes_still_referenced is False
     assert intake_service.list_items(batch.id).total == 0
+    with pytest.raises(NotFoundError):
+        intake_service.get_item(item.id)
 
     again = register(intake_service, batch.id, "oops-removed")
 
-    assert again.ref.id == registered.ref.id
-    assert again.ref.status == INTAKE_FILE_STATUS_READY
-    page = intake_service.get_item(item.id)
-    assert page.decided_purchase_date == date(2026, 11, 8)
+    # ⚠️ 行是真删的，SQLite 可能把同一个 id 发给下一条记录——所以证据是**内容**：
+    # 状态回到还没切页、没有任何内容、切出来的页一个分类都不带。
+    assert again.ref.status == INTAKE_FILE_STATUS_PENDING
+    assert again.ref.item_count is None
+    assert again.reused_bytes is True  # 字节没重复存一份，但记录是全新的
+    assert intake_service.list_items(batch.id).total == 0
+    (fresh,) = intake_service.record_items(again.ref.id, pages=[1])
+    assert fresh.decided_purchase_date is None and fresh.decided_at is None
 
 
 def test_discarding_one_batch_does_not_free_bytes_another_batch_uses(
@@ -578,7 +590,11 @@ def test_a_failed_file_can_be_retried(intake_service: IntakeService) -> None:
 def test_items_of_a_discarded_file_leave_the_working_queue(
     intake_service: IntakeService,
 ) -> None:
-    """回收的文件不再出现在整理页上，但行留着（可查、可复活）。"""
+    """移除的文件连同它的内容一起从库里消失（第 16 节）。
+
+    ⚠️ `include_discarded=True` 也看不到了：它只对 2026-11-24 之前标成 `discarded`
+    的旧行还有意义，新的移除不再留那种行。
+    """
     batch = intake_service.create_batch()
     registered = register(intake_service, batch.id, "recycled")
     items = intake_service.record_items(registered.ref.id, pages=[1, 2])
@@ -588,18 +604,19 @@ def test_items_of_a_discarded_file_leave_the_working_queue(
 
     assert intake_service.list_items(batch.id).total == 0
     assert intake_service.list_groups(batch.id) == ()
-    assert intake_service.list_items(batch.id, include_discarded=True).total == 2
+    assert intake_service.list_items(batch.id, include_discarded=True).total == 0
 
 
-def test_a_discarded_file_cannot_be_reclassified(
+def test_a_removed_files_content_cannot_be_reclassified(
     intake_service: IntakeService,
 ) -> None:
+    """移除之后那几页根本不存在了，所以是 404 而不是「这个文件被撤掉了」。"""
     batch = intake_service.create_batch()
     registered = register(intake_service, batch.id, "no-more-moves")
     (item,) = intake_service.record_items(registered.ref.id, pages=[1])
     intake_service.discard_file(registered.ref.id)
 
-    with pytest.raises(ConflictError):
+    with pytest.raises(NotFoundError):
         intake_service.classify_item(item.id, purchase_date=date(2026, 11, 8))
 
 
@@ -695,6 +712,65 @@ def test_candidates_never_become_decisions(intake_service: IntakeService) -> Non
     # 候选不进分组：这个内容仍然在「待归类」那一组里。
     (group,) = intake_service.list_groups(batch.id)
     assert (group.purchase_date, group.source_name, group.item_count) == (None, None, 1)
+
+
+def test_an_old_pair_of_day_month_readings_shows_as_one_chip(
+    intake_service: IntakeService,
+) -> None:
+    """2026-11-24 之前存下来的那一对读法，卡片上只摆**一条**（第 15 节 ②）。
+
+    那天之前 `6/3/2026` 会存成 mdy、dmy 两条候选等人挑；现在默认按月/日/年读，
+    新识别的只有一条。老记录不会自己变，所以读出来的时候把那一对收成一条——否则
+    同一条规则下的两张卡片长得不一样，老的那张还在问「这是几月」。
+
+    ⚠️ 收的是**显示**：候选记录一条没删，另一种读法仍留在库里和 payload 里。
+    """
+    batch = intake_service.create_batch()
+    registered = register(intake_service, batch.id, "legacy-readings")
+    (item,) = intake_service.record_items(registered.ref.id, pages=[1])
+
+    updated = intake_service.replace_candidates(
+        item.id,
+        field=INTAKE_CANDIDATE_FIELD_PURCHASE_DATE,
+        basis=INTAKE_CANDIDATE_BASIS_PAPER,
+        candidates=[
+            CandidateInput(value="2026-06-03", evidence={
+                "raw_text": "6/3/2026", "reading": "mdy", "ambiguous": True}),
+            CandidateInput(value="2026-03-06", evidence={
+                "raw_text": "6/3/2026", "reading": "dmy", "ambiguous": True}),
+        ],
+    )
+
+    assert [candidate.value for candidate in updated.candidates] == ["2026-06-03"]
+    # 另一条还在库里：这不是删除，是显示上的收口。
+    with intake_service._database.unit_of_work() as session:
+        stored = session.get(IntakeItem, item.id)
+        assert sorted(row.value for row in stored.candidates) == [
+            "2026-03-06", "2026-06-03"]
+
+
+def test_two_readings_of_different_texts_are_both_kept(
+    intake_service: IntakeService,
+) -> None:
+    """⚠️ 收的只是**同一段原文**的那一对。两段不同的原文各说各的，一条都不动。"""
+    batch = intake_service.create_batch()
+    registered = register(intake_service, batch.id, "two-texts")
+    (item,) = intake_service.record_items(registered.ref.id, pages=[1])
+
+    updated = intake_service.replace_candidates(
+        item.id,
+        field=INTAKE_CANDIDATE_FIELD_PURCHASE_DATE,
+        basis=INTAKE_CANDIDATE_BASIS_PAPER,
+        candidates=[
+            CandidateInput(value="2026-06-03", evidence={
+                "raw_text": "6/3/2026", "reading": "mdy"}),
+            CandidateInput(value="2026-06-18", evidence={
+                "raw_text": "6/18/2026", "reading": "strict"}),
+        ],
+    )
+
+    assert sorted(candidate.value for candidate in updated.candidates) == [
+        "2026-06-03", "2026-06-18"]
 
 
 def test_two_bases_can_disagree_and_both_stay_visible(
@@ -826,13 +902,19 @@ def test_latest_open_batch_restores_the_one_in_progress(
     assert intake_service.latest_open_batch() is None
 
     first = intake_service.create_batch()
+    assert intake_service.latest_open_batch() is None
+    first_file = register(intake_service, first.id, "resume-first")
     assert intake_service.latest_open_batch().id == first.id
 
     second = intake_service.create_batch()
+    assert intake_service.latest_open_batch().id == first.id
+    register(intake_service, second.id, "resume-second")
     assert intake_service.latest_open_batch().id == second.id
 
     intake_service.discard_batch(second.id)
     assert intake_service.latest_open_batch().id == first.id
+    intake_service.discard_file(first_file.ref.id)
+    assert intake_service.latest_open_batch() is None
 
 
 def test_a_discarded_batch_refuses_further_changes(

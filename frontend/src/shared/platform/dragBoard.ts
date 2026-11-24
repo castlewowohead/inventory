@@ -59,6 +59,7 @@ export interface BoardDragOptions {
 
 /** Px the pointer must travel before a press becomes a drag. */
 const MOVE_THRESHOLD = 6
+const SCROLL_EDGE = 72
 
 let active: (() => void) | null = null
 
@@ -91,7 +92,38 @@ export function startBoardDrag(options: BoardDragOptions): boolean {
   const startY = origin.clientY
   let started = false
   let lastTarget: string | null = null
+  let lastPosition: DragPosition | null = null
+  let scrollFrame = 0
   const previousUserSelect = document.body.style.userSelect
+
+  function scrollAtEdge() {
+    scrollFrame = 0
+    if (!started || !lastPosition) return
+    const { x, y } = lastPosition
+    const hit = document.elementFromPoint(x, y)
+    let scroller: Element | null = hit
+    while (scroller && scroller !== document.body) {
+      const style = window.getComputedStyle(scroller)
+      if (/(auto|scroll)/.test(style.overflowY) && scroller.scrollHeight > scroller.clientHeight + 1) break
+      scroller = scroller.parentElement
+    }
+    if (!scroller || scroller === document.body) scroller = document.scrollingElement
+    if (scroller) {
+      const page = scroller === document.scrollingElement
+      const rect = page ? { top: 0, bottom: window.innerHeight } : scroller.getBoundingClientRect()
+      const topDistance = y - rect.top
+      const bottomDistance = rect.bottom - y
+      const direction = topDistance < SCROLL_EDGE ? -1 : bottomDistance < SCROLL_EDGE ? 1 : 0
+      if (direction) {
+        const distance = direction < 0 ? topDistance : bottomDistance
+        const speed = Math.max(4, Math.round((SCROLL_EDGE - Math.max(0, distance)) / 4))
+        scroller.scrollTop += direction * speed
+        lastTarget = targetAt(x, y)
+        options.onMove?.({ x, y }, lastTarget)
+      }
+    }
+    scrollFrame = window.requestAnimationFrame(scrollAtEdge)
+  }
 
   function finish(targetKey: string | null) {
     stop()
@@ -111,8 +143,10 @@ export function startBoardDrag(options: BoardDragOptions): boolean {
     // (text selection, or a scroll the grip's `touch-action` did not rule out)
     // worth taking over.
     event.preventDefault()
+    lastPosition = { x: event.clientX, y: event.clientY }
     lastTarget = targetAt(event.clientX, event.clientY)
     options.onMove?.({ x: event.clientX, y: event.clientY }, lastTarget)
+    if (!scrollFrame) scrollFrame = window.requestAnimationFrame(scrollAtEdge)
   }
 
   function onPointerUp(event: PointerEvent) {
@@ -132,6 +166,8 @@ export function startBoardDrag(options: BoardDragOptions): boolean {
   function stop() {
     if (active !== stop) return
     active = null
+    if (scrollFrame) window.cancelAnimationFrame(scrollFrame)
+    scrollFrame = 0
     document.body.style.userSelect = previousUserSelect
     window.removeEventListener('pointermove', onPointerMove)
     window.removeEventListener('pointerup', onPointerUp)

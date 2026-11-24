@@ -6,6 +6,10 @@ export interface IntakeBatchFile {
   original_name: string
   status: 'pending' | 'ready' | 'failed' | 'discarded'
   item_count: number | null
+  /** How many of this file's pages are already in a draft — blocks removing it. */
+  handed_off_item_count: number
+  /** When this file entered the batch. Two files can share a name; this tells them apart. */
+  created_at: string
   size: number
   sheet_name: string | null
   error: { code: string; message: string } | null
@@ -15,6 +19,16 @@ export interface IntakeBatch {
   id: number
   status: 'open' | 'closed' | 'discarded'
   files: IntakeBatchFile[]
+  /** How many classifiable contents this batch holds right now. */
+  item_count: number
+  /**
+   * How many of them are not in a completed invoice yet (plan section 22).
+   *
+   * The board only loads the groups that are open, so counting the cards on
+   * screen would miss whatever sits inside a collapsed one — the same reason
+   * 「重试识别失败项」 asks the server (section 18 ①).
+   */
+  unfinished_item_count: number
   created_at: string
   updated_at: string
 }
@@ -41,6 +55,8 @@ export interface IntakeRecognition {
   is_fake: boolean | null
   date_raw_text: string | null
   date_ambiguous: boolean
+  /** Set when the day/month order was settled by the project default, not by the paper. */
+  date_assumed_order: string | null
   date_problem: string | null
   date_readings: { value: string; order: string | null; note: string | null }[]
   date_order: string | null
@@ -71,6 +87,14 @@ export interface IntakeItem {
    * changed through the review's classification revision instead.
    */
   handed_off_at: string | null
+  /**
+   * The draft this content is being filled in, while `handed_off_at` is set.
+   * Without it the organizer has no way back into the fill page once the user
+   * leaves it (`docs/multifiles.md` 第 11 节 ④).
+   */
+  review_invoice_id: number | null
+  /** Where that draft stands: still being filled, booked, or discarded. */
+  review_status: 'draft' | 'completed' | 'voided' | null
   pile_excluded: boolean
   /** Parsed spreadsheet cells; decimal fields remain strings from the server. */
   row_values: Record<string, string | null> | null
@@ -79,15 +103,15 @@ export interface IntakeItem {
 }
 
 /**
- * A derived (date, supplier) group. The server has no group table: these rows
- * are `GROUP BY` over the human decisions, so a row with neither value is the
- * unclassified bucket and `source_name: null` under a date is 商家待定.
+ * A derived (date, supplier) content group. Empty date headers are persisted
+ * separately, so a date remains visible after its last content moves away.
  */
 export interface IntakeGroup {
   purchase_date: string | null
   source_name: string | null
   source_name_normalized: string | null
   item_count: number
+  suggested_count: number
 }
 
 export interface IntakeGroupPage {

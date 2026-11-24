@@ -18,8 +18,8 @@
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import {
   addInvoiceLine, ApiError, completeInvoice, deleteInvoiceFile, errorMessage, getInvoice,
-  getInvoiceFileContent,
-  getIntakeItemOriginal,
+  getInvoiceFileContent, getInvoices,
+  getIntakeItemOriginal, reassignIntakeReviewContents,
   startExtraction, voidInvoice,
   type ExtractionJob, type Invoice, type InvoiceLine
 } from '../../shared/api'
@@ -36,7 +36,17 @@ import LineTable from './LineTable.vue'
 import OriginalDocumentViewer from './OriginalDocumentViewer.vue'
 
 const props = defineProps<{ invoiceId: number | null }>()
-const emit = defineEmits<{ back: []; saved: []; completed: []; openExisting: [id: number] }>()
+const emit = defineEmits<{ back: [batchId: number | null]; saved: []; completed: [batchId: number | null]; openExisting: [id: number] }>()
+/**
+ * 这张单据的那几页来自哪一批；手工上传的单据没有出处，返回 null。
+ *
+ * 填完之后该回哪里，由**这张单据自己**说了算：只看「从哪进来的」那个内存状态，
+ * 刷新一下就丢了（第 22 节）。
+ */
+function sourceBatchId(item: Invoice | null): number | null {
+  return item?.intake_sources[0]?.batch_id ?? null
+}
+function returnFromInvoice() { emit('back', sourceBatchId(invoice.value)) }
 const invoice = ref<Invoice | null>(null)
 const state = ref<'loading' | 'ready' | 'error'>('loading')
 const failure = ref('')
@@ -72,7 +82,6 @@ const checkedOriginal = ref(false)
 const completing = ref(false)
 const closeoutError = ref('')
 const closeoutSnapshot = ref('')
-const moreOpen = ref(false)
 const actionBusy = ref(false)
 const actionError = ref('')
 const actionNote = ref('')
@@ -91,6 +100,22 @@ const extractionGate = computed<'loading' | 'busy' | 'failed' | 'error' | null>(
   // there are lines to review, show them with the failure card above the form.
   if (extractionActivity.value === 'failed' && !manualAfterFailure.value && invoice.value.lines.length === 0) return 'failed'
   return null
+})
+/**
+ * 「识别进度」这张卡什么时候不该出现（第 17 节 ③）。
+ *
+ * 批次来的单据没有自己的 `files`——原件挂在 `intake_sources` 上，识别在整理页就已经
+ * 做完了，这张单据上**永远不会有**识别任务。于是这张卡只会写一句「请先上传可识别
+ * 的单据文件。」，而用户面前明明摆着原件和识别出来的行。它占掉的是表格和原件的
+ * 位置，却一个问题也回答不了。
+ *
+ * ⚠️ 只有 `none`（既没有任务、也没有可识别的文件）才藏。真的有任务在跑、失败或
+ * 带着警告时照常显示——那几种状态要么需要等，要么需要人动手。
+ */
+const extractionSilent = computed(() => {
+  const item = invoice.value
+  return !!item && item.files.length === 0 && item.intake_sources.length > 0
+    && extractionActivity.value === 'none'
 })
 const waitingText = computed(() => extractionJobs.value.some((job) => job.status === 'running')
   ? '正在识别原件，完成后会显示完整的待核对行。'
@@ -294,6 +319,116 @@ async function filesStored() {
   emit('saved')
 }
 
+// --- 拆分 / 合并：填表期的单据边界修正 --------------------------------------
+//
+// 单据边界只认纸面单号，读不出单号就一页一张（docs/multifiles.md 第 12 节）。
+// 那条规则宁可多拆：合错了两张发票的金额会相加，而「各行之和对不上单据总额」
+// 这个检查正好因此失效；拆错了在这里一眼看得见，并回去就是。
+// 没有这个入口，一张读不出单号的两页发票就再也合不回一张。
+
+/** 选中的整理内容（`intake_sources` 的 `item_id`）。 */
+const selectedSources = ref<number[]>([])
+const mergeTargetId = ref<number | null>(null)
+const mergeCandidates = ref<Invoice[]>([])
+const boundaryBusy = ref(false)
+const boundaryError = ref('')
+const boundaryNote = ref('')
+
+const intakeBatchId = computed(() => invoice.value?.intake_sources[0]?.batch_id ?? null)
+/** 已经入账的行不能靠挪页改归属，那条路是撤销确认。 */
+const canReassign = computed(() => !!invoice.value && canManage.value
+  && invoice.value.intake_sources.length > 0
+  && invoice.value.reconciliation.confirmed_count === 0)
+const canSplit = computed(() => canReassign.value && selectedSources.value.length > 0
+  && selectedSources.value.length < (invoice.value?.intake_sources.length ?? 0))
+
+function toggleSource(itemId: number) {
+  selectedSources.value = selectedSources.value.includes(itemId)
+    ? selectedSources.value.filter((value) => value !== itemId)
+    : [...selectedSources.value, itemId]
+}
+
+function sourceEntries(itemIds: number[]) {
+  return (invoice.value?.intake_sources ?? [])
+    .filter((source) => itemIds.includes(source.item_id))
+    .map((source) => ({ id: source.item_id, version: source.version }))
+}
+
+/**
+ * 能并进去的其它草稿：同一批次、同一天、同一商家、还没入账过。
+ *
+ * 这四个条件是服务端自己的规则，先在界面上筛一遍，免得让人选中一个必然被拒的
+ * 目标。真正的判定仍在服务端，被拒的理由原样显示出来。
+ */
+async function loadMergeCandidates() {
+  const item = invoice.value
+  mergeCandidates.value = []
+  mergeTargetId.value = null
+  if (!item || !item.invoice_date || !item.source_name || intakeBatchId.value === null) return
+  const page = await getInvoices(`?completed=false&limit=50`
+    + `&date_from=${item.invoice_date}&date_to=${item.invoice_date}`
+    + `&source=${encodeURIComponent(item.source_name)}`)
+  mergeCandidates.value = page.items.filter((row) => row.id !== item.id
+    && row.entry_source === item.entry_source
+    && row.reconciliation.confirmed_count === 0
+    && row.intake_sources.some((source) => source.batch_id === intakeBatchId.value))
+}
+
+async function runReassign(itemIds: number[], targetInvoiceId?: number) {
+  const item = invoice.value
+  if (!item || intakeBatchId.value === null || boundaryBusy.value) return
+  boundaryBusy.value = true
+  boundaryError.value = ''
+  boundaryNote.value = ''
+  try {
+    const result = await reassignIntakeReviewContents(
+      intakeBatchId.value, item.id, sourceEntries(itemIds), targetInvoiceId
+    )
+    selectedSources.value = []
+    if (result.source_invoice_id === item.id && itemIds.length === item.intake_sources.length) {
+      // 整张并走之后这张草稿已经作废，留在这里只会显示一张空单据。
+      emit('saved')
+      emit('openExisting', result.target_invoice_id)
+      return
+    }
+    boundaryNote.value = result.created
+      ? `已拆出单据 #${result.target_invoice_id}。两张的单据总额都已清空，请各自照纸面填。`
+      : `已并入单据 #${result.target_invoice_id}。单据总额已清空，请照纸面填。`
+    emit('saved')
+    await refreshQuiet()
+    await loadMergeCandidates()
+  } catch (error) {
+    boundaryError.value = errorMessage(error)
+  } finally {
+    boundaryBusy.value = false
+  }
+}
+
+/** 展开原件清单时才去查可并入的草稿：收着的时候没人需要这份名单。 */
+function toggleFiles() {
+  filesOpen.value = !filesOpen.value
+  boundaryError.value = ''
+  boundaryNote.value = ''
+  selectedSources.value = []
+  if (filesOpen.value && canReassign.value) void loadMergeCandidates()
+}
+
+async function splitSelected() {
+  if (!canSplit.value) return
+  if (!await confirmAction('拆成另一张单据',
+    '选中的页会变成一张新的草稿。两张的单据总额都会清空，需要各自照纸面重新填。')) return
+  await runReassign(selectedSources.value)
+}
+
+async function mergeIntoTarget() {
+  const item = invoice.value
+  if (!item || mergeTargetId.value === null) return
+  if (!await confirmAction('并入另一张单据',
+    `这张草稿的 ${item.intake_sources.length} 页会全部并入单据 #${mergeTargetId.value}，`
+    + '本草稿随即作废。单据总额会清空，需要照纸面重新填。')) return
+  await runReassign(item.intake_sources.map((source) => source.item_id), mergeTargetId.value)
+}
+
 function confirmAction(title: string, content: string): Promise<boolean> {
   return new Promise((resolve) => uni.showModal({
     title, content, confirmText: '继续', cancelText: '取消',
@@ -379,29 +514,45 @@ async function removeFile(fileId: number, name: string) {
   }
 }
 
+/**
+ * 删除本张单据：清空数据，并把它从整理页上彻底移除（第 17 节 ④）。
+ *
+ * ⚠️ 问的那句话照用户 2026-11-24 的原话写。批次来的单据，服务端连它在整理页上的
+ * 那几页内容一起真删——所以这里说得出「整理页上也不会再有它」，而不是让用户回到
+ * 整理页才发现几张「草稿已作废」的卡片还杵在那里。删完就**离开这一页**：单据没
+ * 了，留在它的详情页上只能看到一个空壳。
+ */
 async function cancelInvoice() {
   if (!await prepareAction() || !invoice.value) return
   const id = invoice.value.id
-  if (!await confirmAction('删除整张单据', '这张单据和它的原件都会删掉，同一个文件之后可以重新上传。')) return
+  const batchId = sourceBatchId(invoice.value)
+  const onBoard = invoice.value.intake_sources.length
+  if (!await confirmAction('删除本张单据', onBoard
+    ? `是否清空数据，并彻底移除本张单据？这张单据填过的内容会清空，它在整理页上的 ${onBoard} 项内容也会一并移除；重新上传同一份文件会当作全新的一份。`
+    : '是否清空数据，并彻底移除本张单据？这张单据和它的原件都会删掉，同一个文件之后可以重新上传。')) return
   const bookedIds = invoice.value.lines.filter((line) => line.status === 'confirmed').map((line) => line.id)
   if (bookedIds.length && !await confirmAction(
     '确认移除已入账数据',
     `这张单据有 ${bookedIds.length} 行已经入账。确认删除后，这些采购记录会作废，不再计入价格统计；原件也会删除。是否确认移除？`
   )) return
   actionBusy.value = true
+  let removed = false
   try {
     const result = await voidInvoice(id, bookedIds.length ? bookedIds : undefined)
     invoice.value = result.invoice
     if (result.status !== 'voided') throw new Error('暂时无法确认删除结果，请重新读取单据。')
-    moreOpen.value = false
     actionNote.value = '单据已删除。'
+    removed = true
     emit('saved')
   } catch (error) {
     actionError.value = `${errorMessage(error)} 请根据最新状态处理后再试。`
   } finally {
-    await syncAfterAction()
+    // 删成功就别再去读它了：那几页内容已经不在整理页上，详情也只剩一个空壳。
+    if (!removed) await syncAfterAction()
     actionBusy.value = false
   }
+  // 回到来的地方（整理页或单据库）。
+  if (removed) emit('back', batchId)
 }
 
 function locatePending(item: Invoice, numbers?: unknown) {
@@ -436,7 +587,7 @@ async function openCloseout() {
     const item = await getInvoice(invoice.value.id)
     invoice.value = item
     keepSelection(item)
-    if (item.status === 'completed') { emit('completed'); return }
+    if (item.status === 'completed') { emit('completed', sourceBatchId(item)); return }
     if (!canComplete.value) {
       locatePending(item)
       closeoutError.value = item.reconciliation.pending_count > 0
@@ -457,7 +608,7 @@ async function finishInvoice() {
   try {
     const latest = await getInvoice(invoice.value.id)
     invoice.value = latest
-    if (latest.status === 'completed') { emit('completed'); return }
+    if (latest.status === 'completed') { emit('completed', sourceBatchId(latest)); return }
     if (!canComplete.value) {
       closeoutOpen.value = false
       checkedOriginal.value = false
@@ -476,7 +627,7 @@ async function finishInvoice() {
     if (outcome.status !== 'completed' || outcome.invoice.status !== 'completed') {
       throw new Error('暂时无法确认单据是否完成，请重新读取单据。')
     }
-    emit('completed')
+    emit('completed', sourceBatchId(outcome.invoice))
   } catch (error) {
     closeoutError.value = errorMessage(error)
     if (error instanceof ApiError && error.status === 409) {
@@ -496,7 +647,7 @@ async function finishInvoice() {
       try {
         const latest = await getInvoice(invoice.value.id)
         invoice.value = latest
-        if (latest.status === 'completed') emit('completed')
+        if (latest.status === 'completed') emit('completed', sourceBatchId(latest))
       } catch { closeoutError.value += ' 请重新读取详情确认是否已完成。' }
     }
   } finally { completing.value = false }
@@ -534,7 +685,6 @@ watch(() => props.invoiceId, () => {
   diagnosticsOpen.value = false
   checkedOriginal.value = false
   closeoutError.value = ''
-  moreOpen.value = false
   actionError.value = ''
   actionNote.value = ''
   void load()
@@ -542,23 +692,15 @@ watch(() => props.invoiceId, () => {
 </script>
 
 <template>
-  <CompletedInvoiceView v-if="invoice && state === 'ready' && invoice.status === 'completed'" :invoice="invoice" @back="emit('back')" @open-existing="emit('openExisting', $event)" @currency-changed="applyStoredInvoice($event, false)" @reopened="applyStoredInvoice($event, false)" />
+  <CompletedInvoiceView v-if="invoice && state === 'ready' && invoice.status === 'completed'" :invoice="invoice" @back="returnFromInvoice" @open-existing="emit('openExisting', $event)" @currency-changed="applyStoredInvoice($event, false)" @reopened="applyStoredInvoice($event, false)" />
   <view v-else class="detail-layout" :class="{ narrow }">
     <view class="detail-heading">
-      <view class="heading-primary"><button class="back-link" @click="emit('back')">← 返回单据</button><text class="page-title">单据{{ invoice ? ` #${invoice.id}` : '' }}</text></view>
+      <view class="heading-primary"><button class="back-link" @click="returnFromInvoice">← {{ sourceBatchId(invoice) !== null ? '返回分类页面' : '返回单据' }}</button><text class="page-title">单据{{ invoice ? ` #${invoice.id}` : '' }}</text></view>
+      <!-- 右上角只有这一个动作（第 17 节 ④）。原来是一个「单据更多操作」菜单，
+           里面混着重新提取、识别记录和删除拍坏文件——那三样都是对着原件做的事，
+           已经搬到下面「原件文件」那一折里，这里不再留第二个入口。 -->
       <view v-if="invoice && canManage && !extractionGate" class="more-actions">
-        <button class="ui-button ghost" :aria-expanded="moreOpen" @click="moreOpen = !moreOpen">单据更多操作</button>
-        <view v-if="moreOpen" class="ui-card section more-menu">
-          <view class="form-actions">
-            <button v-if="invoice.entry_source !== 'import' && !invoice.intake_sources.length" class="ui-button secondary" :disabled="actionBusy" @click="retryExtraction">重新提取 / 失败重试</button>
-            <button v-if="invoice.entry_source !== 'import'" class="ui-button secondary" :aria-pressed="diagnosticsOpen" @click="diagnosticsOpen = !diagnosticsOpen">{{ diagnosticsOpen ? '收起识别记录' : '查看识别记录' }}</button>
-            <button class="ui-button ghost" :disabled="actionBusy" @click="cancelInvoice">删除整张单据</button>
-          </view>
-          <view v-if="invoice.files.length" class="file-delete-list">
-            <text class="muted">删除拍坏文件</text>
-            <button v-for="file in invoice.files" :key="file.id" class="ui-button ghost" :disabled="actionBusy" @click="removeFile(file.id, file.original_name)">删除第 {{ file.page_order }} 页 · {{ file.original_name }}</button>
-          </view>
-        </view>
+        <button class="ui-button ghost delete-invoice" :disabled="actionBusy" @click="cancelInvoice">删除本张单据</button>
       </view>
     </view>
     <view v-if="state === 'loading'" class="state-card" role="status" aria-live="polite">正在读取单据详情…</view>
@@ -572,7 +714,7 @@ watch(() => props.invoiceId, () => {
         :files="invoice.files"
         :is-fake="invoice.recognition.is_fake"
         :read-only="!canManage"
-        :hidden="extractionGate !== null || (extractionActivity === 'done' && !diagnosticsOpen)"
+        :hidden="extractionGate !== null || extractionSilent || (extractionActivity === 'done' && !diagnosticsOpen)"
         @finished="extractionFinished"
         @activity="extractionActivity = $event"
         @jobs="extractionJobs = $event"
@@ -589,7 +731,7 @@ watch(() => props.invoiceId, () => {
           <view v-if="waitingLong" class="wait-escape">
             <text>先去忙别的，识别完会留在待办里。</text>
             <view class="escape-actions">
-              <button class="ui-button secondary" @click="emit('back')">返回单据列表</button>
+              <button class="ui-button secondary" @click="returnFromInvoice">{{ sourceBatchId(invoice) !== null ? '返回分类页面' : '返回单据列表' }}</button>
               <button class="ui-button secondary" @click="originalOnly = true">只看原件</button>
               <button class="ui-button ghost" @click="extractionStatus?.refresh()">刷新识别状态</button>
             </view>
@@ -717,11 +859,19 @@ watch(() => props.invoiceId, () => {
                   <text v-for="(note, index) in invoice.reconciliation.notes" :key="index" class="category-note">{{ note.replace(/\*\*/g, '') }}</text>
                 </view>
                 <text v-if="reconciliationNote" class="warning-note" role="status">{{ reconciliationNote }}</text>
-                <label class="check-line" tabindex="0" role="checkbox" :aria-checked="checkedOriginal"
-                  @keydown.enter.prevent="checkedOriginal = !checkedOriginal"
-                  @keydown.space.prevent="checkedOriginal = !checkedOriginal">
-                  <checkbox :checked="checkedOriginal" @click="checkedOriginal = !checkedOriginal" /><text>我已检查原件有无漏行</text>
-                </label>
+                <!--
+                  ⚠️ 这一行曾经是 `<label>` 包着一个 `<checkbox>`，而那是个**哑火的勾**
+                  （2026-11-24 反馈，第 20 节 ①）：uni-app 的 `label` 在点击目标不是
+                  勾选框本身时，直接调勾选框组件内部的 `_onClick`，**不派发 DOM click**。
+                  于是点这行文字＝勾看上去打上了（组件自己的内部状态）、`checkedOriginal`
+                  仍是 false、「完成单据」继续灰着，而且没有任何解释。
+                  现在整行就是一个按钮，勾的样子由 `checkedOriginal` 一处决定，没有第二
+                  份状态可以和它打架。方框的尺寸沿用整理页那一个（第 13 节 ④）。
+                -->
+                <button class="check-line" role="checkbox" :aria-checked="checkedOriginal"
+                  @click="checkedOriginal = !checkedOriginal">
+                  <text class="check-box">{{ checkedOriginal ? '✓' : '' }}</text><text>我已检查原件有无漏行</text>
+                </button>
                 <view class="form-actions"><button class="ui-button" :disabled="!checkedOriginal || completing" @click="finishInvoice">{{ completing ? '正在完成…' : '完成单据' }}</button><button class="ui-button secondary" :disabled="completing" @click="closeoutOpen = false; checkedOriginal = false">取消</button></view>
               </view>
             </template>
@@ -730,7 +880,7 @@ watch(() => props.invoiceId, () => {
 
           <!-- 原件文件清单与补传：也折起来。原件本身在左边一直看得见。 -->
           <view class="ui-card section fold">
-            <button class="fold-toggle" :aria-expanded="filesOpen" @click="filesOpen = !filesOpen">
+            <button class="fold-toggle" :aria-expanded="filesOpen" @click="toggleFiles">
               {{ filesOpen ? '收起原件文件' : '原件文件' }}
               <text class="fold-summary">{{ invoice.files.length + invoice.intake_sources.length }} 个</text>
             </button>
@@ -744,13 +894,57 @@ watch(() => props.invoiceId, () => {
               </view>
               <view v-if="invoice.intake_sources.length" class="rows">
                 <view v-for="source in invoice.intake_sources" :key="source.item_id" class="row">
-                  <text>{{ source.original_name }} · {{ source.kind === 'page' ? `第 ${source.page_no} 页` : `第 ${source.row_no} 行` }}</text>
+                  <button v-if="canReassign" class="source-pick"
+                    :aria-pressed="selectedSources.includes(source.item_id) ? 'true' : 'false'"
+                    :aria-label="`${selectedSources.includes(source.item_id) ? '取消选中' : '选中'} ${source.original_name} ${source.kind === 'page' ? `第 ${source.page_no} 页` : `第 ${source.row_no} 行`}`"
+                    @click="toggleSource(source.item_id)">
+                    <text class="tick">{{ selectedSources.includes(source.item_id) ? '✓' : '' }}</text>
+                    <text>{{ source.original_name }} · {{ source.kind === 'page' ? `第 ${source.page_no} 页` : `第 ${source.row_no} 行` }}</text>
+                  </button>
+                  <text v-else>{{ source.original_name }} · {{ source.kind === 'page' ? `第 ${source.page_no} 页` : `第 ${source.row_no} 行` }}</text>
                   <button class="ui-button secondary" @click="downloadIntakeOriginal(source.batch_id, source.item_id, source.original_name)">下载原件</button>
                 </view>
+              </view>
+
+              <!--
+                单据边界的修正入口。读不出单号时一页一张是默认值（第 12 节），
+                所以「这两页其实是一张」必须有一条合回去的路。
+              -->
+              <view v-if="canReassign" class="boundary">
+                <text class="muted boundary-note">这张单据包含上面这些页。它们不是一张发票时，在这里拆开或并到另一张。</text>
+                <view class="boundary-actions">
+                  <button class="ui-button secondary" :disabled="!canSplit || boundaryBusy" @click="splitSelected">
+                    拆出选中的 {{ selectedSources.length }} 页
+                  </button>
+                  <picker
+                    v-if="mergeCandidates.length"
+                    :range="mergeCandidates.map((row) => `单据 #${row.id}${row.invoice_number ? ' · 单号 ' + row.invoice_number : ' · 无单号'}`)"
+                    :value="mergeCandidates.findIndex((row) => row.id === mergeTargetId)"
+                    @change="mergeTargetId = mergeCandidates[Number($event.detail.value)]?.id ?? null"
+                  >
+                    <view class="picker-face">{{ mergeTargetId === null ? '选择要并入的单据' : `并入单据 #${mergeTargetId}` }}</view>
+                  </picker>
+                  <button class="ui-button secondary" :disabled="mergeTargetId === null || boundaryBusy" @click="mergeIntoTarget">
+                    整张并过去
+                  </button>
+                </view>
+                <text v-if="!mergeCandidates.length" class="muted boundary-note">同一天、同一商家没有别的待填草稿，所以只能拆、不能并。</text>
+                <text v-if="boundaryNote" class="muted boundary-note">{{ boundaryNote }}</text>
+                <text v-if="boundaryError" class="field-error" role="alert">{{ boundaryError }}</text>
               </view>
               <text v-if="!invoice.files.length && !invoice.intake_sources.length" class="muted">暂无原件文件。</text>
               <text v-if="originalDownloadError" class="field-error" role="alert">{{ originalDownloadError }}</text>
               <button v-if="canManage" class="ui-button secondary" :aria-pressed="appending" @click="appending = !appending">{{ appending ? '收起补传' : '补传文件' }}</button>
+              <!-- 原「单据更多操作」菜单里的三样，都是对着这些原件做的事，所以住在这里。 -->
+              <view v-if="canManage" class="form-actions">
+                <button v-if="invoice.entry_source !== 'import' && !invoice.intake_sources.length" class="ui-button secondary" :disabled="actionBusy" @click="retryExtraction">重新提取 / 失败重试</button>
+                <!-- 批次来的单据在这一页上没有识别任务，这个按钮只会打开一张空卡。 -->
+                <button v-if="invoice.entry_source !== 'import' && !extractionSilent" class="ui-button secondary" :aria-pressed="diagnosticsOpen" @click="diagnosticsOpen = !diagnosticsOpen">{{ diagnosticsOpen ? '收起识别记录' : '查看识别记录' }}</button>
+              </view>
+              <view v-if="canManage && invoice.files.length" class="file-delete-list">
+                <text class="muted">删除拍坏文件</text>
+                <button v-for="file in invoice.files" :key="file.id" class="ui-button ghost" :disabled="actionBusy" @click="removeFile(file.id, file.original_name)">删除第 {{ file.page_order }} 页 · {{ file.original_name }}</button>
+              </view>
               <InvoiceUpload
                 v-if="appending"
                 mode="append"
@@ -817,6 +1011,14 @@ watch(() => props.invoiceId, () => {
 .edit-form { display: flex; flex-direction: column; gap: 16px; }
 .picker-text { display: flex; align-items: center; }
 .field-error { color: var(--error); font-size: 13px; }
+.source-pick { min-width: 0; min-height: 44px; margin: 0; padding: 4px 0; display: flex; align-items: center; gap: 10px; border: 0; background: transparent; color: inherit; font-size: 14px; text-align: left; cursor: pointer; }
+.source-pick::after { border: 0; }
+.tick { flex: none; width: 22px; height: 22px; display: flex; align-items: center; justify-content: center; border: 1px solid var(--line); border-radius: 5px; color: var(--green); font-size: 14px; font-weight: 700; }
+.source-pick[aria-pressed="true"] .tick { border-color: var(--green); background: #eef5ef; }
+.boundary { display: flex; flex-direction: column; gap: 10px; margin-top: 14px; padding-top: 14px; border-top: 1px solid var(--line); }
+.boundary-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; }
+.boundary-note { font-size: 13px; line-height: 1.6; }
+.picker-face { min-height: 44px; display: flex; align-items: center; padding: 8px 14px; border: 1px solid var(--line); border-radius: 8px; font-size: 14px; }
 .history-note { padding: 12px; border-radius: 6px; background: #fff5e9; color: #704007; font-size: 13px; line-height: 1.5; }
 .form-actions { display: flex; gap: 10px; flex-wrap: wrap; }
 .check-line:focus-visible { outline: 3px solid var(--focus); outline-offset: 2px; }
@@ -828,7 +1030,9 @@ watch(() => props.invoiceId, () => {
 .row text:first-child { min-width: 0; overflow-wrap: anywhere; }
 .row text:last-child { flex: none; color: var(--muted); }
 .more-actions { display: flex; flex-direction: column; align-items: flex-start; gap: 8px; }
-.more-menu { position: absolute; top: calc(100% + 4px); right: 0; z-index: 8; width: min(560px, 100%); box-shadow: 0 10px 28px #173b2e20; }
+/* 红字、不是红底：它真的会清空这张单据（第 13 节 ② 的口径），但它独自待在标题行
+   右上角，一整块红在那里比按钮本身更吵。确认仍在对话框里问一次。 */
+.delete-invoice { color: var(--error); }
 .file-delete-list { display: flex; flex-direction: column; align-items: flex-start; gap: 6px; }
 .file-delete-list .ui-button { max-width: 100%; overflow-wrap: anywhere; text-align: left; }
 .line-row { display: flex; justify-content: space-between; align-items: center; gap: 16px; width: 100%; min-height: 48px; margin: 0; padding: 12px 8px; border: 0; border-bottom: 1px solid var(--line); border-radius: 0; background: transparent; font-size: 14px; text-align: left; cursor: pointer; }
@@ -850,7 +1054,11 @@ watch(() => props.invoiceId, () => {
 .warning-note { padding: 12px; border-radius: 6px; background: #fff5e9; color: #704007; line-height: 1.5; }
 .blocked-reason { font-size: 14px; }
 .closeout-panel { display: flex; flex-direction: column; gap: 14px; padding: 16px; border: 1px solid var(--line); border-radius: 8px; background: #f7faf6; }
-.check-line { display: flex; align-items: center; gap: 8px; min-height: 44px; cursor: pointer; }
+.check-line { display: flex; align-items: center; gap: 10px; min-height: 44px; margin: 0; padding: 0 4px 0 0; border: 0; background: transparent; color: inherit; font: inherit; text-align: left; cursor: pointer; }
+.check-line::after { border: 0; }
+/* 点击区是整行（≥44px 高），看得见的方框 22px——与整理页的勾选框同一个样子。 */
+.check-box { width: 22px; height: 22px; flex: none; display: flex; align-items: center; justify-content: center; border: 2px solid #8aa394; border-radius: 4px; background: #fff; color: transparent; font-size: 15px; font-weight: 800; line-height: 1; }
+.check-line[aria-checked="true"] .check-box { border-color: var(--green); background: var(--green); color: #fff; }
 /* Narrow: one pane at a time, both kept mounted (see the component comment). */
 .detail-layout.narrow .review-grid { display: block; height: auto; }
 /* ⚠️ The narrow pane keeps a bounded height on purpose. With `height: auto` the

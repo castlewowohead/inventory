@@ -19,7 +19,7 @@ from typing import NamedTuple
 from sqlalchemy import Select, func, select, update
 from sqlalchemy.orm import Session, joinedload, selectinload
 
-from src.models import LINE_KIND_PURCHASE, FoodItem, Purchase, PurchaseRevision
+from src.models import LINE_KIND_PURCHASE, FoodItem, InvoiceLine, Purchase, PurchaseRevision
 
 
 class DescriptionHistoryRow(NamedTuple):
@@ -129,6 +129,26 @@ class PurchaseRepository:
             .offset(offset)
         )
         return list(self._session.scalars(statement).unique()), total
+
+    def for_invoices(self, invoice_ids: list[int], *, limit: int) -> list[Purchase]:
+        """Current purchase lines belonging to the selected invoices only."""
+        statement = (
+            select(Purchase)
+            .join(InvoiceLine, Purchase.invoice_line_id == InvoiceLine.id)
+            .options(
+                joinedload(Purchase.food_item).joinedload(FoodItem.category),
+                joinedload(Purchase.invoice_line),
+                selectinload(Purchase.revisions),
+            )
+            .where(
+                InvoiceLine.invoice_id.in_(invoice_ids),
+                Purchase.line_kind == LINE_KIND_PURCHASE,
+                Purchase.voided_at.is_(None),
+            )
+            .order_by(InvoiceLine.invoice_id, InvoiceLine.line_no, Purchase.id)
+            .limit(limit)
+        )
+        return list(self._session.scalars(statement).unique())
 
     def add(self, purchase: Purchase) -> Purchase:
         self._session.add(purchase)

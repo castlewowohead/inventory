@@ -15,6 +15,7 @@ from src.normalization import (
     NUMBER_FORMAT_DOT,
     NUMBER_FORMAT_STRICT,
     _TRAILING_UNIT_WORDS,
+    DATE_ORDER_ASSUMED,
     date_text_readings,
     normalize_date_text,
     normalize_number_text,
@@ -218,6 +219,47 @@ def test_an_ambiguous_numeric_date_has_both_readings_and_no_preference() -> None
     ]
     assert result.certain is None  # 没有「那一条」答案
     assert result.problem  # 为什么定不死，原话留着
+
+
+def test_the_project_default_reads_an_ambiguous_date_month_first() -> None:
+    """第 15 节：没有别的证据时 `6/11/2026` 读作 **6 月 11 日**，不摆两个选项。
+
+    用户的话是「6/3 肯定是 6 月 3 日，这个就根本没有歧义」——这家店收的是美国
+    供应商开的单据。⚠️ `ambiguous` 仍然是 True：文本本身定不死是事实，留痕之后
+    换一家写日/月/年的商家还能用原文重新解析。
+    """
+    result = date_text_readings("6/11/2026", assume_order=DATE_ORDER_ASSUMED)
+
+    assert [(item.text, item.order) for item in result.readings] == [
+        ("2026-06-11", DATE_ORDER_MDY)
+    ]
+    assert result.ambiguous is True
+    assert result.assumed_order == DATE_ORDER_MDY
+    assert "另一种读法是 2026-11-06" in " ".join(result.notes)
+
+
+def test_the_default_never_overrides_a_text_that_defines_itself() -> None:
+    """⚠️ 默认读法只在**两种都成立**时才出场。
+
+    `18/6/2026` 按月/日/年根本读不出来（没有第 18 个月），所以它不是歧义——它
+    自己就定死了。如果把默认值当成 `date_order=mdy` 一路传下去，这一天会**整个
+    丢掉**，而不是读成 6 月 18 日。这条断言就是守着这个区别。
+    """
+    result = date_text_readings("18/6/2026", assume_order=DATE_ORDER_ASSUMED)
+
+    assert [item.text for item in result.readings] == ["2026-06-18"]
+    assert result.ambiguous is False
+    assert result.assumed_order is None
+
+
+def test_a_confirmed_supplier_order_beats_the_project_default() -> None:
+    """这家明说写日/月/年时，默认读法让路：确认过的商家比默认值更有证据。"""
+    result = date_text_readings(
+        "6/11/2026", date_order=DATE_ORDER_DMY, assume_order=DATE_ORDER_ASSUMED
+    )
+
+    assert [item.text for item in result.readings] == ["2026-11-06"]
+    assert result.assumed_order is None
 
 
 def test_a_confirmed_date_order_collapses_the_ambiguity_to_one_reading() -> None:

@@ -1,6 +1,6 @@
 import { apiRequest, apiRequestBinary, type BinaryResponse } from './request'
 import type {
-  Category, ExtractionJob, Health, ItemList, Page, FoodItem, FoodItemSuggestions, MergePlan, Invoice, InvoiceLine, MatchCandidate, Purchase, PriceUnits, PriceHistory, MonthlyPrices, WeeklyPrices, SourcePrices, PriceAlerts, AlertSettings, IntakeBatch, IntakeGroupPage, IntakeItem,
+  Category, ExtractionJob, Health, ItemList, Page, FoodItem, FoodItemSuggestions, MergePlan, Invoice, InvoiceLine, MatchCandidate, Purchase, PriceUnits, PriceHistory, MonthlyPrices, WeeklyPrices, SourcePrices, PriceAlerts, AlertSettings, IntakeBatch, IntakeBatchFile, IntakeGroupPage, IntakeItem,
   IntakeMoveResult
 } from './types'
 
@@ -81,6 +81,9 @@ export const getInvoiceFileContent = (invoiceId: number, fileId: number) =>
 
 export const getIntakeItemOriginal = (batchId: number, itemId: number) =>
   apiRequestBinary(`/api/intake-batches/${batchId}/items/${itemId}/original`)
+export const deleteIntakeItem = (batchId: number, itemId: number, version: number) =>
+  apiRequest<{ deleted: true; item_id: number }>(
+    `/api/intake-batches/${batchId}/items/${itemId}`, { method: 'DELETE', data: { version } })
 
 export const createIntakeBatch = () =>
   apiRequest<IntakeBatch>('/api/intake-batches', { method: 'POST' })
@@ -88,12 +91,39 @@ export const getCurrentIntakeBatch = () =>
   apiRequest<IntakeBatch>('/api/intake-batches/current')
 export const getIntakeBatch = (id: number) =>
   apiRequest<IntakeBatch>(`/api/intake-batches/${id}`)
+/**
+ * Ends this round of multi-file filling (plan section 22): the batch is closed,
+ * so `/current` stops returning it and the home screen’s 「接着整理」 goes away.
+ *
+ * ⚠️ The server does **not** require everything to be filled in — section 5 lets
+ * leftovers wait. 「全部填完才按得动」 is a gate in the board, not a new rule.
+ * 409 when the batch was already closed.
+ */
+export const closeIntakeBatch = (id: number) =>
+  apiRequest<IntakeBatch>(`/api/intake-batches/${id}/close`, { method: 'POST' })
 export const getIntakeBatchFileOriginal = (batchId: number, fileId: number) =>
   apiRequestBinary(`/api/intake-batches/${batchId}/files/${fileId}/original`)
+/**
+ * Takes one wrongly uploaded file back out of the batch — a real delete (plan
+ * section 16): its pages, their date/supplier decisions and the undo journal go
+ * with it, and uploading the same file again starts from scratch. 409 when any of
+ * its pages is already in a draft. `file` is what the reference looked like before
+ * it went.
+ */
+export const discardIntakeBatchFile = (batchId: number, fileId: number) =>
+  apiRequest<{
+    file: IntakeBatchFile; removed_item_count: number; bytes_still_referenced: boolean
+  }>(`/api/intake-batches/${batchId}/files/${fileId}`, { method: 'DELETE' })
 export const processIntakeBatch = (id: number, retryFailed = false) =>
   apiRequest<{ batch: IntakeBatch }>(`/api/intake-batches/${id}/process`, {
     method: 'POST', data: { retry_failed: retryFailed }
   })
+/** Reads date and supplier suggestions for queued pages; never confirms a group. */
+export const recognizeIntakeBatch = (id: number, retryFailed = false, limit = 1) =>
+  apiRequest<{ results: { outcome: string }[]; model_calls: number }>(
+    `/api/intake-batches/${id}/recognize?limit=${limit}`,
+    { method: 'POST', data: { retry_failed: retryFailed }, timeout: 600000 }
+  )
 
 /** Every classifiable content in the batch, newest decisions included. */
 export interface IntakeItemFilters {
@@ -111,7 +141,7 @@ export const getIntakeItems = (batchId: number, limit = 50, offset = 0, filters:
 
 /** The derived (date, supplier) groups, unclassified bucket included. */
 export const getIntakeGroups = (batchId: number, limit = 50, offset = 0) =>
-  apiRequest<IntakeGroupPage>(`/api/intake-batches/${batchId}/groups?limit=${limit}&offset=${offset}`)
+  apiRequest<IntakeGroupPage>(`/api/intake-batches/${batchId}/groups?limit=${limit}&offset=${offset}&suggested=true`)
 
 /**
  * The contents of one group. Leaving a parameter out addresses the null side:
@@ -122,11 +152,20 @@ export const getIntakeGroupItems = (
   target: { purchaseDate?: string | null; sourceName?: string | null },
   limit = 50, offset = 0
 ) => {
-  const params = new URLSearchParams({ limit: String(limit), offset: String(offset) })
+  const params = new URLSearchParams({ limit: String(limit), offset: String(offset), suggested: 'true' })
   if (target.purchaseDate) params.set('purchase_date', target.purchaseDate)
   if (target.sourceName) params.set('source_name', target.sourceName)
   return apiRequest<Page<IntakeItem>>(`/api/intake-batches/${batchId}/groups/items?${params}`)
 }
+
+export const createIntakeDateGroup = (batchId: number, purchaseDate: string) =>
+  apiRequest<{ purchase_date: string }>(`/api/intake-batches/${batchId}/date-groups`, {
+    method: 'POST', data: { purchase_date: purchaseDate }
+  })
+
+export const deleteIntakeDateGroup = (batchId: number, purchaseDate: string) =>
+  apiRequest<{ purchase_date: string; deleted: boolean }>(
+    `/api/intake-batches/${batchId}/date-groups/${purchaseDate}`, { method: 'DELETE' })
 
 /**
  * The one move command behind dragging, multi-select and tapping a target
@@ -160,11 +199,48 @@ export const undoIntakeMove = (batchId: number, moveId: number) =>
 export const handOffIntakeItems = (
   batchId: number,
   items: { id: number; version: number }[],
-  targetInvoiceId?: number
+  targetInvoiceId?: number,
+  suggestedGroup?: { purchase_date: string; source_name: string }
 ) => apiRequest<{ invoice_id: number; item_ids: number[]; created: boolean }>(
   `/api/intake-batches/${batchId}/reviews`,
-  { method: 'POST', data: { items, ...(targetInvoiceId ? { target_invoice_id: targetInvoiceId } : {}) } }
+  { method: 'POST', data: { items, ...(targetInvoiceId ? { target_invoice_id: targetInvoiceId } : {}),
+    ...(suggestedGroup ? { suggested_group: suggestedGroup } : {}) } }
 )
+
+export const startIntakeForms = (
+  batchId: number, items: { id: number; version: number }[],
+  suggestedGroup: { purchase_date: string; source_name: string }
+) => apiRequest<{ invoice_ids: number[]; item_ids: number[]; created: boolean }>(
+  `/api/intake-batches/${batchId}/reviews/selection`,
+  { method: 'POST', data: { items, suggested_group: suggestedGroup } }
+)
+
+/**
+ * 撤回填表：丢掉草稿上填过的数据，内容回到「已分类、还没填表」。
+ *
+ * ⚠️ 服务端撤的是**整张草稿**（一张草稿就是一张发票），所以返回的 `item_ids`
+ * 可能比传进去的多——同一张草稿里的兄弟页会一起回来。已经确认入账的行撤不了，
+ * 那条路是单据里的撤销确认（第 11 节 ③）。
+ */
+export const withdrawIntakeForms = (
+  batchId: number, items: { id: number; version: number }[]
+) => apiRequest<{ item_ids: number[]; invoice_ids: number[]; cleared_lines: number }>(
+  `/api/intake-batches/${batchId}/reviews/withdraw`, { method: 'POST', data: { items } }
+)
+
+/**
+ * 重新填写：清掉这张单据填过的数据，为同一批页重新开一张空草稿（第 20 节）。
+ *
+ * ⚠️ 与 `withdrawIntakeForms` 的两点不同：①**已完成的单据可以走这条路**，它已经
+ * 入账的采购记录在同一个事务里作废（不撤就会重复记价）；②清完立刻建一张新草稿，
+ * 返回的 `invoice_id` 就是要落进去的那一张。日期和商家这些人工决定一个字不动。
+ */
+export const refillIntakeForm = (
+  batchId: number, items: { id: number; version: number }[]
+) => apiRequest<{
+  invoice_id: number; previous_invoice_id: number; previous_invoice_kept: boolean
+  item_ids: number[]; cleared_lines: number; voided_purchases: number
+}>(`/api/intake-batches/${batchId}/reviews/refill`, { method: 'POST', data: { items } })
 
 export const reviseIntakeReviewClassification = (
   batchId: number, invoiceId: number, items: { id: number; version: number }[],
@@ -172,6 +248,26 @@ export const reviseIntakeReviewClassification = (
 ) => apiRequest(`/api/intake-batches/${batchId}/reviews/${invoiceId}/classification`, {
   method: 'PATCH', data: { scope: 'invoice', items, purchase_date: purchaseDate, source_name: sourceName }
 })
+
+/**
+ * 填表期的**拆分 / 合并**：把选中的页挪到另一张草稿。
+ *
+ * 单据边界只认纸面单号，读不出单号就一页一张（docs/multifiles.md 第 12 节）。
+ * 多拆出来的那一张就靠这条接口并回去；一张真的两页发票被拆开时也走这里。
+ *
+ * - 不给 `targetInvoiceId`：新建一张草稿，把选中的页搬过去（**拆分**）。
+ * - 给了：搬进那张草稿（**合并**）。把这张草稿的页全搬走，它自己就作废。
+ *
+ * ⚠️ 搬完之后两边的**单据总额都会被清空**：拆开的两半各自该是多少，只有纸面
+ * 知道；服务端绝不拿一个总额去除。已经确认入账的行搬不动，那条路是撤销确认。
+ */
+export const reassignIntakeReviewContents = (
+  batchId: number, invoiceId: number, items: { id: number; version: number }[],
+  targetInvoiceId?: number
+) => apiRequest<{ source_invoice_id: number; target_invoice_id: number; item_ids: number[]; created: boolean }>(
+  `/api/intake-batches/${batchId}/reviews/${invoiceId}/reassign`,
+  { method: 'POST', data: targetInvoiceId === undefined ? { items } : { items, target_invoice_id: targetInvoiceId } }
+)
 
 function headerJson(value: string | undefined): unknown {
   if (!value) return null
@@ -331,8 +427,11 @@ export interface ImportPreview {
   }>
 }
 export type ImportOptions = Record<string, unknown>
-export const getPurchaseExport = (format: 'csv' | 'xlsx') =>
-  apiRequestBinary(`/api/purchases/export?format=${format}`)
+export const exportSelectedInvoices = (format: 'csv' | 'xlsx', invoiceIds: number[]) =>
+  apiRequestBinary('/api/invoices/export', {
+    method: 'POST', data: { format, invoice_ids: invoiceIds },
+    headers: { 'Content-Type': 'application/json' },
+  })
 
 // --- 价格历史与基础单位目录 ------------------------------------------------
 export const getPriceUnits = () => apiRequest<PriceUnits>('/api/prices/units')

@@ -76,6 +76,7 @@ from src.services.intake import (
     IntakeFileRefView,
     IntakeItemPage,
     IntakeItemView,
+    collapse_legacy_readings,
 )
 from src.services.intake_ingest import IngestedFile, UploadOutcome
 from src.services.intake_recognition import RecognizedItem
@@ -990,6 +991,9 @@ def intake_file_payload(view: IntakeFileRefView) -> dict[str, Any]:
     `status` 只有四个离散值（`pending` / `ready` / `failed` / `discarded`），
     **没有百分比**：本地切页没有可信的中间进度，编一个出来只会让人以为卡住了。
     `item_count` 在 `ready` 之后才有值，它就是「这份文件贡献了几张卡片」。
+    `handed_off_item_count` 是其中**已经开始填表或已入库**的项数：不为 0 时
+    `DELETE .../files/<id>` 会 409，上传页据此把「移除」按钮暗下来并说出原因，
+    而不是让人点一下才撞到报错（第 14 节）。
 
     ⚠️ 不透出 `storage_key`：那是存储布局的内部引用，回看原件走
     `/api/intake/files/<id>/content`。
@@ -1001,6 +1005,7 @@ def intake_file_payload(view: IntakeFileRefView) -> dict[str, Any]:
         "upload_order": view.upload_order,
         "status": view.status,
         "item_count": view.item_count,
+        "handed_off_item_count": view.handed_off_item_count,
         "sheet_name": view.sheet_name,
         "sha256": view.sha256,
         "size": view.size,
@@ -1024,7 +1029,8 @@ def intake_item_payload(view: IntakeItemView) -> dict[str, Any]:
 
     ⚠️ `handed_off_at` 不是 null 时这张卡片**已经进了审核**，整理命令会被服务端
     拒成 409。透出它是为了让界面先说清楚「这张已送审，改它要走审核里的分类修订」，
-    而不是让人点一下才撞到报错（多文件计划 M12）。
+    而不是让人点一下才撞到报错（多文件计划 M12）。`review_invoice_id` 配套说出
+    **在填哪一张草稿**，整理页据此给出「继续填表」的入口（第 11 节 ④）。
     """
     return {
         "id": view.id,
@@ -1048,6 +1054,8 @@ def intake_item_payload(view: IntakeItemView) -> dict[str, Any]:
         "handed_off_at": (
             view.handed_off_at.isoformat() if view.handed_off_at else None
         ),
+        "review_invoice_id": view.review_invoice_id,
+        "review_status": view.review_status,
         "pile_excluded": view.pile_excluded,
         "row_values": view.row_data.get("values") if isinstance(view.row_data, dict) else None,
         "candidates": [
@@ -1064,15 +1072,19 @@ def intake_recognition_payload(view: IntakeItemView) -> dict[str, Any]:
     `status` 是 `done`、候选是 0 条；没跑过时是 null。前端据此说得出
     「还没读」「读了但纸上没有」「读失败了」三句不同的话，而不是一律显示「未知」。
 
-    `date_raw_text` 与 `date_readings` 是**歧义日期的两种可能**：`6/11/2026` 会给出
-    两条读法，都只是候选。确认商家并给这家设 `date_order` 之后，
-    `POST .../items/<id>/reparse-date` 用这段原文重新解析，**不再调一次模型**。
+    `date_raw_text` 与 `date_readings` 是这段原文读出来的值。`6/11/2026` 这类日/月
+    顺序定不死的写法按本项目默认的月/日/年读成一条（第 15 节）：`date_ambiguous`
+    仍然是 `true`（文本确实定不死，这是事实），`date_assumed_order` 说出它是按哪种
+    书写习惯读的。界面据此说「按月/日/年读作 6 月 11 日」，而不是「要人工确认」。
+    确认商家并给这家设 `date_order` 之后，`POST .../items/<id>/reparse-date` 用这段
+    原文重新解析，**不再调一次模型**。
 
     不透出整份 payload（里面还有行项目与原始响应，那是 M08 建草稿要用的）：
     卡片上要的是「读到什么、还能不能定死日期」。
     """
     payload = view.recognition_payload or {}
-    readings = payload.get("date_readings") or {}
+    # 老 payload 里那一对读法在这里收成一条，与卡片上的候选说同一句话（第 15 节）。
+    readings = collapse_legacy_readings(payload.get("date_readings") or {})
     date_order = payload.get("date_order") or {}
     return {
         "status": view.recognition_status,
@@ -1085,6 +1097,7 @@ def intake_recognition_payload(view: IntakeItemView) -> dict[str, Any]:
         "is_fake": payload.get("is_fake"),
         "date_raw_text": readings.get("raw_text"),
         "date_ambiguous": bool(readings.get("ambiguous")),
+        "date_assumed_order": readings.get("assumed_order"),
         "date_problem": readings.get("problem"),
         "date_readings": list(readings.get("readings") or []),
         "date_order": date_order.get("value"),
@@ -1115,10 +1128,15 @@ def intake_batch_payload(view: IntakeBatchView) -> dict[str, Any]:
 
     `status` 是**派生值**（数据库里没这一列）：open / closed / discarded。
     `files` 里不含已撤掉的文件，所以它就是「这一批现在有什么」。
+
+    `item_count` / `unfinished_item_count` 是这一批「还剩几项没填完」（第 22 节）：
+    整理页底下那个「确认完成所有填写」用它决定按不按得动、按不动时说得出还差什么。
     """
     return {
         "id": view.id,
         "status": view.status,
+        "item_count": view.item_count,
+        "unfinished_item_count": view.unfinished_item_count,
         "created_at": view.created_at.isoformat(),
         "updated_at": view.updated_at.isoformat(),
         "closed_at": view.closed_at.isoformat() if view.closed_at else None,

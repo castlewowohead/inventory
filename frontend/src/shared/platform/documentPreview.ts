@@ -204,3 +204,36 @@ export async function openPdf(bytes: ArrayBuffer): Promise<PdfDocument> {
     'App 端还没有 PDF 预览适配器：pdf.js 在那里没有 canvas，要改用平台的 PDF 组件或原生插件。'
   )
 }
+
+/**
+ * How many pages a **not yet uploaded** file has, or `null` when this platform
+ * or this file cannot answer.
+ *
+ * The upload entry uses it to tell one document from a stack of them: a single
+ * one-page PDF or one photo goes straight to the fill page, anything else goes
+ * to the organizing board (`docs/multifiles.md` 第 11 节 ①). ⚠️ `null` is not
+ * "zero pages" — it means **unknown**, and the caller must then take the
+ * organizing route, which handles any file the server accepts.
+ */
+export async function countLocalPages(
+  source: File | string, name: string, mediaType: string
+): Promise<number | null> {
+  const kind = classifyDocument(name, mediaType)
+  if (kind === 'image') return 1
+  if (kind !== 'pdf') return null
+  // #ifdef H5
+  if (typeof File === 'undefined' || !(source instanceof File)) return null
+  let document: PdfDocument | null = null
+  try {
+    document = await openPdf(await source.arrayBuffer())
+    return document.pageCount
+  } catch {
+    // A PDF the browser cannot parse is not a reason to block the upload; the
+    // server still takes the bytes and reports what it found.
+    return null
+  } finally {
+    document?.close()
+  }
+  // #endif
+  return null
+}

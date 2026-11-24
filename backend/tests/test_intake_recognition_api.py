@@ -72,6 +72,92 @@ def test_recognising_a_batch_returns_candidates_and_reports_zero_model_calls(
     assert body["results"][0]["provider"] == "text-layer"
 
 
+def test_recognition_can_be_driven_one_page_per_request(
+    migrated_client: FlaskClient,
+) -> None:
+    batch_id = new_batch(migrated_client)
+    assert upload(
+        migrated_client, batch_id, "mixed.pdf", text_pdf([INVOICE_PAGE, SECOND_PAGE])
+    ).status_code == 201
+
+    url = f"{INTAKE}/{batch_id}/recognize?limit=1"
+    first = migrated_client.post(url)
+    assert first.status_code == 200
+    assert [entry["outcome"] for entry in first.get_json()["results"]] == ["recognized"]
+    assert [item["recognition"]["status"] for item in items_of(migrated_client, batch_id)] == ["done", "pending"]
+
+    second = migrated_client.post(url)
+    assert second.status_code == 200
+    assert [entry["outcome"] for entry in second.get_json()["results"]] == ["recognized"]
+    assert [item["recognition"]["status"] for item in items_of(migrated_client, batch_id)] == ["done", "done"]
+    assert migrated_client.post(url).get_json()["results"] == []
+
+
+def test_suggested_group_appears_on_right_and_handoff_accepts_only_that_group(
+    migrated_client: FlaskClient,
+) -> None:
+    batch_id = new_batch(migrated_client)
+    anchor = [(72, 740, "Vendor: Costco Wholesale"), (72, 715, "Date: 6/18/2026")]
+    assert upload(migrated_client, batch_id, "same-seller.pdf",
+                  text_pdf([INVOICE_PAGE, anchor])).status_code == 201
+    assert migrated_client.post(f"{INTAKE}/{batch_id}/recognize").status_code == 200
+
+    groups = migrated_client.get(f"{INTAKE}/{batch_id}/groups?suggested=true").get_json()["groups"]
+    assert [(row["purchase_date"], row["source_name"], row["suggested_count"])
+            for row in groups] == [
+        ("2026-06-11", "Costco Wholesale", 1),
+        ("2026-06-18", "Costco Wholesale", 1),
+    ]
+    first = migrated_client.get(
+        f"{INTAKE}/{batch_id}/groups/items?purchase_date=2026-06-11&source_name=Costco%20Wholesale&suggested=true"
+    ).get_json()["items"][0]
+    assert first["decided_purchase_date"] is None
+    assert first["decided_source_name"] is None
+
+    bad = migrated_client.post(f"{INTAKE}/{batch_id}/reviews", json={
+        "items": [{"id": first["id"], "version": first["version"]}],
+        "suggested_group": {"purchase_date": "2026-11-06", "source_name": "Costco Wholesale"},
+    })
+    assert bad.status_code == 409
+
+    accepted = migrated_client.post(f"{INTAKE}/{batch_id}/reviews", json={
+        "items": [{"id": first["id"], "version": first["version"]}],
+        "suggested_group": {"purchase_date": "2026-06-11", "source_name": "Costco Wholesale"},
+    })
+    assert accepted.status_code == 201, accepted.get_json()
+    after = next(item for item in items_of(migrated_client, batch_id) if item["id"] == first["id"])
+    assert (after["decided_purchase_date"], after["decided_source_name"]) == (
+        "2026-06-11", "Costco Wholesale")
+    assert after["handed_off_at"] is not None
+
+
+def test_group_projection_follows_a_manual_date_and_source_correction(
+    migrated_client: FlaskClient,
+) -> None:
+    batch_id = new_batch(migrated_client)
+    anchor = [(72, 740, "Vendor: Costco Wholesale"), (72, 715, "Date: 6/18/2026")]
+    upload(migrated_client, batch_id, "same-seller.pdf", text_pdf([INVOICE_PAGE, anchor]))
+    migrated_client.post(f"{INTAKE}/{batch_id}/recognize")
+    first = items_of(migrated_client, batch_id)[0]
+
+    moved_date = migrated_client.post(f"{INTAKE}/{batch_id}/moves", json={
+        "request_key": "correct-date", "action": "date",
+        "items": [{"id": first["id"], "version": first["version"]}],
+        "purchase_date": "2026-11-06",
+    })
+    assert moved_date.status_code == 200, moved_date.get_json()
+    updated = moved_date.get_json()["items"][0]
+    moved_source = migrated_client.post(f"{INTAKE}/{batch_id}/moves", json={
+        "request_key": "correct-source", "action": "source",
+        "items": [{"id": updated["id"], "version": updated["version"]}],
+        "source_name": "Corrected Supplier",
+    })
+    assert moved_source.status_code == 200, moved_source.get_json()
+    groups = migrated_client.get(f"{INTAKE}/{batch_id}/groups?suggested=true").get_json()["groups"]
+    assert ("2026-11-06", "Corrected Supplier") in {
+        (row["purchase_date"], row["source_name"]) for row in groups}
+
+
 def test_the_item_payload_tells_apart_not_read_yet_from_read_but_nothing_there(
     migrated_client: FlaskClient,
 ) -> None:
@@ -96,13 +182,53 @@ def test_the_item_payload_tells_apart_not_read_yet_from_read_but_nothing_there(
     assert after["recognition"]["prompt_sha12"] is None
 
 
-def test_an_ambiguous_date_is_reported_as_two_readings_on_the_card(
+def test_an_old_card_says_the_same_thing_as_a_new_one(
+    migrated_client: FlaskClient, intake_service: IntakeService,
+) -> None:
+    """11-24 之前存的那一对读法，在响应里也收成一条（第 15 节 ②）。
+
+    否则卡片上只摆一个「确认 6 月 3 日」，旁边那句说明还在说「有两种读法，要人工
+    确认」——同一张卡片自己跟自己打架。⚠️ 收的是**读出来的那一份**，库里的
+    `recognition_payload` 一个字没改。
+    """
+    batch_id = new_batch(migrated_client)
+    upload(migrated_client, batch_id, "legacy.pdf", text_pdf([INVOICE_PAGE]))
+    (item,) = intake_service.list_items(batch_id).items
+    intake_service.record_recognition(
+        item.id,
+        payload={
+            "purpose": "intake_grouping",
+            "date_readings": {
+                "raw_text": "6/3/2026",
+                "ambiguous": True,
+                "readings": [
+                    {"value": "2026-06-03", "order": "mdy", "note": "按「月/日/年」读"},
+                    {"value": "2026-03-06", "order": "dmy", "note": "按「日/月/年」读"},
+                ],
+            },
+        },
+        candidates={},
+    )
+
+    card = items_of(migrated_client, batch_id)[0]
+
+    recognition = card["recognition"]
+    assert recognition["date_ambiguous"] is True
+    assert recognition["date_assumed_order"] == "mdy"
+    assert [entry["value"] for entry in recognition["date_readings"]] == ["2026-06-03"]
+    # 库里那两条一个没少：这是显示上的收口，不是数据订正。
+    stored = intake_service.get_item(item.id).recognition_payload or {}
+    assert len(stored["date_readings"]["readings"]) == 2
+
+
+def test_a_month_first_date_is_read_as_one_day_on_the_card(
     migrated_client: FlaskClient,
 ) -> None:
-    """`6/11/2026` 在卡片上就是**两种可能**，而且带着原文。
+    """`6/11/2026` 在卡片上就是 **6 月 11 日**，而且带着原文和「这是默认读法」。
 
-    前端据此说「这一天定不死，确认商家之后可以定」，而不是先显示一个 6 月 11 日
-    让人以为已经读准了。
+    第 15 节：这是美国供应商开的单据，`6/11` 在那张纸上没有第二种意思。卡片不再
+    摆两个按钮让人挑，但 `date_ambiguous` 仍然为真——文本本身定不死是个事实，
+    换一家明说 `dmy` 的商家还能用原文重新解析。
     """
     batch_id = new_batch(migrated_client)
     upload(migrated_client, batch_id, "invoice.pdf", text_pdf([INVOICE_PAGE]))
@@ -113,18 +239,17 @@ def test_an_ambiguous_date_is_reported_as_two_readings_on_the_card(
     recognition = card["recognition"]
     assert recognition["date_raw_text"] == "6/11/2026"
     assert recognition["date_ambiguous"] is True
-    assert sorted(entry["value"] for entry in recognition["date_readings"]) == [
-        "2026-06-11",
-        "2026-11-06",
-    ]
+    assert recognition["date_assumed_order"] == "mdy"
+    assert [entry["value"] for entry in recognition["date_readings"]] == ["2026-06-11"]
     assert recognition["date_order"] == "strict"
     assert recognition["date_order_from"] == "default_strict"
     # 候选在响应里是单独一处，而且带依据——与人工决定分得清。
     dates = [
         entry for entry in card["candidates"] if entry["field"] == "purchase_date"
     ]
-    assert {entry["value"] for entry in dates} == {"2026-06-11", "2026-11-06"}
+    assert {entry["value"] for entry in dates} == {"2026-06-11"}
     assert {entry["basis"] for entry in dates} == {"paper"}
+    # ⚠️ 读出来仍然只是候选：没有人点过，`decided_*` 一个字都不写。
     assert card["decided_purchase_date"] is None
 
 

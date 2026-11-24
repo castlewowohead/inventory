@@ -154,3 +154,39 @@ def test_http_board_move_and_undo(migrated_client, intake_service):
     assert migrated_client.post(f"{root}/moves", json={**command, "request_key": "bad", "action": []}).status_code == 400
     assert migrated_client.post(f"{root}/moves/{move_id}/undo").status_code == 200
     assert migrated_client.get(f"{root}/groups/items").get_json()["total"] == 4
+
+
+def test_dates_remain_until_deleted_and_clear_overrides_suggestions(migrated_client, intake_service):
+    batch_id, rows = _items(intake_service, 1)
+    intake_service.replace_candidates(rows[0].id, field="purchase_date", basis="paper",
+        candidates=[CandidateInput(value="2026-06-06", evidence={"raw_text": "6/6/2026"})])
+    root = f"/api/intake-batches/{batch_id}"
+
+    def groups():
+        response = migrated_client.get(f"{root}/groups?suggested=true")
+        assert response.status_code == 200
+        return response.json["groups"]
+
+    assert any(group["purchase_date"] == "2026-06-06" for group in groups())
+    moved = migrated_client.post(f"{root}/moves", json={
+        "request_key": "move-to-eight", "action": "date", "items": _selected(rows),
+        "purchase_date": "2026-06-08"})
+    assert moved.status_code == 200
+    assert any(group["purchase_date"] == "2026-06-06" and group["item_count"] == 0
+               for group in groups())
+    current = moved.json["items"][0]
+    cleared = migrated_client.post(f"{root}/moves", json={
+        "request_key": "clear-to-pending", "action": "clear",
+        "items": [{"id": current["id"], "version": current["version"]}]})
+    assert cleared.status_code == 200
+    assert migrated_client.get(f"{root}/groups/items?suggested=true").json["total"] == 1
+    assert all(group["item_count"] == 0 for group in groups()
+               if group["purchase_date"] is not None)
+
+    created = migrated_client.post(f"{root}/date-groups", json={"purchase_date": "2026-06-10"})
+    assert created.status_code == 201
+    assert any(group["purchase_date"] == "2026-06-10" for group in groups())
+    assert migrated_client.delete(f"{root}/date-groups/2026-06-10").status_code == 200
+    assert not any(group["purchase_date"] == "2026-06-10" for group in groups())
+    assert migrated_client.delete(f"{root}/date-groups/2026-06-06").status_code == 200
+    assert not any(group["purchase_date"] == "2026-06-06" for group in groups())

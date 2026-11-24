@@ -289,6 +289,31 @@ def test_ocr_prefills_a_clear_two_digit_year_date(
     assert view.raw_document_fields["fields"]["invoice_date"]["raw_text"] == "6/29/26"
 
 
+def test_an_ambiguous_date_prefills_as_month_first(
+    migrated_database: Database, storage: LocalFileStorage, config: Config
+) -> None:
+    """`6/3/2026` 预填成 6 月 3 日，而不是留空（docs/multifiles.md 第 15 节）。
+
+    这家供应商还没设过日/月顺序。整理页已经按默认的月/日/年把这张纸归到 6 月 3 日，
+    填表页再说一句「读不出来」就等于同一张纸有两种说法。原文仍在
+    `raw_document_fields` 里，预填值随时可改。
+    """
+    recognizer = _StubRecognizer(
+        [_line(1, item_description="Rice")],
+        document_fields={
+            FIELD_INVOICE_DATE: RecognizedField.recognized(
+                FIELD_INVOICE_DATE, "6/3/2026"
+            )
+        },
+    )
+    invoices, _ = _services(migrated_database, storage, recognizer, config)
+
+    view = _upload(invoices, _printed_page(), "printed.jpg")
+
+    assert view.invoice_date.isoformat() == "2026-06-03"
+    assert view.raw_document_fields["fields"]["invoice_date"]["raw_text"] == "6/3/2026"
+
+
 def test_handwritten_pages_are_never_prefilled(
     migrated_database: Database, storage: LocalFileStorage, config: Config
 ) -> None:

@@ -8,7 +8,7 @@
 | 方法   | 路径                                               | 说明                                    |
 | ------ | -------------------------------------------------- | --------------------------------------- |
 | POST   | /api/intake-batches                                | 新建一个整理批次                         |
-| GET    | /api/intake-batches/current                        | **恢复**：最近一个还在整理的批次         |
+| GET    | /api/intake-batches/current                        | **恢复**：最近一个有文件的开放批次       |
 | GET    | /api/intake-batches/<id>                           | 批次与逐文件处理状态（轮询这个）         |
 | GET    | /api/intake-batches/<id>/items                     | 分页读可归类内容（页/行卡片）            |
 | POST   | /api/intake-batches/<id>/files                     | **逐文件**上传（multipart，字段 `file`） |
@@ -43,7 +43,7 @@
    了；是的话 `ingest` 为 null，前端去轮询批次状态。**没有百分比**，只有离散状态。
 3. **文件与内容嵌在批次下**，并且**真的校验归属**：`/<batch_id>/files/<file_id>`
    里两个 id 对不上就是 404，而不是照样把别的批次的原件返回去。
-4. **「现在有没有在整理的批次」用 `GET /current`**，没有就是 404 而不是
+4. **「现在有没有可继续整理的文件」用 `GET /current`**，没有就是 404 而不是
    空对象：前端据此决定「接着整理」还是「新建一批」，两者不能长得一样。
 5. **回看原件原样返回存下来的字节**，不压缩、不转格式——它是核对用的证据。PDF 的
    某一页返回的是**整份 PDF**，页号在 `X-Intake-Page` 响应头里；本项目没有 PDF
@@ -173,7 +173,7 @@ def create_batch() -> tuple[Response, int]:
 
 @intake_bp.get("/current")
 def current_batch() -> tuple[Response, int]:
-    """最近一个还在整理的批次。
+    """最近一个有未移除文件的开放批次。
 
     没有就 404：前端据此决定「接着整理」还是「新建一批」。返回一个空对象会让这两种
     情形长得一样。
@@ -182,7 +182,7 @@ def current_batch() -> tuple[Response, int]:
     view = intake.latest_open_batch()
     if view is None:
         raise NotFoundError(
-            "现在没有正在整理的批次。上传文件时会新建一个。",
+            "现在没有可继续整理的文件批次。上传文件时会新建一个。",
             details={"status": "open"},
         )
     return jsonify(intake_batch_payload(view)), 200
@@ -193,6 +193,21 @@ def get_batch(batch_id: int) -> tuple[Response, int]:
     """批次详情，含逐文件的处理状态。**轮询这个接口**看切页进展。"""
     intake, _, _ = services()
     return jsonify(intake_batch_payload(intake.get_batch(batch_id))), 200
+
+
+@intake_bp.post("/<int:batch_id>/close")
+def close_batch(batch_id: int) -> tuple[Response, int]:
+    """这一批填完了：收口，不再接收新文件（第 22 节）。
+
+    收口之后 `GET /current` 就不再返回它，首页那个「接着整理」因此消失——
+    这正是用户要的「此次多文件填表结束」。
+
+    ⚠️ **服务端不检查是否全部填完**：第 5 节允许把待定内容留着以后再办。
+    「全部填完才按得动」是界面上的一道闸（用 `unfinished_item_count`），不是新的业务规则。
+    已经收过口的批次再收一次是 409。
+    """
+    intake, _, _ = services()
+    return jsonify(intake_batch_payload(intake.close_batch(batch_id))), 200
 
 
 @intake_bp.get("/<int:batch_id>/items")
@@ -210,17 +225,45 @@ def list_items(batch_id: int) -> tuple[Response, int]:
     return jsonify(intake_item_page_payload(page)), 200
 
 
+@intake_bp.delete("/<int:batch_id>/items/<int:item_id>")
+def delete_item(batch_id: int, item_id: int) -> tuple[Response, int]:
+    payload = json_object(request)
+    reject_unknown_fields(payload, ("version",))
+    version = payload.get("version")
+    if type(version) is not int or version < 1:
+        raise ValidationError("version 必须是正整数。")
+    intake, _, _ = services()
+    intake.delete_item(batch_id, item_id, version=version)
+    return jsonify({"deleted": True, "item_id": item_id}), 200
+
+
 def _moves() -> IntakeMoveService:
     return IntakeMoveService(get_database(current_app))
 
 
+@intake_bp.post("/<int:batch_id>/date-groups")
+def create_date_group(batch_id: int) -> tuple[Response, int]:
+    payload = json_object(request)
+    reject_unknown_fields(payload, {"purchase_date"})
+    _moves().create_date_group(batch_id, payload.get("purchase_date"))
+    return jsonify({"purchase_date": payload["purchase_date"]}), 201
+
+
+@intake_bp.delete("/<int:batch_id>/date-groups/<string:purchase_date>")
+def delete_date_group(batch_id: int, purchase_date: str) -> tuple[Response, int]:
+    _moves().delete_date_group(batch_id, purchase_date)
+    return jsonify({"purchase_date": purchase_date, "deleted": True}), 200
+
+
 @intake_bp.get("/<int:batch_id>/groups")
 def list_classification_groups(batch_id: int) -> tuple[Response, int]:
-    page = _moves().groups(batch_id, limit=query_int(request.args, "limit", 50),
-                           offset=query_int(request.args, "offset", 0))
+    service = _moves()
+    reader = service.suggested_groups if query_bool(request.args, "suggested") else service.groups
+    page = reader(batch_id, limit=query_int(request.args, "limit", 50),
+                  offset=query_int(request.args, "offset", 0))
     return jsonify({"groups": [{"purchase_date": row.purchase_date.isoformat() if row.purchase_date else None,
         "source_name": row.source_name, "source_name_normalized": row.source_name_normalized,
-        "item_count": row.item_count} for row in page.groups],
+        "item_count": row.item_count, "suggested_count": row.suggested_count} for row in page.groups],
         "total": page.total, "limit": page.limit, "offset": page.offset}), 200
 
 
@@ -228,7 +271,9 @@ def list_classification_groups(batch_id: int) -> tuple[Response, int]:
 def list_classification_group_items(batch_id: int) -> tuple[Response, int]:
     # Omitted purchase_date/source_name represent the unclassified and
     # date-only buckets. Supplying both addresses a supplier group.
-    page = _moves().group_items(batch_id,
+    service = _moves()
+    reader = service.suggested_group_items if query_bool(request.args, "suggested") else service.group_items
+    page = reader(batch_id,
         purchase_date=request.args.get("purchase_date"), source_name=request.args.get("source_name"),
         limit=query_int(request.args, "limit", 50), offset=query_int(request.args, "offset", 0))
     return jsonify(intake_item_page_payload(page)), 200
@@ -259,11 +304,48 @@ def undo_move(batch_id: int, move_id: int) -> tuple[Response, int]:
 def handoff_review(batch_id: int) -> tuple[Response, int]:
     """Send an explicit set of contents into one existing review draft."""
     payload = json_object(request)
-    reject_unknown_fields(payload, {"items", "target_invoice_id"})
+    reject_unknown_fields(payload, {"items", "target_invoice_id", "suggested_group"})
     result = IntakeReviewService(get_database(current_app)).handoff(
         batch_id, items=payload.get("items"),
-        target_invoice_id=payload.get("target_invoice_id"))
+        target_invoice_id=payload.get("target_invoice_id"),
+        suggested_group=payload.get("suggested_group"))
     return jsonify(result), 201 if result["created"] else 200
+
+
+@intake_bp.post("/<int:batch_id>/reviews/selection")
+def handoff_review_selection(batch_id: int) -> tuple[Response, int]:
+    payload = json_object(request)
+    reject_unknown_fields(payload, {"items", "suggested_group"})
+    result = IntakeReviewService(get_database(current_app)).handoff_selection(
+        batch_id, items=payload.get("items"), suggested_group=payload.get("suggested_group"))
+    return jsonify(result), 201 if result["created"] else 200
+
+
+@intake_bp.post("/<int:batch_id>/reviews/withdraw")
+def withdraw_review(batch_id: int) -> tuple[Response, int]:
+    """撤回填表：删掉草稿上填过的数据，内容回到「已分类、还没填表」。
+
+    撤的是整张草稿（一张草稿就是一张发票），已经确认入账的行拦在这里不许撤。
+    """
+    payload = json_object(request)
+    reject_unknown_fields(payload, {"items"})
+    result = IntakeReviewService(get_database(current_app)).withdraw(
+        batch_id, items=payload.get("items"))
+    return jsonify(result), 200
+
+
+@intake_bp.post("/<int:batch_id>/reviews/refill")
+def refill_review(batch_id: int) -> tuple[Response, int]:
+    """重新填写：清掉这张单据填过的数据，并为同一批页重新开一张空草稿。
+
+    已经入账的行在这一步被**撤销**（采购记录作废、留修改日志），不是被拦住——
+    不撤就会重复记价。日期和商家这些整理阶段的人工决定一个字不动。
+    """
+    payload = json_object(request)
+    reject_unknown_fields(payload, {"items"})
+    result = IntakeReviewService(get_database(current_app)).refill(
+        batch_id, items=payload.get("items"))
+    return jsonify(result), 200
 
 
 @intake_bp.get("/<int:batch_id>/review-suggestions")
@@ -349,22 +431,27 @@ def process_batch(batch_id: int) -> tuple[Response, int]:
 
 @intake_bp.delete("/<int:batch_id>/files/<int:file_id>")
 def discard_file(batch_id: int, file_id: int) -> tuple[Response, int]:
-    """把一个文件从批次里撤掉。
+    """把一个文件从批次里移除：**这份文件在这个批次里的记录一并删掉**。
 
-    **可以反悔**：行与它的页都留着，再传一次同一份文件会把它连同已有分类一起复活。
+    ⚠️ **不可反悔**（2026-11-24 起，docs/multifiles.md 第 16 节）：引用、切出来的页、
+    页上的日期/商家决定与撤销日志一起删。同一份文件再传进来是**全新的一份**，
+    不带任何旧分类。`file` 是删掉之前那条引用的样子，`removed_item_count` 是跟着
+    删掉的内容数。
+
     `bytes_still_referenced` 回答「盘上那份字节现在能删了吗」——别的批次可能还在
-    用同一份字节，所以撤掉不等于能删文件。
+    用同一份字节，所以移除不等于能删文件。已有内容进了填表的文件拦在外面（409）。
     """
     intake, _, _ = services()
     _require_in_batch(
         batch_id, intake.get_file(file_id).batch_id, what="文件", ident=file_id
     )
-    discarded = intake.discard_file(file_id)
+    removed = intake.discard_file(file_id)
     return (
         jsonify(
             {
-                "file": intake_file_payload(discarded.ref),
-                "bytes_still_referenced": discarded.bytes_still_referenced,
+                "file": intake_file_payload(removed.ref),
+                "removed_item_count": removed.removed_item_count,
+                "bytes_still_referenced": removed.bytes_still_referenced,
             }
         ),
         200,
@@ -433,7 +520,8 @@ def recognize_batch(batch_id: int) -> tuple[Response, int]:
     intake, _, recognition = services()
     intake.get_batch(batch_id)
     results = recognition.recognize_waiting(
-        batch_id=batch_id, retry_failed=retry_failed
+        batch_id=batch_id, retry_failed=retry_failed,
+        limit=query_int(request.args, "limit", 50),
     )
     return (
         jsonify(
@@ -441,7 +529,7 @@ def recognize_batch(batch_id: int) -> tuple[Response, int]:
                 "results": [intake_recognized_payload(item) for item in results],
                 "model_calls": sum(item.calls for item in results),
                 "groups_hint": (
-                    "候选不会自己变成分组：日期/商家组只看人工确认过的决定值。"
+                    "识别候选会显示在整理页右侧的系统建议组；人工修改与送审会写入决定值。"
                 ),
             }
         ),

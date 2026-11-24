@@ -17,6 +17,7 @@
  * would catch.
  */
 import type { CropField, InvoiceLine } from '../../shared/api'
+import { plainAmount } from './lineDraft'
 
 /** The five cells the crop endpoint knows, in the order the form shows them. */
 export const EVIDENCE_FIELDS = [
@@ -24,7 +25,7 @@ export const EVIDENCE_FIELDS = [
   { crop: 'quantity', label: '数量', sheet: 'quantity' },
   { crop: 'unit', label: '采购单位', sheet: 'purchase_unit' },
   { crop: 'unit_price', label: '单价', sheet: 'unit_price' },
-  { crop: 'line_amount', label: '行金额', sheet: 'line_amount' }
+  { crop: 'line_amount', label: '金额', sheet: 'line_amount' }
 ] as const satisfies readonly { crop: CropField; label: string; sheet: string }[]
 
 export type BoxSource = 'grid' | 'grid_row' | 'vendor'
@@ -192,8 +193,17 @@ export function suggestedValue(line: InvoiceLine, field: CropField): string | nu
   const raw = evidence.rawText?.trim()
   if (evidence.status === 'recognized' && raw) {
     if (field === 'item_description') return cleanProductName(raw)
-    if ((field === 'quantity' || field === 'unit_price' || field === 'line_amount')
-        && !/^[0-9]+(?:\.[0-9]+)?$/.test(raw)) return null
+    if (field === 'quantity' || field === 'unit_price' || field === 'line_amount') {
+      // ⚠️ 纸面原文带着货币符号和千分位（`$1,664.33`），而数字框只收 `1664.33`。
+      // 原来这里直接拿原文去比「纯数字」，于是**两个模型都读出来、而且读的一样**的
+      // 行金额被这道闸挡在外面，格子里连灰字都没有——看上去就像 AI 没读这一项
+      // （2026-11-24 反馈，第 21 节 ①）。M12 那次只把 `plainAmount()` 加在「此数据
+      // 正确」那一下，可值根本没摆出来，那一步就永远走不到。
+      // 现在先按输入框的形状收一次，收不干净的仍然不提：`-` 是纸面上真实存在的一个
+      // 字符（见 dashscope 的 MISSING_MARKERS），它不是数字，格子照旧留空等人填。
+      const plain = plainAmount(raw)
+      return /^[0-9]+(?:\.[0-9]+)?$/.test(plain) ? plain : null
+    }
     return raw
   }
 

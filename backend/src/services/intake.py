@@ -32,6 +32,7 @@ from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
 from typing import Any, Final, Mapping, Sequence
 
+from sqlalchemy import delete
 from sqlalchemy.orm import Session
 
 from src.db import Database
@@ -55,6 +56,7 @@ from src.models import (
     INTAKE_RECOGNITION_STATUS_DONE,
     INTAKE_RECOGNITION_STATUS_FAILED,
     INTAKE_RECOGNITION_STATUS_PENDING,
+    IntakeReviewLink,
     SHA256_LENGTH,
     SHEET_NAME_MAX_LENGTH,
     SOURCE_NAME_MAX_LENGTH,
@@ -67,6 +69,8 @@ from src.models import (
     IntakeItemCandidate,
     utcnow,
 )
+from src.normalization import DATE_ORDER_ASSUMED, DATE_ORDER_DMY, DATE_ORDER_MDY
+from src.repositories.intake_moves import IntakeMoveRepository
 from src.repositories.intake import (
     IntakeBatchFileRepository,
     IntakeBatchRepository,
@@ -177,6 +181,13 @@ class IntakeItemView:
     """M08 送审时写上的时刻。不是 null 就意味着这张卡片**不再接受整理命令**：
     改日期/商家要走审核里的分类修订（`PATCH .../reviews/<invoice_id>/classification`）。
     透出它是因为界面否则只能等服务端 409 才知道这件事（多文件计划 M12）。"""
+    review_invoice_id: int | None = None
+    """正在填的那张草稿。`handed_off_at` 只说「在填表中」，这一列说**在填哪一张**，
+    否则用户退出填表页之后，整理页上就没有回到这张草稿的入口（第 11 节 ④）。"""
+    review_status: str | None = None
+    """那张草稿处在哪一步：`draft` 还在填、`completed` 已收口入库、`voided` 已作废。
+    ⚠️ 没有它，卡片只能一律写「编辑中」——已经入库的那张也写「编辑中」就是假话，
+    而被删掉的那张会让人去点一个必然失败的「撤回填表」（第 11 节 ③）。"""
     pile_excluded: bool = False
     row_data: dict[str, Any] | None = None
     """M04 存下来的表格行：解析值、单元格原文、逐行问题。页内容是 None。"""
@@ -189,6 +200,7 @@ class IntakeItemView:
     @classmethod
     def of(cls, item: IntakeItem) -> "IntakeItemView":
         batch_file = item.batch_file
+
         return cls(
             id=item.id,
             batch_id=batch_file.batch_id,
@@ -206,10 +218,10 @@ class IntakeItemView:
             decided_at=item.decided_at,
             version=item.version,
             handed_off_at=item.handed_off_at,
+            review_invoice_id=item.review_link.invoice_id if item.review_link else None,
+            review_status=_review_status(item),
             pile_excluded=item.pile_excluded,
-            candidates=tuple(
-                IntakeCandidateView.of(candidate) for candidate in item.candidates
-            ),
+            candidates=_visible_candidates(item),
             row_data=_maybe_json(item.row_data),
             recognition_status=item.recognition_status,
             recognized_at=item.recognized_at,
@@ -225,6 +237,10 @@ class IntakeFileRefView:
 
     `storage_key` 是**回指那份字节**的引用（M03 要用它读原件并切页）。它不是绝对
     路径——绝对路径随部署变化，取字节一律经文件存储适配器。
+
+    `handed_off_item_count` 是**这份文件有几页已经进了填表**。它不是统计口径，而是
+    「这份文件现在还能不能撤掉」的那条理由：不为 0 时 `discard_file` 会 409，界面据此
+    提前把「移除」按钮暗下来并说出原因，而不是让人点一下才撞到报错（第 14 节）。
     """
 
     id: int
@@ -243,6 +259,7 @@ class IntakeFileRefView:
     error_message: str | None
     discarded_at: datetime | None
     created_at: datetime
+    handed_off_item_count: int
 
     @classmethod
     def of(cls, batch_file: IntakeBatchFile) -> "IntakeFileRefView":
@@ -263,6 +280,9 @@ class IntakeFileRefView:
             error_message=batch_file.error_message,
             discarded_at=batch_file.discarded_at,
             created_at=batch_file.created_at,
+            handed_off_item_count=sum(
+                1 for item in batch_file.items if item.handed_off_at is not None
+            ),
         )
 
 
@@ -278,11 +298,18 @@ class IntakeGroupView:
     source_name: str | None
     source_name_normalized: str | None
     item_count: int
+    suggested_count: int = 0
 
 
 @dataclass(frozen=True)
 class IntakeBatchView:
-    """一个整理批次。`status` 是派生值，数据库里没有这一列。"""
+    """一个整理批次。`status` 是派生值，数据库里没有这一列。
+
+    `item_count` / `unfinished_item_count` 同样是**派生值**（第 22 节）：界面上那个
+    「确认完成所有填写」只有在这一批一项不剩时才按得动，而整理页只加载展开了的那
+    几组，数页面上的卡片数不到收起来的组里还剩几项——同「重试识别失败项」要问服务端
+    的那条理由（第 18 节 ①）。不另存一列：填没填完由那几页所在的单据说了算。
+    """
 
     id: int
     status: str
@@ -291,9 +318,16 @@ class IntakeBatchView:
     closed_at: datetime | None
     discarded_at: datetime | None
     files: tuple[IntakeFileRefView, ...]
+    item_count: int = 0
+    unfinished_item_count: int = 0
 
     @classmethod
     def of(cls, batch: IntakeBatch) -> "IntakeBatchView":
+        live = [
+            batch_file for batch_file in batch.files
+            if batch_file.status != INTAKE_FILE_STATUS_DISCARDED
+        ]
+        items = [item for batch_file in live for item in batch_file.items]
         return cls(
             id=batch.id,
             status=_batch_status(batch),
@@ -301,10 +335,10 @@ class IntakeBatchView:
             updated_at=batch.updated_at,
             closed_at=batch.closed_at,
             discarded_at=batch.discarded_at,
-            files=tuple(
-                IntakeFileRefView.of(batch_file)
-                for batch_file in batch.files
-                if batch_file.status != INTAKE_FILE_STATUS_DISCARDED
+            files=tuple(IntakeFileRefView.of(batch_file) for batch_file in live),
+            item_count=len(items),
+            unfinished_item_count=sum(
+                1 for item in items if _review_status(item) != "completed"
             ),
         )
 
@@ -331,13 +365,17 @@ class RegisteredFile:
 
 @dataclass(frozen=True)
 class DiscardedFile:
-    """一次文件回收的结果。
+    """一次文件移除的结果。
+
+    `ref` 是**删掉之前**那条引用的样子——调用方要据此说出「移除了哪一份」。
+    `removed_item_count` 是跟着一起删掉的内容数（界面用它说「3 项内容已撤下」）。
 
     `bytes_still_referenced` 回答「磁盘上那份字节现在能删了吗」：还有别的批次引用
     着就不能删，否则会把别人的原件一起删掉。本模块不删文件，只给出这个事实。
     """
 
     ref: IntakeFileRefView
+    removed_item_count: int
     bytes_still_referenced: bool
 
 
@@ -371,6 +409,86 @@ def _batch_status(batch: IntakeBatch) -> str:
     if batch.closed_at is not None:
         return BATCH_STATUS_CLOSED
     return BATCH_STATUS_OPEN
+
+
+def collapse_legacy_readings(readings: dict[str, Any]) -> dict[str, Any]:
+    """把 2026-11-24 之前存下来的那一对日期读法，在**读出来**的时候收成一条。
+
+    那天之前 `6/3/2026` 的 `recognition_payload` 里会存两条读法（mdy、dmy）、
+    没有 `assumed_order`；第 15 节定下默认按月/日/年读之后，新识别的只存一条并写明
+    依据。老记录不会自己变，所以这里替它补上同一个结论——否则卡片上只摆一个
+    「确认 6 月 3 日」，旁边那句说明却还在说「有两种读法，要人工确认」。
+
+    ⚠️ 只动**读出来的那一份字典**，库里的 payload 一个字不改；两种读法都成立
+    之外的情形（只有一条、读不出来、商家路由已经定死）原样返回。
+    """
+    entries = readings.get("readings")
+    if readings.get("assumed_order") or not isinstance(entries, list):
+        return readings
+    orders = {entry.get("order") for entry in entries if isinstance(entry, dict)}
+    if orders != {DATE_ORDER_MDY, DATE_ORDER_DMY}:
+        return readings
+    kept = [
+        entry for entry in entries
+        if isinstance(entry, dict) and entry.get("order") == DATE_ORDER_ASSUMED
+    ]
+    if len(kept) != 1:
+        return readings
+    return {**readings, "readings": kept, "assumed_order": DATE_ORDER_ASSUMED}
+
+
+def _visible_candidates(item: IntakeItem) -> tuple["IntakeCandidateView", ...]:
+    """这张卡片上要摆出来的候选。
+
+    只做一件事：**把 2026-11-24 之前存下来的那一对日期读法收成一条**。那天之前
+    `6/3/2026` 会存成两条候选（mdy 一条、dmy 一条）等人挑；第 15 节定下默认按
+    月/日/年读之后，新识别的只会有一条，而库里已有的那些不会自己变。不收的话，
+    同一条规则下的两张卡片会长得不一样——老的那张仍然摆两个按钮问「这是几月」。
+
+    ⚠️ 只收**同一段原文、读法恰好是 mdy 与 dmy 的那一对**；原文不同、或者本来就
+    只有一条的，一个都不动。候选记录本身也不动——这是**显示**上的收口，原文与
+    另一种读法仍留在 `intake_item_candidates` 和 `recognition_payload` 里。
+    """
+    views = [IntakeCandidateView.of(candidate) for candidate in item.candidates]
+    pairs: dict[str, set[str]] = {}
+    for view in views:
+        if view.field != INTAKE_CANDIDATE_FIELD_PURCHASE_DATE or view.basis != "paper":
+            continue
+        evidence = view.evidence or {}
+        raw = evidence.get("raw_text")
+        reading = evidence.get("reading")
+        if isinstance(raw, str) and reading in (DATE_ORDER_MDY, DATE_ORDER_DMY):
+            pairs.setdefault(raw, set()).add(reading)
+    superseded = {
+        raw for raw, orders in pairs.items()
+        if orders == {DATE_ORDER_MDY, DATE_ORDER_DMY}
+    }
+    if not superseded:
+        return tuple(views)
+    kept = []
+    for view in views:
+        evidence = view.evidence or {}
+        if (
+            view.field == INTAKE_CANDIDATE_FIELD_PURCHASE_DATE
+            and evidence.get("raw_text") in superseded
+            and evidence.get("reading") != DATE_ORDER_ASSUMED
+            and evidence.get("reading") in (DATE_ORDER_MDY, DATE_ORDER_DMY)
+        ):
+            continue
+        kept.append(view)
+    return tuple(kept)
+
+
+def _review_status(item: IntakeItem) -> str | None:
+    """这一页所在的填表草稿走到哪一步了；没有草稿时是 None。"""
+    link = item.review_link
+    if link is None or link.invoice is None:
+        return None
+    if link.invoice.voided_at is not None:
+        return "voided"
+    if link.invoice.completed_at is not None:
+        return "completed"
+    return "draft"
 
 
 def _maybe_json(raw: str | None) -> dict[str, Any] | None:
@@ -798,33 +916,94 @@ class IntakeService:
             return tuple(IntakeFileRefView.of(ref) for ref in rows)
 
     def discard_file(self, batch_file_id: int) -> DiscardedFile:
-        """把一个文件从批次里撤掉（文件回收）。
+        """把一个文件从批次里移除：**这份文件在这个批次里的记录一并删掉**。
 
-        行与它的内容**保留**：撤掉是一个可以反悔的动作，再传一次同一份文件会把这条
-        引用连同已有分类一起复活。磁盘上那份字节能不能删，看
-        `bytes_still_referenced`——本模块不删文件。
+        ⚠️ 2026-11-24 改掉了原来的软删（第 16 节）。原先撤掉只是标成 `discarded`、
+        页与分类都留着，再传一次同一份文件就连分类一起复活。用户的决定是
+        **「移除就当没传过，重新上传当作全新的文件」**：一份传错的文件留着一份看不见
+        的旧分类，下次传回来时会无声地带着它，那比丢掉分类更难查。
+
+        所以这里按顺序删：撤销日志里指向这些内容的条目（空掉的那次移动一并删，
+        一个什么都恢复不了的「撤销」是个陷阱）→ 送审链接（正常情况下没有，下面那道
+        闸门拦着）→ 内容（候选随 ORM 级联）→ 这条文件引用本身。删完之后同一份字节
+        再传进来就是一条全新的引用：新 id、新传入时刻、新切出来的页，什么都不带。
+
+        **不删的两样**：`intake_files` 里那行字节与磁盘上的原件。别的批次可能还引用着
+        同一份（`bytes_still_referenced` 回答这件事），而同一份字节重传时会被复用，
+        不会存第二份。已经进了填表的文件拦在外面——草稿是对着它填的。
         """
         with self._database.unit_of_work() as session:
             batch_file = self._load_batch_file(session, batch_file_id)
-            if any(item.handed_off_at is not None for item in batch_file.items):
-                raise ConflictError("文件已有内容进入审核，原件必须保留供核对。",
-                                    details={"batch_file_id": batch_file_id})
-            if batch_file.status != INTAKE_FILE_STATUS_DISCARDED:
-                batch_file.status = INTAKE_FILE_STATUS_DISCARDED
-                batch_file.discarded_at = utcnow()
-                session.flush()
+            handed_off = sum(
+                1 for item in batch_file.items if item.handed_off_at is not None
+            )
+            if handed_off:
+                # 指得出下一步：填表中的先撤回填表，已入库的走单据里的撤销确认。
+                raise ConflictError(
+                    f"这份文件有 {handed_off} 项已经开始填表或已入库，不能移除——"
+                    "原件要留着供核对。先在整理页撤回填表（已入库的走单据里的"
+                    "撤销确认与采购修订），再移除这份文件。",
+                    details={
+                        "batch_file_id": batch_file_id,
+                        "handed_off_item_count": handed_off,
+                    },
+                )
+            removed = IntakeFileRefView.of(batch_file)
+            item_ids = [item.id for item in batch_file.items]
+            if item_ids:
+                IntakeMoveRepository(session).forget_items(item_ids)
+                session.execute(
+                    delete(IntakeReviewLink).where(
+                        IntakeReviewLink.item_id.in_(item_ids)
+                    )
+                )
+            session.delete(batch_file)
+            session.flush()
             still = IntakeFileRepository(session).active_reference_count(
                 batch_file.intake_file_id
             )
             logger.info(
-                "intake file discarded batch_file=%s still_referenced=%s",
-                batch_file.id,
+                "intake file removed batch_file=%s items=%s still_referenced=%s",
+                removed.id,
+                len(item_ids),
                 still,
             )
             return DiscardedFile(
-                ref=IntakeFileRefView.of(batch_file),
+                ref=removed,
+                removed_item_count=len(item_ids),
                 bytes_still_referenced=still > 0,
             )
+
+    def delete_item(self, batch_id: int, item_id: int, *, version: int) -> None:
+        """Delete one unreviewed page/row from the organizing board.
+
+        A reviewed item belongs to a whole invoice and must use void_invoice,
+        which also reverses its booked purchases and removes sibling pages.
+        When this was the file's last item, remove the batch file reference so
+        uploading the same file again starts with fresh classification.
+        """
+        with self._database.unit_of_work() as session:
+            batch = self._load_batch(session, batch_id)
+            if batch.closed_at or batch.discarded_at:
+                raise ConflictError("这个批次已经结束，不能删除内容。")
+            item = self._load_item(session, item_id)
+            batch_file = item.batch_file
+            if batch_file.batch_id != batch_id:
+                raise NotFoundError("内容不在这个批次中。", details={"item_id": item_id})
+            if item.version != version:
+                raise ConflictError("内容版本已变化，请刷新。", details={"item_id": item_id, "current_version": item.version})
+            if item.handed_off_at is not None or session.query(IntakeReviewLink).filter_by(item_id=item_id).first():
+                raise ConflictError("这张内容已经开始填表，请删除对应的整张单据。", details={"item_id": item_id})
+            IntakeMoveRepository(session).forget_items([item_id])
+            session.delete(item)
+            session.flush()
+            remaining = session.query(IntakeItem).filter_by(batch_file_id=batch_file.id).count()
+            if remaining == 0:
+                session.expire(batch_file, ["items"])
+                session.delete(batch_file)
+            else:
+                batch_file.item_count = remaining
+            session.flush()
 
     # --- 内容与分组 ---------------------------------------------------------
 

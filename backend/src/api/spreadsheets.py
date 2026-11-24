@@ -5,7 +5,7 @@ import json
 
 from flask import Blueprint, current_app, jsonify, request, send_file
 
-from src.api.schemas import invoice_payload, query_bool, query_int, query_kind, query_text
+from src.api.schemas import invoice_payload, json_object, query_int, reject_unknown_fields
 from src.errors import ValidationError
 from src.factory import get_config, get_database, get_file_storage, get_recognizer
 from src.services.invoices import InvoiceService, UploadedFile
@@ -129,15 +129,10 @@ def get_template():
     return _download(template(extension), extension, "purchase-import-template")
 
 
-@spreadsheets_bp.get("/purchases/export")
+@spreadsheets_bp.post("/invoices/export")
 def export():
-    allowed = {"format", "food_item_id", "source", "date_from", "date_to", "undated", "kind", "include_voided"}
-    if set(request.args) - allowed:
-        raise ValidationError("导出使用筛选条件，不接受分页或未知参数。")
-    extension = request.args.get("format", "xlsx")
-    content = service().export(extension,
-        food_item_id=query_int(request.args, "food_item_id"), source=query_text(request.args, "source"),
-        date_from=query_text(request.args, "date_from"), date_to=query_text(request.args, "date_to"),
-        undated=query_bool(request.args, "undated"), kind=query_kind(request.args),
-        include_voided=bool(query_bool(request.args, "include_voided")))
-    return _download(content, extension, "purchase-details")
+    payload = json_object(request)
+    reject_unknown_fields(payload, {"format", "invoice_ids"})
+    extension = payload.get("format", "xlsx")
+    content = service().export(extension, payload.get("invoice_ids"))
+    return _download(content, extension, "selected-invoices")

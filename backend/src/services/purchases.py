@@ -62,6 +62,7 @@ from src.models import (
     utcnow,
 )
 from src.repositories.ingredients import FoodItemRepository
+from src.repositories.invoices import InvoiceRepository
 from src.repositories.purchases import PurchaseRepository, PurchaseRevisionRepository
 from src.services.ingredients import (
     BASE_UNITS,
@@ -643,18 +644,22 @@ class PurchaseService:
                 offset=checked_offset,
             )
 
-    def export_purchases(self, **filters: Any) -> tuple[PurchaseView, ...]:
-        """All matching current records in one snapshot; never just the UI page."""
-        result: list[PurchaseView] = []
+    def export_selected_invoices(self, invoice_ids: Any) -> tuple[PurchaseView, ...]:
+        """Export only active purchase rows from explicitly selected completed invoices."""
+        if (not isinstance(invoice_ids, list) or not invoice_ids
+                or len(invoice_ids) > 200 or any(type(id_) is not int or id_ < 1 for id_ in invoice_ids)
+                or len(set(invoice_ids)) != len(invoice_ids)):
+            raise ValidationError("请选择 1 至 200 张不同的已完成单据。", details={"field": "invoice_ids"})
         with self._database.unit_of_work() as session:
-            while True:
-                page = self.search_purchases(**filters, limit=MAX_LIMIT,
-                                             offset=len(result), session=session)
-                if page.total > 10000:
-                    raise ValidationError("一次最多导出 10000 条，请缩小日期或来源范围。")
-                result.extend(page.items)
-                if len(result) >= page.total:
-                    return tuple(result)
+            statuses = InvoiceRepository(session).export_statuses(invoice_ids)
+            invalid = [id_ for id_ in invoice_ids if not statuses.get(id_, False)]
+            if invalid:
+                raise ConflictError("所选单据中有待处理、已作废或不存在的单据，请刷新后重新勾选。",
+                                    details={"invoice_ids": invalid})
+            rows = PurchaseRepository(session).for_invoices(invoice_ids, limit=10001)
+            if len(rows) > 10000:
+                raise ValidationError("一次最多导出 10000 条采购明细，请减少勾选的单据。")
+            return tuple(PurchaseView.of(row) for row in rows)
 
     def list_revisions(self, purchase_id: int) -> list[PurchaseRevisionView]:
         with self._database.unit_of_work() as session:

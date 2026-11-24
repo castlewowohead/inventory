@@ -12,8 +12,9 @@
   查询时算，不改采购记录里的原始数量、单位与金额（docs/stru_dev.md 09.5）。
 - **多文件计划 M02（本文件当前内容）**：`intake_batches`、`intake_files`、
   `intake_batch_files`、`intake_items`、`intake_item_candidates`（混合上传的整理
-  批次，见 docs/multifiles.md M02）。⚠️ **日期/商家组没有落表**：组由内容上的
-  人工决定值派生，另存一张组表就会与内容打架。`invoice_files` 的两条既有约束
+  批次，见 docs/multifiles.md M02）。日期/商家内容组仍由内容派生；
+  `intake_date_groups` 只保存用户创建或曾经出现过的日期标题，允许空组保留。
+  `invoice_files` 的两条既有约束
   （`sha256` 全局唯一、一份文件只属一张单据）**一个字都没改**。
 
 命名约定不是风格偏好，而是迁移前提：SQLite 不支持大部分 ALTER，Alembic 要靠
@@ -1354,6 +1355,19 @@ class IntakeBatch(Base, TimestampMixin):
         return f"IntakeBatch(id={self.id!r}, closed_at={self.closed_at!r})"
 
 
+class IntakeDateGroup(Base):
+    """A date header kept after its last content moves away."""
+
+    __tablename__ = "intake_date_groups"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    batch_id: Mapped[int] = mapped_column(ForeignKey("intake_batches.id", ondelete="CASCADE"), nullable=False)
+    purchase_date: Mapped[date] = mapped_column(Date, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(UtcDateTime, nullable=False, default=utcnow)
+
+    __table_args__ = (UniqueConstraint("batch_id", "purchase_date"),)
+
+
 class IntakeFile(Base):
     """一份原件的字节，按内容摘要**一行一份**（第 5 节「原件字节只存一次」）。
 
@@ -1579,6 +1593,13 @@ class IntakeItem(Base, TimestampMixin):
         cascade="all, delete-orphan",
         order_by="IntakeItemCandidate.field, IntakeItemCandidate.id",
     )
+    # 这一页/这一行正在哪张填表草稿里（M08 建的链接，至多一条）。
+    # ⚠️ `viewonly` + `selectin`：它只是**读出来给界面用**的——整理页要能从卡片
+    # 直接回到那张草稿继续填（否则退出填表页就再也找不到入口），而建链接、删链接
+    # 一律走 services/intake_reviews.py 的事务，不经这个关系。
+    review_link: Mapped[Optional["IntakeReviewLink"]] = relationship(
+        viewonly=True, uselist=False, lazy="selectin",
+    )
 
     __table_args__ = (
         CheckConstraint(f"kind in ({_INTAKE_ITEM_KIND_SQL})", name="kind"),
@@ -1651,7 +1672,9 @@ class IntakeReviewLink(Base):
     )
 
     item: Mapped[IntakeItem] = relationship()
-    invoice: Mapped[Invoice] = relationship()
+    # `selectin`：整理页每张卡片都要说出「这张草稿是还在填、已经入库、还是被删了」，
+    # 逐条懒加载会在一屏卡片上发几十条查询。
+    invoice: Mapped[Invoice] = relationship(lazy="selectin")
 
 
 class IntakeItemCandidate(Base):

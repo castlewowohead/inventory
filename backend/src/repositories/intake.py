@@ -22,7 +22,7 @@ from __future__ import annotations
 
 from datetime import date
 
-from sqlalchemy import Select, func, or_, select
+from sqlalchemy import Select, exists, func, or_, select
 from sqlalchemy.orm import Session, joinedload, selectinload
 
 from src.models import (
@@ -85,11 +85,11 @@ class IntakeBatchRepository:
         return batch
 
     def latest_open(self) -> IntakeBatch | None:
-        """最近一个还在整理的批次（既没收口也没作废）。
+        """最近一个有文件可继续处理的开放批次。
 
         「恢复批次」用它：浏览器关掉再打开，老板应该接着整理上次那一批，而不是又
-        建一个空批次把同一天的内容分成两处。排序第二个键是 id——同一秒建的两个批次
-        必须有稳定次序。
+        建一个空批次把同一天的内容分成两处。空批次没有可恢复的工作，不应让首页
+        出现「接着整理」；等待切页或处理失败的文件仍算有工作。排序第二个键是 id。
         """
         statement = (
             select(IntakeBatch)
@@ -97,6 +97,10 @@ class IntakeBatchRepository:
             .where(
                 IntakeBatch.closed_at.is_(None),
                 IntakeBatch.discarded_at.is_(None),
+                exists(select(IntakeBatchFile.id).where(
+                    IntakeBatchFile.batch_id == IntakeBatch.id,
+                    IntakeBatchFile.status != INTAKE_FILE_STATUS_DISCARDED,
+                )),
             )
             .order_by(IntakeBatch.created_at.desc(), IntakeBatch.id.desc())
             .limit(1)

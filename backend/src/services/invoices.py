@@ -86,11 +86,14 @@ from src.models import (
     utcnow,
 )
 from src.repositories.invoices import (
+    LIST_ORDERS,
+    ORDER_BY_CREATED_AT,
     InvoiceFileRepository,
     InvoiceLineRepository,
     InvoiceRepository,
 )
 from src.repositories.extraction import ExtractionJobRepository
+from src.repositories.intake_moves import IntakeMoveRepository
 from src.repositories.intake_reviews import IntakeReviewRepository
 from src.normalization import normalize_date_text
 from src.repositories.ingredients import FoodItemRepository
@@ -479,6 +482,34 @@ class ConfirmOutcome:
 
 
 # --- 模块级辅助 -------------------------------------------------------------
+
+
+def _filter_date(value: Any, *, field: str) -> date | None:
+    """解析列表筛选用的日历日。空值表示「这一端不限」。
+
+    与录入用的 `parse_purchase_date` 分开，是因为两者该拦的东西不一样：录入时
+    拦住未来日期能挡下敲错的年份；**筛选**时拦住它反而会让「这个月」用不了——
+    今天是月中时，这个月的区间末端本来就在未来。筛出 0 条是无害的，拦下来却是
+    一个没法解释给用户听的报错。
+    """
+    if value is None:
+        return None
+    if isinstance(value, date) and not isinstance(value, datetime):
+        return value
+    if not isinstance(value, str):
+        raise ValidationError(
+            f"{field} 必须是 YYYY-MM-DD 形式的字符串。", details={"field": field}
+        )
+    text = value.strip()
+    if not text:
+        return None
+    try:
+        return date.fromisoformat(text)
+    except ValueError as exc:
+        raise ValidationError(
+            f"{field} 必须是 YYYY-MM-DD 形式的日历日（收到 {text!r}）。",
+            details={"field": field},
+        ) from exc
 
 
 def _expire_collections(session: Session, invoice: Invoice) -> None:
@@ -1118,26 +1149,53 @@ class InvoiceService:
         *,
         completed: bool | None = None,
         source: str | None = None,
+        date_from: Any = None,
+        date_to: Any = None,
+        order: Any = ORDER_BY_CREATED_AT,
         include_voided: bool = False,
         limit: int = DEFAULT_LIMIT,
         offset: int = 0,
     ) -> InvoicePage:
-        """按「做完了没有」与采购来源查单据，上传时间倒序。
+        """按「做完了没有」、采购来源与采购日期区间查单据。
 
         `completed=False` 就是老板的待办清单。列表不算行匹配候选（见
         `InvoiceLineView` 的说明）。
+
+        `date_from` / `date_to` 是闭区间，按**单据上的采购日期**筛，于是界面上的
+        界面上选定的时间范围就是这一对参数，后端不必认识「周」这个概念。
+        ⚠️ 区间**排除**没有日期的单据，它们落在任何区间之外。
+
+        `order` 两种：`created_at`（默认，刚录进来的在最前）与 `invoice_date`
+        （单据上的采购日期）。六月一日补录一张五月二十二日的单子，两者差着十天，
+        所以待办清单用前者、翻历史用后者，不能拿一个冒充另一个。
         """
         clean_limit = require_limit(limit, max_limit=MAX_LIMIT)
         clean_offset = require_offset(offset)
         clean_source = optional_text(
             source, field="source", max_length=SOURCE_NAME_MAX_LENGTH
         )
+        parsed_from = _filter_date(date_from, field="date_from")
+        parsed_to = _filter_date(date_to, field="date_to")
+        if parsed_from and parsed_to and parsed_from > parsed_to:
+            raise ValidationError(
+                f"date_from（{parsed_from.isoformat()}）不能晚于 "
+                f"date_to（{parsed_to.isoformat()}）。",
+                details={"field": "date_from"},
+            )
+        if order not in LIST_ORDERS:
+            raise ValidationError(
+                f"order 只能是 {' 或 '.join(sorted(LIST_ORDERS))}，收到 {order!r}。",
+                details={"field": "order"},
+            )
         with self._database.unit_of_work() as session:
             rows, total = InvoiceRepository(session).search(
                 completed=completed,
                 source_normalized=(
                     normalize_name(clean_source) if clean_source else None
                 ),
+                date_from=parsed_from,
+                date_to=parsed_to,
+                order=order,
                 include_voided=include_voided,
                 limit=clean_limit,
                 offset=clean_offset,
@@ -1622,6 +1680,13 @@ class InvoiceService:
         409 并指回那张**界面上已经看不见**的单据——图传不进来，单据也打不开。
 
         原件删除后可以重新上传相同文件；已作废采购记录仍可追溯，但原图不再可查看。
+
+        **批次来的单据：它在整理页上的那几页内容一并真删**（2026-11-24 反馈，
+        第 17 节 ④）。用户的话是「清空数据，并彻底移除本张单据」，而一张删掉的单据
+        在整理页上留几张「草稿已作废」的卡片，正是那种**界面上看得见、却什么也不
+        回答**的残留。删的顺序与移除文件那条路一样（第 16 节）：撤销日志里指向这些
+        内容的条目 → 送审链接 → 内容本身（候选随 ORM 级联）。`intake_files` 里的
+        字节与磁盘上的原件**不删**——那份 PDF 的其它页可能还在整理页上。
         """
         with self._database.unit_of_work() as session:
             invoice = self._load_invoice(session, invoice_id)
@@ -1669,6 +1734,21 @@ class InvoiceService:
                 line.version += 1
             invoice.completed_at = None
             invoice.voided_at = utcnow()
+            # 整理页上的那几页：链接、撤销日志条目、内容本身，一起真删。
+            links = IntakeReviewRepository(session).links_for_invoice(invoice.id)
+            intake_items = [link.item for link in links]
+            if intake_items:
+                IntakeMoveRepository(session).forget_items([item.id for item in intake_items])
+                for link in links:
+                    session.delete(link)
+                session.flush()
+                for item in intake_items:
+                    session.delete(item)
+                logger.info(
+                    "invoice voided with intake contents invoice=%s items=%s",
+                    invoice.id,
+                    len(intake_items),
+                )
             try:
                 session.flush()
             except IntegrityError as exc:
@@ -2546,19 +2626,26 @@ class InvoiceService:
             lines.append(InvoiceLineView.of(line, candidates=candidates))
 
         duplicates: tuple[int, ...] = ()
-        if (
-            invoice.source_name_normalized
-            and invoice.invoice_number_normalized
-            and invoice.invoice_total is not None
-        ):
-            duplicates = tuple(
-                InvoiceRepository(session).find_possible_duplicates(
-                    exclude_invoice_id=invoice.id,
-                    source_normalized=invoice.source_name_normalized,
-                    number_normalized=invoice.invoice_number_normalized,
-                    total=invoice.invoice_total,
+        if invoice.source_name_normalized and invoice.invoice_total is not None:
+            if invoice.invoice_number_normalized:
+                duplicates = tuple(
+                    InvoiceRepository(session).find_possible_duplicates(
+                        exclude_invoice_id=invoice.id,
+                        source_normalized=invoice.source_name_normalized,
+                        number_normalized=invoice.invoice_number_normalized,
+                        total=invoice.invoice_total,
+                    )
                 )
-            )
+            elif invoice.invoice_date is not None:
+                # 没有单号时用采购日期补它的位置，见仓储层那条方法的说明。
+                duplicates = tuple(
+                    InvoiceRepository(session).find_possible_duplicates_unnumbered(
+                        exclude_invoice_id=invoice.id,
+                        source_normalized=invoice.source_name_normalized,
+                        invoice_date=invoice.invoice_date,
+                        total=invoice.invoice_total,
+                    )
+                )
 
         intake_sources = tuple({
             "batch_id": link.item.batch_file.batch_id,

@@ -76,6 +76,20 @@ DATE_ORDER_MDY = "mdy"
 DATE_ORDER_DMY = "dmy"
 DATE_ORDERS = (DATE_ORDER_STRICT, DATE_ORDER_MDY, DATE_ORDER_DMY)
 
+DATE_ORDER_ASSUMED = DATE_ORDER_MDY
+"""日/月顺序**文本本身定不死**时按哪种读法算（docs/multifiles.md 第 15 节）。
+
+本项目服务的是美国餐厅，收到的是美国供应商开的单据，`6/3/2026` 在那张纸上就是
+6 月 3 日——用户的原话是「这个就根本没有歧义」。所以这里不是「猜一个」，而是
+**说清楚默认按哪种人类书写习惯读**：
+
+- 文本自己定得死的照旧（`2026-06-03`、`18/6/2026`、`June 3, 2026`）。
+- 某家商家的 `ocr_routes.date_order` 明确写了 `mdy` / `dmy` 的，**那一条优先**——
+  确认过的商家比默认值更有证据。
+- 只有两种读法都成立、又没人确认过商家时，才落到这个默认值上，并且把原文、
+  「这是默认读法」一并记在证据里，商家确认之后仍可用原文重新解析。
+"""
+
 # 币种代码前后缀与货币符号。剥掉它们不改变数值，所以不算"猜"。
 _CURRENCY_CODE = re.compile(
     r"^(?:USD|CNY|RMB|EUR|GBP|CAD|AUD|JPY)\s*|\s*(?:USD|CNY|RMB|EUR|GBP|CAD|AUD|JPY)$",
@@ -450,13 +464,20 @@ class DateReadings:
       比留一个空格子有用得多，而且**两条都只是候选，没有一条会自己变成决定**
       （docs/multifiles.md 第 4 节）。
 
-    `ambiguous` 为 True 时 `readings` 恰好有两条（mdy 与 dmy），顺序是 mdy 在前
-    ——⚠️ 这个顺序**不表示 mdy 更可能**，只是为了让界面有稳定次序。谁对要么看
-    纸面上别的线索，要么等这家商家的 `date_order` 定下来。
+    `ambiguous` 为 True 时**文本本身定不死**。此时有两种结局，由 `assume_order`
+    决定：
+
+    - 没传 `assume_order`：`readings` 恰好有两条（mdy 在前、dmy 在后）。⚠️ 这个
+      顺序**不表示 mdy 更可能**，只是为了让界面有稳定次序。
+    - 传了（整理与审核都传 `DATE_ORDER_ASSUMED`）：`readings` 只有被选中的那一条，
+      `assumed_order` 说出是按哪种习惯读的。`ambiguous` **仍然是 True**——文本确实
+      定不死，这是一条该留痕的事实，只是本项目已经替它定了默认读法。
     """
 
     readings: tuple[DateReading, ...] = dataclass_field(default_factory=tuple)
     ambiguous: bool = False
+    assumed_order: str | None = None
+    """不为 None 时：这个日期是按默认习惯读出来的，不是文本自己定死的。"""
     notes: tuple[str, ...] = dataclass_field(default_factory=tuple)
     problem: str | None = None
 
@@ -471,7 +492,11 @@ class DateReadings:
 
 
 def date_text_readings(
-    raw: str, *, date_order: str = DATE_ORDER_STRICT, allow_short_year: bool = False
+    raw: str,
+    *,
+    date_order: str = DATE_ORDER_STRICT,
+    allow_short_year: bool = False,
+    assume_order: str | None = None,
 ) -> DateReadings:
     """一个日期原文能成立的全部读法。**一个字都不猜，但也不把歧义丢掉。**
 
@@ -481,12 +506,17 @@ def date_text_readings(
     | --- | --- | --- |
     | `2026-11-08` | 任意 | 一条读法，`ambiguous=False` |
     | `6/11/2026` | `strict` | **两条**读法（6 月 11 日 / 11 月 6 日），`ambiguous=True` |
+    | `6/11/2026` | `strict` + `assume_order="mdy"` | 一条读法（6 月 11 日），`ambiguous=True`、`assumed_order="mdy"` |
     | `6/11/2026` | `mdy` | 一条读法（6 月 11 日）——这家商家说过它写月/日/年 |
     | `这是什么` | 任意 | 零条读法，`problem` 说明原因 |
 
     ⚠️ **`date_order` 只能来自人工确认过的商家**（docs/multifiles.md M05）：拿一个
     还没人确认的商家候选去套它的日/月顺序，等于用相似度决定了一个日历日，而那种
     错误不报错——它只是把这笔采购算进了错误的月份。
+
+    `assume_order` 是另一回事：它与「这页看起来像哪家」无关，是**整个项目**的默认
+    书写习惯（`DATE_ORDER_ASSUMED`，第 15 节）。商家路由说了话时轮不到它——调用方
+    只在 `date_order` 仍是 `strict` 时才传它。
     """
     if date_order not in DATE_ORDERS:
         raise ValueError(f"date_order={date_order!r} 无效，可选：{DATE_ORDERS}")
@@ -519,11 +549,33 @@ def date_text_readings(
         return DateReadings(notes=direct.notes, problem=direct.problem)
 
     assert as_mdy.text is not None and as_dmy.text is not None
+    both = (
+        DateReading(as_mdy.text, DATE_ORDER_MDY, f"按「月/日/年」读 {raw!r}"),
+        DateReading(as_dmy.text, DATE_ORDER_DMY, f"按「日/月/年」读 {raw!r}"),
+    )
+    if assume_order in (DATE_ORDER_MDY, DATE_ORDER_DMY):
+        chosen = both[0] if assume_order == DATE_ORDER_MDY else both[1]
+        other = both[1] if assume_order == DATE_ORDER_MDY else both[0]
+        habit = "月/日/年" if assume_order == DATE_ORDER_MDY else "日/月/年"
+        return DateReadings(
+            readings=(
+                DateReading(
+                    chosen.text,
+                    chosen.order,
+                    f"{chosen.note}（默认按{habit}这一书写习惯读）",
+                ),
+            ),
+            ambiguous=True,
+            assumed_order=assume_order,
+            notes=tuple(direct.notes) + (
+                f"{raw!r} 的日/月顺序文本本身定不死，按默认的{habit}读作 "
+                f"{chosen.text}；另一种读法是 {other.text}。"
+                "确认商家并给这家设 date_order 之后可以用保存的原文重新解析。",
+            ),
+            problem=direct.problem,
+        )
     return DateReadings(
-        readings=(
-            DateReading(as_mdy.text, DATE_ORDER_MDY, f"按「月/日/年」读 {raw!r}"),
-            DateReading(as_dmy.text, DATE_ORDER_DMY, f"按「日/月/年」读 {raw!r}"),
-        ),
+        readings=both,
         ambiguous=True,
         notes=tuple(direct.notes) + (
             f"{raw!r} 的日/月顺序文本本身定不死，两种读法都留着等人确认；"

@@ -1,10 +1,11 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref } from 'vue'
 import {
-  ApiError, createIntakeBatch, errorMessage, getCurrentIntakeBatch, getIntakeBatch,
-  getIntakeBatchFileOriginal, processIntakeBatch, type IntakeBatch
+  ApiError, createIntakeBatch, discardIntakeBatchFile, errorMessage, getCurrentIntakeBatch,
+  getIntakeBatch, getIntakeBatchFileOriginal, processIntakeBatch,
+  type IntakeBatch, type IntakeBatchFile
 } from '../../shared/api'
-import { formatBytes } from '../../shared/format'
+import { formatBytes, formatLocalClock } from '../../shared/format'
 import { downloadAttachment } from '../../shared/platform/download'
 import { pickIntakeFiles, isCancelledPick, type PickedFile } from '../../shared/platform/filePicker'
 import { registerLeaveGuard } from '../../shared/platform/leaveGuard'
@@ -24,6 +25,10 @@ const running = ref(false)
 const processing = ref(false)
 const error = ref('')
 const tableKey = ref<number | null>(null)
+const askRemove = ref<IntakeBatchFile | null>(null)
+const removing = ref(false)
+const removeFailed = ref('')
+const notice = ref('')
 let nextKey = 0
 let stopped = false
 let active: UploadHandle<unknown> | null = null
@@ -46,6 +51,7 @@ function add(files: PickedFile[]) {
   }
 }
 function choose() {
+  notice.value = ''
   // Keep the picker in the click gesture; a batch can contain more than one invoice.
   pickIntakeFiles().then((files) => { add(files); if (batch.value && !running.value && tableKey.value === null) void run() })
     .catch((reason) => { if (!isCancelledPick(reason)) error.value = errorMessage(reason) })
@@ -124,6 +130,44 @@ function tableClosed() {
   void run()
 }
 function remove(key: number) { if (!running.value && tableKey.value === null) queue.value = queue.value.filter((item) => item.key !== key) }
+/**
+ * A file whose pages are already in a draft must stay: the draft is filled against
+ * this original. The button says so before it is pressed instead of letting the
+ * server answer with a 409 after the click (plan section 14).
+ *
+ * ⚠️ Since 2026-11-24 removing is a real delete (section 16): the pages and whatever
+ * was classified on them go with the file, and re-uploading it starts from scratch.
+ * That is why the button is red and the dialog says so in as many words.
+ */
+function blockedReason(file: IntakeBatchFile): string {
+  if (!file.handed_off_item_count) return ''
+  return `有 ${file.handed_off_item_count} 项已经开始填表或已入库，先在整理页撤回填表再移除。`
+}
+function startRemove(file: IntakeBatchFile) {
+  if (!canUpload.value || blockedReason(file)) return
+  removeFailed.value = ''
+  askRemove.value = file
+}
+async function confirmRemove() {
+  const file = askRemove.value
+  if (!file || !batch.value || removing.value) return
+  removing.value = true
+  try {
+    const result = await discardIntakeBatchFile(batch.value.id, file.id)
+    // The local list is what the person just chose; keep it in step with the batch.
+    queue.value = queue.value.filter((item) => !(item.state === 'done'
+      && item.file.name === file.original_name && item.file.size === file.size))
+    askRemove.value = null
+    notice.value = result.removed_item_count
+      ? `已移除 ${file.original_name}，连同它的 ${result.removed_item_count} 项内容和做过的分类。重新上传会当作全新的一份。`
+      : `已移除 ${file.original_name}。重新上传会当作全新的一份。`
+    await refresh()
+  } catch (reason) {
+    // Stays in the dialog: the person's finger is here, and the top of the card is not.
+    removeFailed.value = errorMessage(reason)
+    await refresh()
+  } finally { removing.value = false }
+}
 async function original(fileId: number, name: string) {
   if (!batch.value) return
   try { downloadAttachment(await getIntakeBatchFileOriginal(batch.value.id, fileId), name) }
@@ -140,7 +184,9 @@ onUnmounted(() => { stopped = true; stopGuard(); active?.abort(); if (poll) clea
 
 <template>
   <view class="ui-card batch-panel">
-    <text class="title">混合文件整理批次{{ batch ? ` #${batch.id}` : '' }}</text>
+    <!-- 同第 19 节：批次号是库里的主键，界面上回答不了任何问题（这里也从来
+         没有「挑一个批次」这回事）。它留在 URL、接口和下面这个属性里。 -->
+    <text class="title" :data-batch-id="batch ? batch.id : undefined">上传单据</text>
     <text class="muted">图片与 PDF 按页、CSV 与 XLSX 按行保存。上传后仍需整理和审核，才会进入采购历史。</text>
     <button class="ui-button ghost back-list" @click="emit('list')">返回单据列表</button>
     <text v-if="loading" role="status">正在读取批次…</text>
@@ -148,20 +194,30 @@ onUnmounted(() => { stopped = true; stopGuard(); active?.abort(); if (poll) clea
     <template v-else>
       <text v-if="!canUpload" class="muted">这个批次已结束，可回看文件；继续录入请新建一批。</text>
       <view class="actions">
-        <button class="ui-button" :disabled="!canUpload || running || tableKey !== null" @click="choose">继续选择文件</button>
-        <button class="ui-button secondary" :disabled="running || tableKey !== null" @click="emit('organize', batch.id)">按日期和商家整理</button>
+        <!-- 主按钮是「开始填表」（2026-11-24 反馈，第 22 节）：文件传完了之后，这一页上
+             要做的下一件事就是它；「继续选择文件」退成白色。原来那个名字「按日期和商家整理」
+             说的是下一页叫什么，不是点它要干什么。 -->
+        <button class="ui-button secondary" :disabled="!canUpload || running || tableKey !== null" @click="choose">继续选择文件</button>
+        <button class="ui-button" :disabled="running || tableKey !== null" @click="emit('organize', batch.id)">开始填表</button>
         <button class="ui-button secondary" :disabled="processing" @click="refresh">刷新状态</button>
         <button v-if="batch.files.some(file => file.status === 'pending' || file.status === 'failed')" class="ui-button secondary" :disabled="processing" @click="process(true)">重试文件处理</button>
       </view>
       <text class="muted">可选 JPG、JPEG、PNG、HEIC、PDF、CSV、XLSX；单文件默认不超过 20 MB。服务端仍会最终校验。</text>
-      <view v-if="batch.files.length" class="files">
+      <view v-if="batch.files.length" class="files saved">
         <text class="section-title">已保存的文件 · {{ batch.files.length }}</text>
+        <text v-if="notice" class="muted" role="status">{{ notice }}</text>
         <view v-for="file in batch.files" :key="file.id" class="file-row">
-          <view><text class="name">{{ file.original_name }}</text><text class="muted">{{ formatBytes(file.size) }} · {{ file.status === 'pending' ? '等待处理' : file.status === 'ready' ? `已处理 · ${file.item_count ?? 0} 项` : file.status === 'failed' ? '处理失败' : '已移除' }}</text><text v-if="file.error" class="error">{{ file.error.message }}</text></view>
-          <button class="ui-button ghost" @click="original(file.id, file.original_name)">下载原件</button>
+          <view><text class="name">{{ file.original_name }}</text><text class="muted">{{ formatBytes(file.size) }} · {{ file.status === 'pending' ? '等待处理' : file.status === 'ready' ? `已处理 · ${file.item_count ?? 0} 项` : file.status === 'failed' ? '处理失败' : '已移除' }} · {{ formatLocalClock(file.created_at) }} 传入</text><text v-if="file.error" class="error">{{ file.error.message }}</text><text v-if="blockedReason(file)" class="muted">{{ blockedReason(file) }}</text></view>
+          <view class="row-actions">
+            <button class="ui-button ghost" @click="original(file.id, file.original_name)">下载原件</button>
+            <!-- 传错了的文件在这里撤下来。暗着的那一个在上面一行说得出原因，手机上没有悬停也看得见。 -->
+            <button v-if="canUpload" class="ui-button danger" :disabled="!!blockedReason(file)"
+              :title="blockedReason(file) || undefined" :aria-label="`移除 ${file.original_name}`"
+              @click="startRemove(file)">移除</button>
+          </view>
         </view>
       </view>
-      <view v-if="queue.length" class="files">
+      <view v-if="queue.length" class="files chosen">
         <text class="section-title">本次选择</text>
         <view v-for="item in queue" :key="item.key" class="file-row">
           <view><text class="name">{{ item.file.name }}</text><text class="muted">{{ formatBytes(item.file.size) }} · {{ item.state === 'invalid' ? '本地校验未通过' : item.state === 'uploading' ? '上传中' : item.state === 'done' ? '已保存' : item.state === 'failed' ? '待重试' : '待上传' }}</text><text v-if="item.message" class="error">{{ item.message }}</text><view v-if="item.state === 'uploading'" class="progress" role="progressbar" :aria-valuenow="item.progress" aria-valuemin="0" aria-valuemax="100"><view :style="{ width: item.progress + '%' }"></view></view><text v-if="item.state === 'uploading'" class="muted">{{ item.progress }}%</text></view>
@@ -173,6 +229,23 @@ onUnmounted(() => { stopped = true; stopGuard(); active?.abort(); if (poll) clea
       <text v-if="processing" role="status">正在处理已保存的文件…</text>
     </template>
     <text v-if="error" role="alert" class="error">{{ error }}</text>
+
+    <view v-if="askRemove" class="overlay" @click.self="askRemove = null">
+      <view class="ui-card sheet" role="dialog" aria-modal="true" aria-label="移除这份文件">
+        <text class="sheet-title">移除 {{ askRemove.original_name }}？</text>
+        <text class="muted">
+          它切出的 {{ askRemove.item_count ?? 0 }} 项内容会从整理页撤下，这些内容上做过的日期、商家分类一并删掉。
+        </text>
+        <text class="muted">
+          这一步不能反悔：重新上传同一份文件会被当作全新的一份，之前做过的分类不会回来。
+        </text>
+        <text v-if="removeFailed" role="alert" class="error">{{ removeFailed }}</text>
+        <view class="sheet-actions">
+          <button class="ui-button danger" :disabled="removing" @click="confirmRemove">移除这份文件</button>
+          <button class="ui-button secondary" :disabled="removing" @click="askRemove = null">取消</button>
+        </view>
+      </view>
+    </view>
   </view>
 </template>
 
@@ -184,5 +257,12 @@ onUnmounted(() => { stopped = true; stopGuard(); active?.abort(); if (poll) clea
 .file-row > view:first-child { min-width:0; display:flex; flex-direction:column; gap:4px; }.name { overflow-wrap:anywhere; }
 .error { color:var(--error); font-size:13px; }.progress { width:100%; height:8px; background:#e6ece7; border-radius:4px; overflow:hidden; }.progress view { height:100%; background:var(--green); }
 .back-list { align-self:flex-start; }
+.row-actions { display:flex; flex-wrap:wrap; align-items:center; gap:8px; }
+/* 红的：它真的会把这份文件的内容和分类删掉（第 16 节）。确认仍在对话框里问一次。 */
+.ui-button.danger { border-color:var(--error); background:var(--error); color:#fff; }
+.overlay { position:fixed; inset:0; z-index:20; display:flex; align-items:center; justify-content:center; padding:16px; background:rgba(23,59,46,.45); }
+.sheet { width:min(100%, 420px); max-height:86vh; overflow-y:auto; display:flex; flex-direction:column; gap:10px; padding:20px; }
+.sheet-title { font-size:16px; font-weight:700; overflow-wrap:anywhere; }
+.sheet-actions { display:flex; flex-wrap:wrap; gap:10px; margin-top:4px; }
 @media(max-width:899px) { .batch-panel { padding:16px; }.file-row { flex-direction:column; } }
 </style>

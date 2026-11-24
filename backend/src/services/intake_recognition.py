@@ -97,6 +97,7 @@ from src.models import (
     INTAKE_RECOGNITION_STATUS_DONE,
 )
 from src.normalization import (
+    DATE_ORDER_ASSUMED,
     DATE_ORDER_STRICT,
     DateReadings,
     date_text_readings,
@@ -330,7 +331,9 @@ class IntakeRecognitionService:
                 )
             )
         elif date_raw is not None:
-            readings = date_text_readings(date_raw, allow_short_year=True)
+            readings = date_text_readings(
+                date_raw, allow_short_year=True, assume_order=DATE_ORDER_ASSUMED
+            )
             for reading in readings.readings:
                 date_candidates.append(
                     CandidateInput(
@@ -672,15 +675,25 @@ class IntakeRecognitionService:
         if supplier_note:
             all_notes.append(supplier_note)
         if date_payload.get("ambiguous"):
-            all_notes.append(
-                "日期的日/月顺序**文本本身定不死**，两种读法都留着当候选。"
-                "确认这张卡片的商家、并在这家的路由上设 date_order 之后，"
-                "可以用保存下来的原文重新解析——**不必再识别一次**。"
-            )
+            assumed = date_payload.get("assumed_order")
+            if assumed:
+                habit = "月/日/年" if assumed == DATE_ORDER_ASSUMED else "日/月/年"
+                all_notes.append(
+                    f"日期的日/月顺序**文本本身定不死**，按默认的{habit}读。"
+                    "原文留着：确认这张卡片的商家、并在这家的路由上设 date_order "
+                    "之后可以重新解析——**不必再识别一次**。"
+                )
+            else:
+                all_notes.append(
+                    "日期的日/月顺序**文本本身定不死**，两种读法都留着当候选。"
+                    "确认这张卡片的商家、并在这家的路由上设 date_order 之后，"
+                    "可以用保存下来的原文重新解析——**不必再识别一次**。"
+                )
         if date_order == DATE_ORDER_STRICT and order_from == DATE_ORDER_FROM_DEFAULT:
             all_notes.append(
                 "这张卡片的商家**还没人工确认**，所以不套用任何一家的日/月顺序："
-                "拿相似度猜出来的商家去定日历日，错了也不会报错。"
+                "拿相似度猜出来的商家去定日历日，错了也不会报错。歧义写法按本项目"
+                "默认的月/日/年读，原文仍留着可重新解析。"
             )
 
         payload = {
@@ -774,7 +787,10 @@ class IntakeRecognitionService:
             candidates: list[CandidateInput] = []
         else:
             readings = date_text_readings(
-                raw_text, date_order=date_order, allow_short_year=True
+                raw_text,
+                date_order=date_order,
+                allow_short_year=True,
+                assume_order=DATE_ORDER_ASSUMED,
             )
             candidates = [
                 CandidateInput(
@@ -785,6 +801,7 @@ class IntakeRecognitionService:
                         "reading": reading.order,
                         "note": reading.note,
                         "ambiguous": readings.ambiguous,
+                        "assumed_order": readings.assumed_order,
                         "date_order": date_order,
                         "date_order_from": order_from,
                         "confirmed_source": confirmed,
@@ -808,6 +825,7 @@ class IntakeRecognitionService:
         payload["date_readings"] = {
             "raw_text": raw_text,
             "ambiguous": readings.ambiguous,
+            "assumed_order": readings.assumed_order,
             "problem": readings.problem,
             "readings": [
                 {"value": item.text, "order": item.order, "note": item.note}
@@ -955,11 +973,16 @@ def _date_candidates(
 
     raw_text = found.raw_text or ""
     readings = date_text_readings(
-        raw_text, date_order=date_order, allow_short_year=True
+        raw_text,
+        date_order=date_order,
+        allow_short_year=True,
+        # 商家路由说了话时这个参数轮不到（`date_text_readings` 自己会让路）。
+        assume_order=DATE_ORDER_ASSUMED,
     )
     payload = {
         "raw_text": raw_text,
         "ambiguous": readings.ambiguous,
+        "assumed_order": readings.assumed_order,
         "problem": readings.problem,
         "date_order": date_order,
         "readings": [
@@ -977,6 +1000,7 @@ def _date_candidates(
                 "reading": reading.order,
                 "note": reading.note,
                 "ambiguous": readings.ambiguous,
+                "assumed_order": readings.assumed_order,
                 "date_order": date_order,
                 "page": found.page,
                 "provider": result.provider,

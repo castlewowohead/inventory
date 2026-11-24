@@ -63,7 +63,7 @@ const draft = reactive({ description: '', quantity: '', purchaseUnit: '', unitPr
             <view class="field"><text class="field-label">数量</text><input v-model="draft.quantity" class="ui-input" inputmode="decimal" placeholder="留空表示未知" /></view>
             <view class="field"><text class="field-label">采购单位</text><input v-model="draft.purchaseUnit" class="ui-input" placeholder="例如 lb" /></view>
             <view class="field"><text class="field-label">单价</text><input v-model="draft.unitPrice" class="ui-input" inputmode="decimal" placeholder="留空表示未知" /></view>
-            <view class="field"><text class="field-label">行金额</text><input v-model="draft.lineAmount" class="ui-input" inputmode="decimal" placeholder="留空表示未知" /></view>
+            <view class="field"><text class="field-label">金额</text><input v-model="draft.lineAmount" class="ui-input" inputmode="decimal" placeholder="留空表示未知" /></view>
           </view>
           <text class="placeholder draft-note">仅供排版与焦点预览；输入不会保存，也不会生成采购记录。</text>
           <view class="desktop-actions"><button class="ui-button" disabled>确认此行</button><button class="ui-button secondary" disabled>跳过此行</button></view>

@@ -50,7 +50,7 @@ export const FIELD_LABEL: Record<DraftField | 'line_kind' | 'food_item_id', stri
   quantity: '数量',
   purchase_unit: '采购单位',
   unit_price: '单价',
-  line_amount: '行金额',
+  line_amount: '金额',
   purchase_date: '日期',
   source_name: '来源',
   currency: '币种',

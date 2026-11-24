@@ -701,6 +701,79 @@ def test_the_list_paginates(migrated_client: FlaskClient) -> None:
     assert (len(body["items"]), body["total"], body["limit"]) == (2, 3, 2)
 
 
+def _dated(client: FlaskClient, *, day: str | None, source: str, index: int) -> int:
+    """建一张带日期与来源的单据，返回它的 id。"""
+    invoice_id = post_invoice(
+        client, content=f"photo {index}".encode(), name=f"p{index}.png"
+    )["id"]
+    response = client.patch(
+        f"/api/invoices/{invoice_id}",
+        json={"invoice_date": day, "source_name": source},
+    )
+    assert response.status_code == 200, response.get_json()
+    return invoice_id
+
+
+def test_the_list_filters_by_purchase_date_range(migrated_client: FlaskClient) -> None:
+    """某天 / 某周 / 某月都是同一个闭区间参数的不同宽度。"""
+    june_03 = _dated(migrated_client, day="2026-06-03", source="Costco", index=0)
+    june_08 = _dated(migrated_client, day="2026-06-08", source="Costco", index=1)
+    july_01 = _dated(migrated_client, day="2026-07-01", source="Costco", index=2)
+
+    one_day = migrated_client.get("/api/invoices?date_from=2026-06-08&date_to=2026-06-08")
+    assert [item["id"] for item in one_day.get_json()["items"]] == [june_08]
+
+    one_month = migrated_client.get("/api/invoices?date_from=2026-06-01&date_to=2026-06-30")
+    assert {item["id"] for item in one_month.get_json()["items"]} == {june_03, june_08}
+    assert one_month.get_json()["total"] == 2
+
+    open_end = migrated_client.get("/api/invoices?date_from=2026-07-01")
+    assert [item["id"] for item in open_end.get_json()["items"]] == [july_01]
+
+
+def test_a_date_range_excludes_invoices_without_a_date(
+    migrated_client: FlaskClient,
+) -> None:
+    """没有日期的单据落在任何区间之外——这是期望行为，不是漏行。"""
+    dated = _dated(migrated_client, day="2026-06-03", source="Costco", index=0)
+    post_invoice(migrated_client, content=b"no date", name="nodate.png")
+
+    june = migrated_client.get("/api/invoices?date_from=2026-06-01&date_to=2026-06-30")
+    assert [item["id"] for item in june.get_json()["items"]] == [dated]
+
+    assert migrated_client.get("/api/invoices?date_from=06/08/2026").status_code == 400
+    assert migrated_client.get(
+        "/api/invoices?date_from=2026-07-01&date_to=2026-06-01"
+    ).status_code == 400
+
+
+def test_the_two_list_orders_answer_two_different_questions(
+    migrated_client: FlaskClient,
+) -> None:
+    """录入次序与采购日期次序**故意**相反，这样两种排法才区分得开。
+
+    六月一日补录一张五月二十二日的单子，两者差着十天；用一个键冒充另一个，
+    「最近录了什么」和「这批货是哪天进的」就会是同一份名单。
+    """
+    newest_purchase = _dated(migrated_client, day="2026-06-08", source="Costco", index=0)
+    middle = _dated(migrated_client, day="2026-06-03", source="Costco", index=1)
+    oldest_purchase = _dated(migrated_client, day="2026-05-22", source="Costco", index=2)
+    undated = post_invoice(migrated_client, content=b"no date", name="nodate.png")["id"]
+
+    # 默认（待办清单）：刚录进来的在最前，与单据上的日期无关。
+    by_creation = [item["id"] for item in migrated_client.get("/api/invoices").get_json()["items"]]
+    assert by_creation == [undated, oldest_purchase, middle, newest_purchase]
+    assert by_creation == [item["id"] for item in
+                           migrated_client.get("/api/invoices?order=created_at").get_json()["items"]]
+
+    # 按采购日期：日期待填排最前，其余按单据上的日期倒序。
+    by_date = [item["id"] for item in
+               migrated_client.get("/api/invoices?order=invoice_date").get_json()["items"]]
+    assert by_date == [undated, newest_purchase, middle, oldest_purchase]
+
+    assert migrated_client.get("/api/invoices?order=uploaded_at").status_code == 400
+
+
 def test_match_endpoint_returns_candidates(migrated_client: FlaskClient) -> None:
     payload = post_invoice(migrated_client)
     food_item_id = create_food_item(migrated_client)

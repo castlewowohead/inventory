@@ -10,7 +10,7 @@ import {
 import { isNarrowViewport, watchViewport } from '../../shared/platform/viewport'
 import OriginalDocumentViewer from './OriginalDocumentViewer.vue'
 import {
-  cardLocation, isHandedOff, isIsoDate, missingLabel, recognitionNote, suggestionsOf
+  cardLocation, formState, isHandedOff, isIsoDate, missingLabel, recognitionNote, suggestionsOf
 } from './intakeBoard'
 
 const props = withDefaults(defineProps<{ batchId?: number | null; active?: boolean }>(), { batchId: null, active: true })
@@ -34,6 +34,8 @@ const missing = ref<IntakeItemFilters['missing'] | ''>('')
 const editDate = ref('')
 const editSource = ref('')
 const narrow = ref(isNarrowViewport())
+/** 标题旁边那个「▾」展开的显示形式菜单（卡片整理 / 财务表格）。 */
+const viewMenu = ref(false)
 let stopViewport = () => {}
 let requestSerial = 0
 let loadSerial = 0
@@ -189,6 +191,8 @@ async function undo() {
 
 async function openReview(item: IntakeItem) {
   if (!batch.value || busy.value) return
+  // Already 编辑中: go back to that draft instead of asking the server again.
+  if (item.review_invoice_id !== null) { emit('review', item.review_invoice_id); return }
   if (!item.decided_purchase_date || !item.decided_source_name) {
     error.value = '先确认这一行的采购日期和商家，才能进入明细审核。'
     return
@@ -229,8 +233,22 @@ onUnmounted(() => { stopViewport(); loadSerial++ })
 <template>
   <view class="ledger ui-card">
     <view class="heading">
-      <view><text class="eyebrow">同一批次 · 财务表格</text><text class="sheet-title">按行核对采购日期与商家</text></view>
-      <view class="heading-actions"><button class="ui-button secondary" @click="emit('cards')">返回卡片整理</button><button class="ui-button secondary" @click="emit('upload')">查看上传文件</button></view>
+      <!-- 回卡片整理的入口和进来时那个「▾」在同一个位置：左上角、标题旁边
+           （第 18 节 ③）。两种显示形式用同一个控件换，来回是一条路。 -->
+      <view>
+        <text class="eyebrow">同一批次 · 财务表格</text>
+        <view class="title-row">
+          <text class="sheet-title">按行核对采购日期与商家</text>
+          <view class="view-switch">
+            <button class="caret" :aria-expanded="viewMenu ? 'true' : 'false'" aria-label="切换显示形式"
+              @click="viewMenu = !viewMenu">▾</button>
+            <view v-if="viewMenu" class="view-menu">
+              <button class="ui-button ghost" @click="viewMenu = false; emit('cards')">卡片整理形式</button>
+            </view>
+          </view>
+        </view>
+      </view>
+      <view class="heading-actions"><button class="ui-button secondary" @click="emit('upload')">查看上传文件</button></view>
     </view>
     <view v-if="narrow" class="mobile-note">窄屏请使用卡片整理页；表格保留给桌面核对。</view>
     <template v-else>
@@ -259,8 +277,8 @@ onUnmounted(() => { stopViewport(); loadSerial++ })
             <td>{{ cell(item, 'original_description') }}</td><td class="numeric">{{ cell(item, 'quantity') }}</td><td class="numeric">{{ cell(item, 'unit_price') }}</td>
             <td><strong v-if="item.decided_purchase_date">{{ item.decided_purchase_date }}</strong><span v-else class="pending">待确认</span><small v-if="candidate(item, 'purchase_date')">建议：{{ candidate(item, 'purchase_date') }}</small></td>
             <td><strong v-if="item.decided_source_name">{{ item.decided_source_name }}</strong><span v-else class="pending">待确认</span><small v-if="candidate(item, 'source_name')">建议：{{ candidate(item, 'source_name') }}</small></td>
-            <td>{{ isHandedOff(item) ? '已送审' : missingLabel(item) || (item.recognition.status === 'failed' ? '识别失败' : '已分类') }}<small v-if="item.recognition.status === 'failed'">{{ recognitionNote(item) }}</small><small v-else-if="isHandedOff(item)">分类改动请在审核里做</small></td>
-            <td><button @click="preview = item">看原件</button><button :disabled="busy" @click="openReview(item)">{{ isHandedOff(item) ? '打开审核' : '明细审核' }}</button></td>
+            <td>{{ formState(item)?.label ?? (missingLabel(item) || (item.recognition.status === 'failed' ? '识别失败' : '已分类')) }}<small v-if="item.recognition.status === 'failed'">{{ recognitionNote(item) }}</small><small v-else-if="isHandedOff(item)">分类改动请在填表页做，或在卡片页撤回填表</small></td>
+            <td><button @click="preview = item">看原件</button><button :disabled="busy" @click="openReview(item)">{{ formState(item)?.action === 'refill' ? '查看单据' : isHandedOff(item) ? '继续填表' : '开始填表' }}</button></td>
           </tr><tr v-if="!loading && !rows.length"><td colspan="9">没有符合条件的内容。</td></tr></tbody>
         </table>
       </view>
@@ -275,6 +293,13 @@ onUnmounted(() => { stopViewport(); loadSerial++ })
 .heading, .heading-actions, .filters, .bulk, .pager, .preview-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
 .heading { justify-content: space-between; margin-bottom: 16px; }
 .heading > :first-child { display: grid; gap: 4px; }
+.title-row { display: flex; align-items: center; gap: 6px; }
+/* 和整理页标题旁那个「▾」一模一样：同一个控件，换一种显示形式。 */
+.view-switch { position: relative; display: flex; align-items: center; }
+.caret { width: 36px; min-height: 36px; margin: 0; padding: 0; border: 0; background: transparent; color: var(--green); font-size: 16px; line-height: 1; cursor: pointer; }
+.caret::after { border: 0; }
+.view-menu { position: absolute; top: calc(100% + 4px); left: 0; z-index: 8; min-width: 160px; padding: 6px; border: 1px solid var(--line); border-radius: 8px; background: #fff; box-shadow: 0 10px 28px #173b2e20; }
+.view-menu .ui-button { width: 100%; margin: 0; text-align: left; }
 .filters, .bulk { padding: 12px 0; border-top: 1px solid var(--line); }
 .filters :deep(uni-label) { display: grid; gap: 4px; font-size: 13px; }
 :deep(uni-input), select { min-height: 38px; border: 1px solid var(--line); border-radius: 6px; padding: 6px 9px; background: white; color: var(--ink); }

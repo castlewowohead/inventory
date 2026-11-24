@@ -25,7 +25,7 @@ function record(value: unknown): value is Record<string, unknown> {
 const fieldNames: Record<string, string> = {
   purchase_date: '采购日期', invoice_date: '单据日期', source_name: '来源',
   invoice_number: '单号', invoice_total: '单据总额', quantity: '数量',
-  purchase_unit: '采购单位', unit_price: '单价', line_amount: '行金额',
+  purchase_unit: '采购单位', unit_price: '单价', line_amount: '金额',
   food_item_id: '食材', category_id: '分类', base_unit: '基础单位',
   name_zh: '中文名', line_kind: '记录类型', currency: '币种',
   date_from: '开始日期', date_to: '结束日期', header_row: '表头所在行',

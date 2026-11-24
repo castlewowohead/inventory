@@ -153,8 +153,10 @@ from src.models import (
     utcnow,
 )
 from src.normalization import (
+    DATE_ORDER_ASSUMED,
     DATE_ORDER_STRICT,
     NUMBER_FORMAT_AUTO,
+    date_text_readings,
     fold_width,
     normalize_date_text,
     normalize_number_text,
@@ -1241,9 +1243,9 @@ class ExtractionService:
         date_order = (route.date_order if route else None) or DATE_ORDER_STRICT
         if date_order == DATE_ORDER_STRICT:
             warnings.append(
-                "这家供应商没有设置日/月顺序，所以 `6/11/2026` 这类写法**不会被"
-                "解析**（两种读法都成立，猜错会把采购算进错误的月份）。"
-                "在供应商路由上设 date_order=mdy 之后，这家的单据就按月/日/年读。"
+                "这家供应商没有设置日/月顺序，所以 `6/11/2026` 这类写法按本项目"
+                "默认的**月/日/年**读（docs/multifiles.md 第 15 节）。"
+                "这家确实写日/月/年时，在供应商路由上设 date_order=dmy。"
             )
 
         grid = self._detect_grid(decoded, warnings)
@@ -1899,11 +1901,17 @@ class ExtractionService:
                     header["invoice_total"] = parsed
         date_text = _text_of(result.document_field(FIELD_INVOICE_DATE))
         if date_text:
-            normalized_date = normalize_date_text(
-                date_text, date_order=date_order, allow_short_year=True
+            # 日/月顺序定不死时按项目默认的月/日/年读（第 15 节）：整理页已经这么
+            # 读了，填表页再说一句「读不出来」只会让同一张纸有两种说法。原文仍在
+            # `raw_document_fields` 里，预填值是可改的。
+            readings = date_text_readings(
+                date_text,
+                date_order=date_order,
+                allow_short_year=True,
+                assume_order=DATE_ORDER_ASSUMED,
             )
-            if normalized_date.ok:
-                header["invoice_date"] = normalized_date.text
+            if readings.readings:
+                header["invoice_date"] = readings.readings[0].text
         supplier = _text_of(result.document_field(FIELD_SUPPLIER))
         if supplier:
             header["source_name"] = supplier

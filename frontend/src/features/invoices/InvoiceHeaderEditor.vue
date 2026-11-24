@@ -29,9 +29,40 @@ let saveTask: Promise<boolean> | null = null
 const errorText = ref('')
 const fieldError = ref<Record<string, string>>({})
 const evidence = computed(() => readDocumentEvidence(props.invoice.recognition.raw_document_fields))
-const sourceEvidence = computed(() => evidence.value?.fields.filter((item) =>
-  ['supplier', 'supplier_english', 'supplier_chinese', 'supplier_evidence'].includes(item.key)
-) ?? [])
+/**
+ * 纸面上读出来的商家，一个值而已。
+ *
+ * ⚠️ 这里原来摊开四行识别线索（纸面英文名、中文名、模型摘录、模型之间读法不一致
+ * ……）。用户 2026-11-24 的话是「识别来源下面不需要讲一堆证据」——那几行回答的是
+ * 「系统是怎么想的」，而老板要回答的是「这张纸上的商家对不对」。所以只留**一个
+ * 值**，而且只在它和当前填着的不一样时才说出来（见下）：对得上的时候，把同一个
+ * 名字再印一遍什么也没说。完整证据仍在 `raw_document_fields` 里，没有删数据。
+ */
+const paperSource = computed(() => {
+  const field = evidence.value?.fields.find((item) => item.key === 'supplier')
+  return field?.status === 'recognized' ? field.rawText?.trim() || null : null
+})
+/** 用户在这一页上点过「此来源正确」——只管这一次打开，不写库。 */
+const sourceChecked = ref(false)
+/**
+ * 来源这一格也给「此来源正确 / 修改」那一对（2026-11-24 反馈，第 17 节 ⑤）。
+ *
+ * 为什么不能只靠上面那条通用的 `suggestion()`：批次来的单据，商家在整理页就被人
+ * 确认过了，`header_reviewed_fields` 里已经有 `source_name`，于是通用分支一个按钮
+ * 都不给，来源成了这一页上唯一没有绿/红按钮的字段。而整理页上的商家**可能是整组
+ * 带上的**（一张 KUN KEE 的纸被拖进 NEW MOY'S 组就会这样，第 17 节 ②），对着左边
+ * 的原件复核一次正是这一页该干的事。
+ *
+ * ⚠️ 这一对**不挂「AI 识别 · 待核对」**那个标签：人已经确认过的东西再说一次「待
+ * 核对」是假话。点「此来源正确」也不写库——库里本来就记着它已被确认，这一下只是
+ * 「我看过了」，所以刷新之后会再出现一次。
+ */
+const sourceReview = computed(() => props.canManage && !sourceChecked.value
+  && suggestion('source_name') === null
+  && paperSource.value !== null && form.value.source_name.trim() !== '')
+/** 纸面读的和填着的不是同一家——这一句才值得占一行。 */
+const sourceMismatch = computed(() =>
+  sourceReview.value && paperSource.value !== form.value.source_name.trim() ? paperSource.value : null)
 
 function values(item: Invoice): HeaderForm {
   return {
@@ -46,6 +77,7 @@ function reset(item: Invoice) {
   editingSuggestions.value = new Set()
   fieldError.value = {}
   errorText.value = ''
+  sourceChecked.value = false
 }
 const dirty = computed(() => fields.some(({ key }) => form.value[key] !== baseline.value[key]) || editingSuggestions.value.size > 0)
 watch(() => props.invoice.id, () => reset(props.invoice), { immediate: true })
@@ -140,6 +172,11 @@ function accept(key: HeaderKey) {
 function edit(key: HeaderKey) {
   form.value[key] = ''
   editingSuggestions.value = new Set([...editingSuggestions.value, key])
+  if (key === 'source_name') sourceChecked.value = true
+}
+/** 「此来源正确」：这一格的值已经在库里，点一下只是把这一对收起来。 */
+function confirmSource() {
+  sourceChecked.value = true
 }
 function changeCurrency(value: string | number) {
   form.value.currency = ['USD', 'CNY'][Number(value)] ?? 'USD'
@@ -180,14 +217,14 @@ onUnmounted(stopGuard)
           </view>
           <input v-else-if="suggestion(field.key)" class="ui-input suggested" :value="''" :placeholder="suggestion(field.key) || ''" :aria-label="field.label" readonly />
           <input v-else v-model="form[field.key]" class="ui-input" :inputmode="field.key === 'invoice_total' ? 'decimal' : 'text'" :aria-label="field.label" :placeholder="field.key === 'invoice_date' ? 'YYYY-MM-DD' : '待填'" @blur="save([field.key])" />
-          <view v-if="suggestion(field.key)" class="ai-review"><text>请对照原件核对</text><view class="ai-actions"><button class="accept" :disabled="saving" @click="accept(field.key)">此数据正确</button><button class="edit" :disabled="saving" @click="edit(field.key)">修改</button></view></view>
-          <view v-if="field.key === 'source_name' && sourceEvidence.length" class="source-evidence">
-            <text>以下是识别线索，请对照原件确认。</text>
-            <text v-for="item in sourceEvidence" :key="item.key">
-              {{ item.label }}：{{ item.rawText ?? (item.status === 'missing' ? '模型判断纸面未见' : '待核对') }}<template v-if="item.page">（第 {{ item.page }} 页）</template>
-              <template v-if="item.modelValues.length > 1 && !item.agreement?.includes('多模型一致')">；模型读法：{{ item.modelValues.join(' / ') }}</template>
-              <template v-if="item.agreement && !item.agreement.includes('多模型一致')">；{{ item.agreement }}</template>
-            </text>
+          <view v-if="suggestion(field.key)" class="ai-review"><text>请对照原件核对</text><view class="ai-actions"><button class="accept" :disabled="saving" @click="accept(field.key)">{{ field.key === 'source_name' ? '此来源正确' : '此数据正确' }}</button><button class="edit" :disabled="saving" @click="edit(field.key)">修改</button></view></view>
+          <!-- 已经确认过的来源：同一对按钮，没有「待核对」那个假标签（第 17 节 ⑤）。 -->
+          <view v-else-if="field.key === 'source_name' && sourceReview" class="ai-review">
+            <text>{{ sourceMismatch ? `纸面读出：${sourceMismatch}` : '请对照原件核对来源' }}</text>
+            <view class="ai-actions">
+              <button class="accept" :disabled="saving" @click="confirmSource">此来源正确</button>
+              <button class="edit" :disabled="saving" @click="edit('source_name')">修改</button>
+            </view>
           </view>
           <button v-if="field.key === 'invoice_total'" class="calculate" :disabled="saving" @click="calculateTotal">计算总额</button>
           <text v-if="fieldError[field.key]" class="field-error" role="alert">{{ fieldError[field.key] }}</text>
@@ -210,7 +247,6 @@ onUnmounted(stopGuard)
 .ai-badge { color:var(--muted); font-size:12px; }
 .suggested::placeholder { color:#8b9790; opacity:1; }
 .ai-review { display:flex; align-items:center; justify-content:space-between; gap:10px; flex-wrap:wrap; color:var(--muted); font-size:13px; }
-.source-evidence { display:flex; flex-direction:column; gap:3px; color:var(--muted); font-size:12px; overflow-wrap:anywhere; }
 .ai-actions, .form-actions { display:flex; gap:8px; flex-wrap:wrap; }
 .ai-actions button { width:auto; min-height:42px; margin:0; padding:8px 12px; color:#fff; border:0; font-size:13px; }
 .ai-actions button::after, .calculate::after { border:0; }

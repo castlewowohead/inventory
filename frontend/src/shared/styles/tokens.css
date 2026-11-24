@@ -8,6 +8,8 @@
   --line: #d8e0d9;
   --warning: #b45309;
   --error: #9a3b2f;
+  /* 「有草稿」那一族的蓝，`.chip.handed` 早就在用它；第 20 节的「重新填写」按钮同色。 */
+  --blue: #1f3b63;
   --focus: #b45309;
   --radius: 10px;
 }

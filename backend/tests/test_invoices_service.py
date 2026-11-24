@@ -233,10 +233,13 @@ def test_possible_duplicate_is_only_a_hint(invoice_service: InvoiceService) -> N
     )
 
 
-def test_no_duplicate_hint_without_an_invoice_number(
+def test_no_duplicate_hint_without_an_invoice_number_or_a_date(
     invoice_service: InvoiceService,
 ) -> None:
-    """手写单常常没有单号：三个字段缺一个就不判重，免得天天误报。"""
+    """没有单号也没有日期就不判重：只剩「来源 + 总额」会天天误报。
+
+    同一家供应商按同一份订货单下单，不同日子的总额确实会一样。
+    """
     first = draft(invoice_service)
     invoice_service.update_invoice(first.id, source_name="Costco", invoice_total="286.00")
     second = invoice_service.create_invoice([upload(content=OTHER_PHOTO, name="b.png")])
@@ -245,10 +248,58 @@ def test_no_duplicate_hint_without_an_invoice_number(
     )
     # Fake 识别器给每张草稿都填了同一个假单号，这里把它清掉，才是"手写单没有单号"
     # 那个场景。
-    invoice_service.update_invoice(first.id, invoice_number=None)
-    invoice_service.update_invoice(second.id, invoice_number=None)
+    invoice_service.update_invoice(first.id, invoice_number=None, invoice_date=None)
+    invoice_service.update_invoice(second.id, invoice_number=None, invoice_date=None)
 
     assert invoice_service.get_invoice(second.id).possible_duplicate_invoice_ids == ()
+
+
+def test_unnumbered_invoices_hint_on_same_source_date_and_total(
+    invoice_service: InvoiceService,
+) -> None:
+    """读不出单号时，采购日期补上单号的位置。
+
+    新的单据边界规则（docs/multifiles.md 第 11 节）规定读不出单号就一页一张，
+    于是同一张单被重复上传时不再有单号这条线索。同一家、同一天、分毫不差的同一个
+    总额仍然值得提示一句。
+    """
+    first = draft(invoice_service)
+    invoice_service.update_invoice(
+        first.id, source_name="Costco", invoice_number=None,
+        invoice_date="2026-06-08", invoice_total="286.00",
+    )
+    second = invoice_service.create_invoice([upload(content=OTHER_PHOTO, name="b.png")])
+    invoice_service.update_invoice(
+        second.id, source_name="costco ", invoice_number=None,
+        invoice_date="2026-06-08", invoice_total="286.00",
+    )
+
+    assert invoice_service.get_invoice(second.id).possible_duplicate_invoice_ids == (
+        first.id,
+    )
+
+    # 换一天就不是同一张单了。
+    invoice_service.update_invoice(second.id, invoice_date="2026-06-09")
+    assert invoice_service.get_invoice(second.id).possible_duplicate_invoice_ids == ()
+
+
+def test_an_unnumbered_invoice_does_not_hint_at_a_numbered_one(
+    invoice_service: InvoiceService,
+) -> None:
+    """一张读出了单号、一张没读出：纸面上本来就分得开，不该因为金额巧合互相提示。"""
+    numbered = draft(invoice_service)
+    invoice_service.update_invoice(
+        numbered.id, source_name="Costco", invoice_number="INV-77",
+        invoice_date="2026-06-08", invoice_total="286.00",
+    )
+    blank = invoice_service.create_invoice([upload(content=OTHER_PHOTO, name="b.png")])
+    invoice_service.update_invoice(
+        blank.id, source_name="Costco", invoice_number=None,
+        invoice_date="2026-06-08", invoice_total="286.00",
+    )
+
+    assert invoice_service.get_invoice(blank.id).possible_duplicate_invoice_ids == ()
+    assert invoice_service.get_invoice(numbered.id).possible_duplicate_invoice_ids == ()
 
 
 # --- 草稿与原始识别证据 -----------------------------------------------------

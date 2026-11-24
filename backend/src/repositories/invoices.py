@@ -16,12 +16,45 @@
 
 from __future__ import annotations
 
+from datetime import date
 from decimal import Decimal
+
+from typing import Final
 
 from sqlalchemy import Select, func, select, update
 from sqlalchemy.orm import Session, joinedload, selectinload
 
 from src.models import Invoice, InvoiceFile, InvoiceLine
+
+
+ORDER_BY_INVOICE_DATE: Final[str] = "invoice_date"
+ORDER_BY_CREATED_AT: Final[str] = "created_at"
+LIST_ORDERS: Final[frozenset[str]] = frozenset(
+    {ORDER_BY_INVOICE_DATE, ORDER_BY_CREATED_AT}
+)
+
+
+def _list_ordering(order: str) -> tuple[object, ...]:
+    """列表排序键。见 `InvoiceRepository.search` 的说明。
+
+    两种排法回答的是两个不同的问题：`invoice_date` 是「这批货是哪天进的」，
+    `created_at` 是「这条记录是哪天录进系统的」。六月一日补录一张五月二十二日的
+    单子，两者差着十天，所以不能用一个键冒充另一个。
+
+    `is_(None).desc()` 是「空值排前面」的可移植写法：SQLite 没有 `NULLS FIRST`，
+    而 `invoice_date DESC` 在 SQLite 下把 NULL 排到最后。日期待填的排最前是因为
+    它们最需要处理——没有日期就进不了价格历史。
+
+    末尾一律跟 `id` 倒序：同一天、同一秒的多张单据必须有稳定次序，否则同一个
+    offset 两次请求可能漏行或重行。
+    """
+    if order == ORDER_BY_CREATED_AT:
+        return (Invoice.created_at.desc(), Invoice.id.desc())
+    return (
+        Invoice.invoice_date.is_(None).desc(),
+        Invoice.invoice_date.desc(),
+        Invoice.id.desc(),
+    )
 
 
 def _detail_options() -> tuple[object, ...]:
@@ -45,11 +78,23 @@ class InvoiceRepository:
         )
         return self._session.scalars(statement).unique().one_or_none()
 
+    def export_statuses(self, invoice_ids: list[int]) -> dict[int, bool]:
+        """Whether each requested invoice is completed and still active."""
+        rows = self._session.execute(
+            select(Invoice.id, Invoice.completed_at, Invoice.voided_at)
+            .where(Invoice.id.in_(invoice_ids))
+        )
+        return {id_: completed_at is not None and voided_at is None
+                for id_, completed_at, voided_at in rows}
+
     def search(
         self,
         *,
         completed: bool | None = None,
         source_normalized: str | None = None,
+        date_from: date | None = None,
+        date_to: date | None = None,
+        order: str = ORDER_BY_CREATED_AT,
         include_voided: bool = False,
         limit: int,
         offset: int,
@@ -57,9 +102,15 @@ class InvoiceRepository:
         """返回（当页单据, 符合条件的总条数）。
 
         `completed` 三态：`True` 只要已完成的，`False` 只要还没完成的（老板的待办
-        清单），`None` 不筛。排序是上传时间倒序 + id 倒序——第二个键不是装饰，
-        同一秒上传的多张单据必须有稳定次序，否则同一个 offset 两次请求可能漏行或
-        重行。
+        清单），`None` 不筛。
+
+        `date_from` / `date_to` 按**单据上的采购日期**筛（闭区间），不是上传时间：
+        老板问的是「六月那批货」，不是「六月传进来的文件」。补录三个月前的单子两者
+        会差出一个季度。⚠️ 日期区间**排除**没有日期的单据——`NULL >= '2026-06-01'`
+        在 SQL 里不成立——所以筛了区间就看不见它们，这是期望行为而不是漏行。
+
+        `order` 见 `_list_ordering()`：默认 `created_at`（刚录进来的在最前，这是
+        待办清单要的次序），`invoice_date` 按单据上的采购日期排。
         """
         conditions = []
         if completed is True:
@@ -68,6 +119,10 @@ class InvoiceRepository:
             conditions.append(Invoice.completed_at.is_(None))
         if source_normalized is not None:
             conditions.append(Invoice.source_name_normalized == source_normalized)
+        if date_from is not None:
+            conditions.append(Invoice.invoice_date >= date_from)
+        if date_to is not None:
+            conditions.append(Invoice.invoice_date <= date_to)
         if not include_voided:
             conditions.append(Invoice.voided_at.is_(None))
 
@@ -78,7 +133,7 @@ class InvoiceRepository:
             select(Invoice)
             .options(*_detail_options())
             .where(*conditions)
-            .order_by(Invoice.created_at.desc(), Invoice.id.desc())
+            .order_by(*_list_ordering(order))
             .limit(limit)
             .offset(offset)
         )
@@ -103,14 +158,46 @@ class InvoiceRepository:
         字段都一样就很可能是同一张单。调用方只提示、不阻止——真有两张同号同额的单
         也是可能的（供应商自己开重了），拦住反而让人没法录入。
 
-        三个值必须都有：缺一个就不判重（手写单常常连单号都没有，凭「来源 + 总额」
-        相同就报重复会在同一家供应商的常规订货上天天误报）。
+        三个值必须都有：缺一个就不判重。没有单号的单据走
+        `find_possible_duplicates_unnumbered()`，它用日期补上单号的位置。
         """
         statement = select(Invoice.id).where(
             Invoice.id != exclude_invoice_id,
             Invoice.voided_at.is_(None),
             Invoice.source_name_normalized == source_normalized,
             Invoice.invoice_number_normalized == number_normalized,
+            Invoice.invoice_total == total,
+        )
+        return [int(value) for value in self._session.scalars(statement)]
+
+    def find_possible_duplicates_unnumbered(
+        self,
+        *,
+        exclude_invoice_id: int,
+        source_normalized: str,
+        invoice_date: date,
+        total: Decimal,
+    ) -> list[int]:
+        """返回「来源 + 采购日期 + 总额」都相同、且**双方都没有单号**的其它单据。
+
+        没有单号的发票不止来自手写单：纸面印着单号但模型漏读也会得到空单号，而
+        docs/multifiles.md 第 12 节的新边界规则规定读不出单号就一页一张，于是同一
+        张单被重复上传时不再有单号这条线索可用。
+
+        日期是这里的关键一笔。上面那条注释说的「凭来源 + 总额相同就报重复会天天
+        误报」仍然成立——同一家供应商按同一份订货单下单，不同日子的总额确实会一样。
+        加上**同一天**之后，剩下的是「同一家、同一天、分毫不差的同一个总额」，那更
+        可能是同一张单传了两次。仍然只提示、不阻止。
+
+        两边都必须没有单号：这张没读出单号、另一张读出来了，说明它们在纸面上就是
+        能区分的两张单，不该因为金额巧合而互相提示。
+        """
+        statement = select(Invoice.id).where(
+            Invoice.id != exclude_invoice_id,
+            Invoice.voided_at.is_(None),
+            Invoice.invoice_number_normalized.is_(None),
+            Invoice.source_name_normalized == source_normalized,
+            Invoice.invoice_date == invoice_date,
             Invoice.invoice_total == total,
         )
         return [int(value) for value in self._session.scalars(statement)]

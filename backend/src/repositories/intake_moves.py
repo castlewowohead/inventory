@@ -4,10 +4,16 @@ from __future__ import annotations
 
 from datetime import date
 
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.orm import Session, selectinload
 
-from src.models import IntakeBatchFile, IntakeItem, IntakeMove, INTAKE_FILE_STATUS_DISCARDED
+from src.models import (
+    IntakeBatchFile,
+    IntakeItem,
+    IntakeMove,
+    IntakeMoveEntry,
+    INTAKE_FILE_STATUS_DISCARDED,
+)
 from src.repositories.intake import _item_options
 
 
@@ -29,6 +35,32 @@ class IntakeMoveRepository:
                 IntakeMove.entries.any(),
             ).order_by(IntakeMove.id.desc()).limit(1)
         ).one_or_none()
+
+    def forget_items(self, item_ids: list[int]) -> int:
+        """把撤销日志里指向这些内容的条目删掉，空掉的那几次移动一并删。
+
+        移除文件时用（第 16 节）：内容都没了，留着一条**什么都恢复不了**的「撤销
+        最近一次移动」是个陷阱——点下去不报错，也什么都不会变。只影响这些内容的
+        条目，同一次移动里别的内容照常可撤。
+        """
+        if not item_ids:
+            return 0
+        touched = set(self.session.scalars(
+            select(IntakeMoveEntry.move_id).where(IntakeMoveEntry.item_id.in_(item_ids))
+        ).all())
+        removed = self.session.execute(
+            delete(IntakeMoveEntry).where(IntakeMoveEntry.item_id.in_(item_ids))
+        ).rowcount or 0
+        self.session.flush()
+        for move_id in touched:
+            left = self.session.scalar(
+                select(func.count()).select_from(IntakeMoveEntry)
+                .where(IntakeMoveEntry.move_id == move_id)
+            ) or 0
+            if left == 0:
+                self.session.execute(delete(IntakeMove).where(IntakeMove.id == move_id))
+        self.session.flush()
+        return int(removed)
 
     def get(self, move_id: int) -> IntakeMove | None:
         return self.session.scalars(

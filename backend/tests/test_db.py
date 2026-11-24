@@ -390,7 +390,8 @@ def test_declared_business_tables_are_exactly_the_expected_ones() -> None:
 
     多文件计划 M02 加五张 `intake_*`：整理批次、按内容摘要一行一份的原件字节、
     批次对原件的引用、可归类内容（PDF 的一页 / 表格的一行）与分类候选。
-    ⚠️ **没有「日期/商家组」表**——组由内容上的人工决定值派生，另存一张就会与
+    ⚠️ **没有保存成员的「日期/商家组」表**——组由内容上的人工决定值派生；
+    `intake_date_groups` 只保留可为空的日期标题。另存成员名单就会与
     内容打架。⚠️ **`invoice_files` 一个字都没改**：它的 `sha256` 全局唯一是
     步骤 05「完全相同的文件不许重复上传」的落点，整理批次另立一套表而不是放宽它。
     """
@@ -408,6 +409,7 @@ def test_declared_business_tables_are_exactly_the_expected_ones() -> None:
         "price_alert_settings",
         "food_item_merges",
         "intake_batches",
+            "intake_date_groups",
         "intake_files",
         "intake_batch_files",
         "intake_items",

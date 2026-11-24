@@ -27,7 +27,7 @@
 - **匹配只给候选**：「这句描述以前确认到哪个食材」直接查采购历史，同来源优先，最多 5 个，**不自动确认**。
 - **收口确认**：审完所有行要点一次「完成」，接口把「已确认 N 行、跳过 M 行、几个文件、对账差多少」摆出来。这是**漏行唯一会被拦住的时刻**——各行之和对不上总额只能抓到一部分，手写单常常连总额都没有。
 
-**步骤 06（CSV / Excel 导入导出）已完成并验收**（2026-11-10，Check List 06.0—06.6 已勾选）：`POST /api/imports`（建批次）、`POST /api/imports/preview`（只读预览）、`GET /api/imports/template`（中文表头模板）与 `GET /api/purchases/export`（明细导出）均可用。表格走的是**同一套审核流程**：导入建出 `entry_source='import'` 的草稿批次，修改、匹配食材、逐行确认、撤销、收口全部用步骤 05 的同一组接口，入账走步骤 04 的 `create_purchase`。几条值得记住的：
+**步骤 06（CSV / Excel 导入导出）已完成并验收**（2026-11-10，Check List 06.0—06.6 已勾选）：`POST /api/imports`（建批次）、`POST /api/imports/preview`（只读预览）、`GET /api/imports/template`（中文表头模板）与 `POST /api/invoices/export`（勾选已完成单据后导出明细）均可用。表格走的是**同一套审核流程**：导入建出 `entry_source='import'` 的草稿批次，修改、匹配食材、逐行确认、撤销、收口全部用步骤 05 的同一组接口，入账走步骤 04 的 `create_purchase`。几条值得记住的：
 
 - **不猜**：`1,234.5` 的逗号含义不明、`03/04/2026` 的日月顺序不明时**直接报错并定位到单元格**，要老板显式选 `number_format` / `date_order`。猜错一次就是一个错价格永久留在历史里。
 - **不经 float**：XLSX 直接读 OOXML 的 `<v>` 文本再交给步骤 04 的 `parse_decimal`，不走 openpyxl 的常规 reader（那条路会先把十进制单元格转成 `float`）。
@@ -170,7 +170,7 @@
 | 图片按张、PDF 按页切成可归类内容（**多页 PDF 不等于一张发票**） | 可用 | M03 |
 | CSV / XLSX 按行进入整理批次（列映射、重复提示） | 可用 | M04 |
 | 整理阶段的人工归组、批量移动与撤销 | 可用（后端 API） | M06 |
-| 整理阶段的日期/商家候选（数字 PDF 走文字层零成本；歧义日期留两种读法） | 可用 | M05 |
+| 整理阶段的日期/商家候选（数字 PDF 走文字层零成本；日/月顺序定不死时按默认的月/日/年读） | 可用 | M05 + 第 15 节 |
 | 确认商家后用保存的原文重解析日期（**不重新识别**） | 可用 | M05 |
 | 已整理内容幂等送审、按单据拆并页、回看原件及入账后分类修订 | 可用（后端 API） | M08 |
 | 商家记忆与相似堆：同文件参考、历史写法/别名、版式相似建议（**一次模型都不调**） | 可用（后端 API） | M07 |
@@ -650,7 +650,7 @@ GET /api/purchases?kind=all              # 对账：各行相加应等于单据�
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | POST | `/api/invoices` | 上传文件并建草稿（**multipart**，字段名 `files`，可重复；`recognize=false` 则只存不识别） |
-| GET | `/api/invoices` | 单据列表；`completed=false` 就是待办清单，另有 `source` / `include_voided` / `limit` / `offset` |
+| GET | `/api/invoices` | 单据列表；`completed=false` 就是待办清单，另有 `source` / `date_from` / `date_to` / `order`（`created_at` 默认 / `invoice_date`）/ `include_voided` / `limit` / `offset` |
 | GET | `/api/invoices/<id>` | 详情：文件、行、每个待确认行的匹配候选、对账结果、可能重复的单据 |
 | PATCH | `/api/invoices/<id>` | 改单据头（来源、单号、日期、币种、总额，全部可空） |
 | DELETE | `/api/invoices/<id>` | **作废**整张单据；有已确认行时须提交当前 `confirmed_line_ids`，返回 200 |
@@ -679,9 +679,12 @@ POST /api/invoices
 **重复上传。** 两种口径，轻重不同：
 
 - **完全相同的文件**（`sha256` 相同）→ 409，`details.invoice_id` 指回已有的那张单据，让老板去那边接着审；
-- **来源 + 单号 + 总额都相同但文件不同** → 不拦，详情里给 `possible_duplicate_invoice_ids`。同一张单补拍的照片字节本来就不同，拦住反而误伤。三个字段缺一个就不判重（手写单常常连单号都没有）。
+- **来源 + 单号 + 总额都相同但文件不同** → 不拦，详情里给 `possible_duplicate_invoice_ids`。同一张单补拍的照片字节本来就不同，拦住反而误伤。
+- **没有单号时，用采购日期补它的位置**：来源 + 采购日期 + 总额都相同，且**两边都没有单号**，同样给出这条软提示。读不出单号就一页一张（第 12 节的单据边界），同一张单重复上传时便没有单号这条线索了。只凭「来源 + 总额」会在同一家供应商的常规订货上天天误报，加上同一天才足够紧。两边都必须没有单号：一张读出了、一张没读出，说明纸面上本来就分得开。缺日期又缺单号则不判重。
 
 **删整单。** 界面先确认删除；若有已入账行，再提示具体行数。请求 `DELETE /api/invoices/<id>` 带 JSON `{"confirmed_line_ids": [11, 12]}`，必须与服务端当前已确认行的 ID 集合完全一致；未带或状态已变化则返回 409。成功时，同一事务里作废这些行的采购记录（保留修改日志），再作废单据、删除原件。已作废采购记录不进入价格统计；原始文件删除后无法再回看，但同一文件可以重新上传。没有已入账行时仍可不带请求体删除。
+
+> **批次来的单据：整理页上的那几页一并真删**（2026-11-24 反馈，`docs/multifiles.md` 第 17 节 ④）。同一个事务里按序删掉撤销日志里指向这些内容的条目、送审链接、内容本身（候选随 ORM 级联），顺序与移除文件那条路（第 16 节）一致。于是「删除本张单据」之后，整理页上不会再留下一张「草稿已作废」的卡片。⚠️ **不删的两样**：`intake_files` 里的字节与磁盘上的原件——同一份 PDF 的其它页可能还在整理页上；单据行本身仍是**作废**而不是抹掉（它可能背着已作废的采购记录）。代价写在这里：那几页**回不来了**，要重新整理得把那份文件重新上传一次（重传按全新的一份处理）。
 
 **删文件。** 三道闸门都回 409 并说清为什么：① 单据上**最后一个文件**不能删（发票至少要留一份原始凭据）；② 表格导入批次的**源文件**不能删（它就是那些明细的凭据，要撤就作废整个批次）；③ 这个文件**正在识别**时不能删——提取任务还在排队或正在跑，worker 已经按它的 `storage_key` 去读字节，删掉只会换来一条看不懂的失败，而那次模型调用的钱照样要花（`details` 里给出 `extraction_job_id` 与 `status`，等它跑完或失败再删）。删成功时磁盘上那份字节一并删除；**已经跑完的提取任务记录保留**，只把 `invoice_file_id` 置空并在 `warnings` 里记下被删的是哪个文件——任务历史是事后唯一能解释「这张单当初怎么没出行」的东西；**已经识别出来的草稿行也不跟着删**（人可能已经改过它们），它们的证据里仍记着那个文件编号，界面据此提示「这一行的原件已经被删掉了，别拿左边那张纸核对它」。
 
@@ -730,7 +733,7 @@ POST /api/invoices/7/confirm
 | POST | `/api/imports/preview` | **只读预览**：看列映射对不对、哪几行有问题，不写数据 |
 | POST | `/api/imports` | 建一个待审核批次（`multipart`，文件字段 `file`，选项放在 `options` 这个 JSON 字符串里） |
 | GET | `/api/imports/template` | 下载中文表头模板（`format=csv` / `xlsx`） |
-| GET | `/api/purchases/export` | 导出采购明细（`format=csv` / `xlsx`），可带 `food_item_id` / `source` / `date_from` / `date_to` / `undated` / `kind` / `include_voided` |
+| POST | `/api/invoices/export` | JSON `{ "format": "xlsx" 或 "csv", "invoice_ids": [1, 2] }`；只接受 1–200 张已完成且未作废单据，导出所选单据当前有效的采购行，不含调整行；最多 10000 行 |
 
 **导入就是步骤 05 的草稿。** 批次是一张 `entry_source='import'` 的单据：原始表格文件原样存着、每行是一条 `pending` 的待确认行，修改、匹配食材、逐行确认、撤销、收口确认全部用上面发票那一组接口；入账走步骤 04 的 `create_purchase`，记录的 `entry_source` 是 `import`。**导入不调识别器**——表格本来就是结构化的，走 OCR 只会凭空引入错误。
 
@@ -755,18 +758,24 @@ POST /api/invoices/7/confirm
 | 方法 | 路径 | 用途 |
 | --- | --- | --- |
 | POST | `/api/intake-batches` | 新建一个整理批次 |
-| GET | `/api/intake-batches/current` | **恢复**：最近一个还在整理的批次；没有就是 404 |
-| GET | `/api/intake-batches/<id>` | 批次与逐文件处理状态（**轮询这个**） |
+| GET | `/api/intake-batches/current` | **恢复**：最近一个仍开放且有未移除文件的批次；空批次不构成待办，返回 404。等待处理或处理失败的文件仍可恢复。 |
+| GET | `/api/intake-batches/<id>` | 批次与逐文件处理状态（**轮询这个**）；另带 `item_count` / `unfinished_item_count` |
+| POST | `/api/intake-batches/<id>/close` | 这一批填完了：收口（`/current` 不再返回它）；已收口的批次再收一次是 409 |
 | GET | `/api/intake-batches/<id>/items?limit=50&offset=0` | 分页读可归类内容，最多 200 条；M11 可按日期、商家、待定原因筛选 |
 | POST | `/api/intake-batches/<id>/files` | **一次一个文件**（`multipart`，字段 `file`） |
 | POST | `/api/intake-batches/<id>/process` | 驱动切页队列；`{"retry_failed": true}` 连失败的一起重试 |
-| DELETE | `/api/intake-batches/<id>/files/<file_id>` | 把一个文件从批次里撤掉（可反悔） |
+| DELETE | `/api/intake-batches/<id>/files/<file_id>` | 把一个文件移出批次：**连同它的页与分类一起删**（不可反悔；有内容已进填表时 409） |
 | GET | `/api/intake-batches/<id>/files/<file_id>/original` | 回看整份原件 |
 | GET | `/api/intake-batches/<id>/items/<item_id>/original` | 回看某一页的原件 |
+| DELETE | `/api/intake-batches/<id>/items/<item_id>` | 删除未开始填表的一页/一行；请求 `{"version":N}`，版本变化或已送入草稿时返回 409。删除文件的最后一项时一并移除该批次文件引用，重传从头开始。已开始填表的内容须删除对应整张单据。 |
 
 M11 财务表格沿用 `/items`，增加可选的 `purchase_date=YYYY-MM-DD`、`source_name=<确认名>` 和 `missing=any|both|date_any|source_any|date|source|recognition_failed`，筛选在数据库分页前进行，`total` 是筛选后的总数。`date_any` / `source_any` 包含两项都缺的内容，`date` / `source` 只含单独缺该项的内容；另可传 `purchase_date=missing` 或 `source_name=missing` 精确筛空值。表格行的响应新增 `row_values`（保存的解析字段；数量和金额仍是字符串），图片/PDF 页为 `null`；`row_no` 是原 CSV/XLSX 行号，不是分页序号。没有迁移，分类写入仍走 M06 `/moves`，送审仍走 M08 `/reviews`。
 
-**上传只存字节、只登记，不等切页。** 响应里的 `queued` 说明切页是不是交给后台了：是的话 `ingest` 为 `null`，前端去轮询批次状态。⚠️ **状态只有 `pending` / `ready` / `failed` / `discarded` 四个离散值，加上「切出了几个内容」（`item_count`），没有百分比**——本地切页没有可信的中间进度，编一个只会让人以为卡在 73%。实测 12 MB / 32 页 PDF：上传请求 0.07 秒返回，切页 0.30 秒后完成。
+**这一批填完了就收口。** `POST .../close` 把批次置为 `closed`：它不再接收新文件，`GET /api/intake-batches/current` 也不再返回它，因此首页那个「接着整理」消失——这就是「此次多文件填表结束」（见 [docs/multifiles.md 第 22 节](docs/multifiles.md)）。批次本身仍然读得到（URL 里那个 `batch=<id>` 仍然有效，只能查看）。⚠️ **服务端不检查是否全部填完**：第 5 节允许把待定内容留着以后再办。「全部填完才按得动」是整理页上的一道闸，它问的是批次详情里那两个**派生计数**：`item_count`（这一批有几项可整理内容）与 `unfinished_item_count`（其中没有落在一张**已完成**单据里的有几项）。两个数都不落表：填没填完由那几页所在的单据说了算。没有迁移。
+
+**传错的文件撤得下来，而且是真删。** `DELETE .../files/<file_id>` 把这份文件在这个批次里的记录一并删掉：撤销日志里指向这些内容的条目（空掉的那次移动一并删）→ 送审链接 → 内容与候选 → 这条文件引用本身。⚠️ **不可反悔**（2026-11-24 改掉了原来的软删）：同一份文件再传进来是**全新的一份**，新 id、新传入时刻、新切出来的页，`decided_*` 全空。响应的 `removed_item_count` 是跟着删掉的内容数，`file` 是删之前那条引用的样子。盘上的字节不在这里删（别的批次可能还在引用同一份），`bytes_still_referenced` 只回答「现在还有没有人用它」。⚠️ `discarded` 状态与 `include_discarded` 参数留着只为读 2026-11-24 之前标成 `discarded` 的旧行，新的移除不再产生这种行。⚠️ 已经有内容进入填表的文件**撤不掉**（409）：草稿是对着这份原件填的，原件必须留着供核对。409 的 `details.handed_off_item_count` 说出有几项，消息指向下一步——先在整理页撤回填表，已入库的走单据里的撤销确认与采购修订。同一个数字也在批次详情的每个文件上透出，上传页据此把「移除」按钮提前暗下来并写出原因，而不是让人点一下才撞到 409（见 [docs/multifiles.md 第 14 节](docs/multifiles.md)）。
+
+**上传只存字节、只登记，不等切页。** 响应里的 `queued` 说明切页是不是交给后台了：是的话 `ingest` 为 `null`，前端去轮询批次状态。⚠️ **状态只有 `pending` / `ready` / `failed` / `discarded` 四个离散值，加上「切出了几个内容」（`item_count`）与「其中几个已经开始填表」（`handed_off_item_count`），没有百分比**——本地切页没有可信的中间进度，编一个只会让人以为卡在 73%。实测 12 MB / 32 页 PDF：上传请求 0.07 秒返回，切页 0.30 秒后完成。
 
 **一次一个文件**（字段 `file`，不可重复），与 `POST /api/invoices` 的 `files`（同一张单据的多页）刻意不同：这里十几份文件属于不同的单据，整批一起提交的话一份超限就得全部重传。
 
@@ -791,7 +800,9 @@ M11 财务表格沿用 `/items`，增加可选的 `purchase_date=YYYY-MM-DD`、`
 
 ### 整理内容送入现有审核（M08）
 
-日期/商家组只是工作队列，不是一张发票。调用方明确选择内容组成一张草稿：`POST /api/intake-batches/<id>/reviews`，请求 `{"items":[{"id":1,"version":2}]}`；要把后续页并入同一张待审核草稿，加 `target_invoice_id`。同批、同已确认日期与商家才可合并；不同单号或总额拒绝并提示分开核对。重复送审返回 200 和原草稿 ID，不重复建行或采购。一次最多 20 个内容。组内次级建议可读 `GET /api/intake-batches/<id>/review-suggestions?purchase_date=2026-11-08&source_name=Costco`（`limit` / `offset`，最多 200）：纸面单号相同或同文件连续页仅是建议，绝不自动合成一张单据。
+日期/商家组只是工作队列，不是一张发票。调用方明确选择内容组成一张草稿：`POST /api/intake-batches/<id>/reviews`，请求 `{"items":[{"id":1,"version":2}]}`；要把后续页并入同一张待审核草稿，加 `target_invoice_id`。同批、同已确认日期与商家才可合并；不同单号或总额拒绝并提示分开核对。重复送审返回 200 和原草稿 ID，不重复建行或采购。一次最多 20 个内容。组内次级建议可读 `GET /api/intake-batches/<id>/review-suggestions?purchase_date=2026-11-08&source_name=Costco`（`limit` / `offset`，最多 200）：纸面单号相同仅是建议，绝不自动合成一张单据。
+
+**单据边界只认纸面单号**（第 12 节）：`POST .../reviews/selection` 把单号相同的页合成一张草稿，**读不出单号的页一页一张**——同一个文件里挨着并不能证明是同一张发票，一份 PDF 本来就是几十张独立发票扫在一起的。合错了两张发票的金额会相加，而「各行之和对不上单据总额」这个检查正好因此失效；拆错了在填表页一眼看得见，用 `POST .../reviews/<invoice_id>/reassign` 并回去就是。表格行不走这条规则：一张 `entry_source="import"` 的草稿是整份表格的审核容器，按行拆开会把一份 CSV 变成几十张假发票。
 
 表格行创建 `entry_source=import` 的导入草稿，图片/PDF 页创建 `entry_source=invoice` 的单据草稿；两类内容分别送审，保留各自现有审核和原件展示方式。
 
@@ -817,6 +828,12 @@ GET  /api/prices/food-items/<id>/history   价格历史回查
 ```
 
 ⚠️ **一个日期/商家组可能装着几张真正的发票**，所以送审送的是**明确选中的那几项**，不是「整组」。同组两张发票各自成为一张草稿、各自收口、各自入账；价格历史里比较的来源名与日期就是整理页上人工确认的那两项。
+
+同一天的使用反馈（第 11 节）再加一条 **`POST /api/intake-batches/<id>/reviews/withdraw`**，请求 `{"items":[{"id":1,"version":3}]}`：撤回填表，把草稿连同填过的行一起删掉，内容的 `handed_off_at` 清空而 `decided_*` **保留**——撤的是「开始填表」这一步，不是分类。⚠️ 撤的单位是**整张草稿**（一张草稿就是一张发票），所以返回的 `item_ids` 可能比传进去的多；草稿里只要有一行已确认入账、单据已完成、或还挂着识别任务，就拒成 409，那条路仍是单据里的撤销确认与作废。`/items` 与 `.../groups/items` 的内容另外透出 **`review_invoice_id`**（在填哪一张草稿），整理页据此给出「继续填表」的入口；没有它，退出填表页之后卡片上就只剩一个 `handed_off_at` 标记而没有回去的路。没有迁移。
+
+2026-11-24 的使用反馈（第 20 节）再加一条 **`POST /api/intake-batches/<id>/reviews/refill`**，请求与撤回同形 `{"items":[{"id":1,"version":3}]}`：**重新填写**——清掉这张单据填过的数据，并用同一批页立刻建一张新的空草稿（走的就是 `handoff`，识别结果照样预填），返回 `invoice_id`（新草稿）、`previous_invoice_id`、`previous_invoice_kept`、`cleared_lines` 与 `voided_purchases`。⚠️ 与 `withdraw` 的差别只有两处：①**已完成的单据走这条路**，它已经入账的行在同一个事务里按现有的软删 + 修改日志作废（不撤就会重复记价），所以 `withdraw` 那条「已入账不许撤」的 409 在这里是**撤销**而不是拦住；②清完立刻落进新草稿。旧草稿的去留沿用 `withdraw` 的规则：行上挂过采购记录就整张作废留着（那是价格历史的凭据），一条都没有就真删。`decided_*` 一个字不动。一次只能重填**一张**单据；补传过原件的单据拒成 409（`invoice_files.sha256` 全局唯一，留着作废会让同一张照片再也传不进新草稿）。没有迁移。
+
+2026-11-23 的使用反馈增加了 `POST /api/intake-batches/<id>/reviews/selection`：同一天、同一商家的所选内容可一次开始填表；纸面单号不同的页在一个事务中拆成独立草稿，返回 `invoice_ids` 供前端切换，原有 `/reviews` 仍用于明确的一张草稿。日期类别由 `intake_date_groups` 单独保留空标题，使用 `POST /date-groups` 新建、`DELETE /date-groups/<YYYY-MM-DD>` 删除空类别；内容归属仍由内容本身派生。`clear` 移动通过既有 `decided_at` 记下人工清空，防止系统建议马上把它投影回原组。迁移版本为 `a8c92e74d130`，详见 [docs/multifiles.md 第 10 节](docs/multifiles.md)。
 
 ⚠️ **草稿可能一行都没有**。页上的文字层或识别结果没有可解析的明细行时，草稿就是 0 行——这是诚实而不是失败，填写从「手工加一行」开始。系统不会为了让草稿"看起来完整"而编出几行。
 
@@ -848,7 +865,7 @@ GET  /api/prices/food-items/<id>/history   价格历史回查
 
 ⚠️ **`status` 与「有没有候选」不是同一件事。** 读完发现纸面上没有商家时是 `done` + 0 条候选；没读过时两者都是空。分不开这两者，重新打开批次就只能把所有没候选的页再送一遍模型——那是对同一页重复收费。响应里的 `model_calls` 是**这一次真的发了几次调用**，重复驱动队列时它是 0。
 
-⚠️ **商家没人工确认之前，不套用任何一家的 `date_order`。** 所以 `6/11/2026` 这类写法会给出**两条**候选（6 月 11 日 / 11 月 6 日），顺序不表示倾向。确认商家、并在 `PUT /api/ocr-routes` 上给这家设了 `date_order` 之后，`POST .../items/<id>/reparse-date` 用**保存下来的原文**重新解析，**不会再调一次模型**。拿相似度猜出来的商家去定一个日历日，猜错不报错——它只是把这笔采购算进了错误的月份。
+⚠️ **商家没人工确认之前，不套用任何一家的 `date_order`。** 但 `6/11/2026` 这类写法**不会**因此停在「两种读法」上：依据从硬到软是「文本自己定死的 → 这家确认过的 `date_order` → 同文件同商家的明确证据（第 8 节）→ 本项目默认的月/日/年（`DATE_ORDER_ASSUMED`，[docs/multifiles.md 第 15 节](docs/multifiles.md)）」，所以它给出**一条**候选 6 月 11 日，响应里的 `date_ambiguous` 仍是 `true`、`date_assumed_order` 是 `mdy`——「文本定不死」是留痕的事实，不是要用户回答的问题。⚠️ 默认值只在**两种读法都成立**时出场：`18/6/2026` 本来就只有一种读法，把默认值当 `date_order=mdy` 一路传下去反而会把它整个丢掉。确认商家、并在 `PUT /api/ocr-routes` 上给这家设了 `date_order` 之后，`POST .../items/<id>/reparse-date` 用**保存下来的原文**重新解析，**不会再调一次模型**。拿相似度猜出来的商家去定一个日历日，猜错不报错——它只是把这笔采购算进了错误的月份。
 
 **读不出来不是错误**，是这张卡片的状态：取不到字节、PDF 读不开、取不出整页图、模型调用失败，都写成 `failed` + 原因（`bytes_missing` / `pdf_unreadable` / `image_unreadable` / `page_image_missing` / `content_unsupported` / `ocr_failed` / `row_data_missing`），**原件一个字节都不动**，同一份 PDF 的其它页照常；重试要显式 `retry_failed=true`——否则每次驱动队列都会把钱花在同一个坏页上。
 
@@ -1128,7 +1145,7 @@ python -m alembic -x db_url=sqlite:///tmp.db upgrade head   # 临时数据库
 - 结构与初始数据**分成两条修订**：`script.py.mako` 的约定是「迁移只改结构」，需要初始数据时单独说明来源与可重复执行方式。初始分类修订因此只插缺的那几条，重复执行不会报唯一约束错误，`downgrade` 按名称删回去。
 - 迁移脚本**不 import `src/models.py`**：它是结构的历史快照，模型以后改名或搬家时旧修订仍要能原样执行。因此时间列写 `sa.DateTime()` 而不是 `src.models.UtcDateTime`，数值列写 `sa.Integer()` 而不是 `src.models.DecimalAsInteger`（两者生成的 DDL 完全相同）。**`alembic revision --autogenerate` 会在这里写出 `src.models.*`，而且丢掉 `DecimalAsInteger` 的 `scale` 参数，必须手工改回 impl 类型**——照抄自动生成的结果会得到一个 import 不到模型就崩掉的修订。
 - 模型与迁移是否一致由 `tests/test_migrations.py::test_models_match_migrations` 用 Alembic 的 `compare_metadata` 断言，改了模型忘记写迁移会直接失败。
-- **多文件计划 M02 的修订 `a3c81d57e240` 只加表、不改表**：五张 `intake_*`（整理批次、按内容摘要一行一份的原件字节、批次对原件的引用、可归类内容、分类候选）。⚠️ **`invoices` 与 `invoice_files` 一个字都没动**——那边 `sha256` 全局唯一是步骤 05「完全相同的文件不许重复上传」的落点、`invoice_id` 非空意味着一份文件只属一张单据，而整理阶段要的恰好是「一份文件的不同页属于不同组」。放宽旧索引会让旧单张上传路径的重复拦截失效，所以两套表并存，跨路径的同摘要文件只**提示**不阻断。⚠️ **没有「日期/商家组」表**：组是 `(实际采购日, 规范化来源)` 的 `GROUP BY` 结果，另存一张就会出现「组表的成员名单」和「内容上的决定值」两份能互相矛盾的真相（与「单据状态由行状态派生」、「标准化价格不落列」同一条）。
+- **多文件计划 M02 的修订 `a3c81d57e240` 只加表、不改表**：五张 `intake_*`（整理批次、按内容摘要一行一份的原件字节、批次对原件的引用、可归类内容、分类候选）。⚠️ **`invoices` 与 `invoice_files` 一个字都没动**——那边 `sha256` 全局唯一是步骤 05「完全相同的文件不许重复上传」的落点、`invoice_id` 非空意味着一份文件只属一张单据，而整理阶段要的恰好是「一份文件的不同页属于不同组」。放宽旧索引会让旧单张上传路径的重复拦截失效，所以两套表并存，跨路径的同摘要文件只**提示**不阻断。M02 当时没有保存成员的「日期/商家组」表：组是 `(实际采购日, 规范化来源)` 的派生结果；后续 `intake_date_groups` 仅保留可为空的日期标题，不存成员名单。
 - **多文件计划 M03 没有迁移。** 图片/PDF 的摄入用的是 M02 已有的五张表：切页的待办状态就是 `intake_batch_files.status`（`pending` = 字节存好了、还没切），**没有第二张任务表**——另立一张会出现「任务表说跑完了、文件还是 pending」两份能互相矛盾的真相。⚠️ 与 `extraction_jobs` 的差别是**代价**：那边有 `running` 中间态、重跑要再花一次钱，所以需要独立任务表与「卡住任务退回排队」；本地切页两者都没有，进程被 kill 之后那一条仍是 `pending`，再驱动一次队列就接着切。
 
 ## 11. 原始文件存储

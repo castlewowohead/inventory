@@ -42,7 +42,7 @@ from src.contracts import (
     RecognizedLine,
     RecognizedPage,
 )
-from src.errors import ConflictError, ValidationError
+from src.errors import ConflictError, NotFoundError, ValidationError
 from src.integrations.dashscope import OcrServiceError
 from src.integrations.file_storage import LocalFileStorage
 from src.models import (
@@ -456,15 +456,16 @@ def test_the_line_items_from_the_text_layer_are_kept_for_the_review_step(
 # --- 验收条件 1：商家未知且日期歧义时两项独立待定 ---------------------------
 
 
-def test_an_ambiguous_date_keeps_both_readings_and_an_unknown_supplier_stays_unknown(
+def test_an_ambiguous_date_reads_as_month_first_and_an_unknown_supplier_stays_unknown(
     intake_ingest_service: IntakeIngestService,
     intake_service: IntakeService,
     stub_recognition: IntakeRecognitionService,
     stub: StubRecognizer,
 ) -> None:
-    """`6/11/2026` 留**两条**读法；商家读不出就是 0 条候选。两项互不牵连。
+    """`6/11/2026` 按默认的月/日/年读成 **6 月 11 日**；商家读不出就是 0 条候选。
 
-    ⚠️ 两条日期候选**不表示系统倾向哪一条**：顺序只是为了让界面有稳定次序。
+    第 15 节：本项目服务的是美国餐厅，纸上的 `6/11` 就是 6 月 11 日。原文与
+    「这是默认读法」都留在证据里，商家确认后仍可重新解析成另一种。
     """
     stub.supplier = (FieldStatus.UNREADABLE, None)
     stub.supplier_english = None
@@ -475,10 +476,12 @@ def test_an_ambiguous_date_keeps_both_readings_and_an_unknown_supplier_stays_unk
 
     result = stub_recognition.recognize_item(items[0])
 
-    assert sorted(result.date_candidates) == ["2026-06-11", "2026-11-06"]
+    assert result.date_candidates == ("2026-06-11",)
     assert result.source_candidates == ()
     payload = result.item.recognition_payload or {}
+    # 文本确实定不死，这件事仍然如实记着——只是本项目已经替它定了默认读法。
     assert payload["date_readings"]["ambiguous"] is True
+    assert payload["date_readings"]["assumed_order"] == "mdy"
     assert payload["date_readings"]["raw_text"] == "6/11/2026"
     assert payload["date_order"]["from"] == DATE_ORDER_FROM_DEFAULT
     assert payload["date_order"]["value"] == "strict"
@@ -588,13 +591,17 @@ def test_an_unconfirmed_supplier_candidate_never_applies_that_suppliers_date_ord
     stub_recognition: IntakeRecognitionService,
     extraction_service: ExtractionService,
 ) -> None:
-    """这家的 `date_order=mdy` 已经设好了，但**商家还没人工确认** → 日期仍然歧义。
+    """这家的 `date_order=dmy` 已经设好了，但**商家还没人工确认** → 不套用它。
 
     M05 第二条子项：没有人工确认商家时，不能仅凭相似度应用该商家的 OCR 路由。
     拿一个猜出来的商家去定日历日，猜错不报错——它只是把这笔采购算进错误的月份。
+
+    ⚠️ 这家故意设成 `dmy`：如果路由被错误地套上去，`6/11/2026` 会变成 11 月 6 日；
+    没套上去时它落到项目默认的月/日/年，仍是 6 月 11 日（第 15 节）。两者不同，
+    这条断言才分得出真假。
     """
     extraction_service.set_route(
-        source_name="Costco Wholesale", doc_class="printed_scan", date_order="mdy"
+        source_name="Costco Wholesale", doc_class="printed_scan", date_order="dmy"
     )
     _, items = ingest(intake_ingest_service, intake_service, "scan.jpg", jpeg_bytes())
 
@@ -602,7 +609,7 @@ def test_an_unconfirmed_supplier_candidate_never_applies_that_suppliers_date_ord
 
     # 候选里明明有 `Costco Wholesale`，但它没有被用来解歧义。
     assert result.source_candidates == ("Costco Wholesale",)
-    assert sorted(result.date_candidates) == ["2026-06-11", "2026-11-06"]
+    assert result.date_candidates == ("2026-06-11",)
     payload = result.item.recognition_payload or {}
     assert payload["date_order"]["from"] == DATE_ORDER_FROM_DEFAULT
     assert payload["date_order"]["confirmed_source"] is None
@@ -692,15 +699,16 @@ def test_reparsing_a_page_that_was_never_recognised_is_a_conflict(
         stub_recognition.reparse_date(items[0])
 
 
-def test_a_confirmed_supplier_without_a_date_order_still_refuses_to_guess(
+def test_a_confirmed_supplier_without_a_date_order_falls_back_to_the_project_default(
     intake_ingest_service: IntakeIngestService,
     intake_service: IntakeService,
     stub_recognition: IntakeRecognitionService,
 ) -> None:
-    """确认了商家、但这家没说过日/月顺序 → 仍然是两条读法。
+    """确认了商家、但这家没说过日/月顺序 → 落回项目默认的月/日/年，不是两条读法。
 
-    「宁可留空让人填，也不猜」在这一步的样子：确认商家本身不代表知道这家怎么写
-    日期。
+    确认商家本身不代表知道这家怎么写日期，所以这里**没有**第二条证据可用；
+    第 15 节定下的默认读法正是为这种情形准备的，而不是去猜一个。原文仍留着：
+    哪天这家被设成 `dmy`，重新解析就会改口。
     """
     _, items = ingest(intake_ingest_service, intake_service, "scan.jpg", jpeg_bytes())
     stub_recognition.recognize_item(items[0])
@@ -708,10 +716,11 @@ def test_a_confirmed_supplier_without_a_date_order_still_refuses_to_guess(
 
     result = stub_recognition.reparse_date(items[0])
 
-    assert sorted(result.date_candidates) == ["2026-06-11", "2026-11-06"]
+    assert result.date_candidates == ("2026-06-11",)
     payload = result.item.recognition_payload or {}
     assert payload["date_order"]["value"] == "strict"
     assert payload["date_order"]["from"] == DATE_ORDER_FROM_CONFIRMED_SOURCE
+    assert payload["date_readings"]["assumed_order"] == "mdy"
 
 
 # --- 验收条件 3：重新打开批次不重复调用模型 ---------------------------------
@@ -928,17 +937,21 @@ def test_content_that_is_neither_image_nor_pdf_fails_with_a_readable_reason(
     assert result.error_code == ERROR_CONTENT_UNSUPPORTED
 
 
-def test_a_discarded_file_is_not_recognised_behind_the_users_back(
+def test_a_removed_file_is_not_recognised_behind_the_users_back(
     intake_ingest_service: IntakeIngestService,
     intake_service: IntakeService,
     stub_recognition: IntakeRecognitionService,
     stub: StubRecognizer,
 ) -> None:
-    """用户把文件撤出批次了 → 不再为它的页花钱。"""
+    """用户把文件移出批次了 → 不再为它的页花钱。
+
+    第 16 节起移除是真删，所以这里是「找不到这一页」而不是「它被撤掉了」。
+    要守住的那一条没变：**一次模型调用都不许发生**。
+    """
     _, items = ingest(intake_ingest_service, intake_service, "scan.jpg", jpeg_bytes())
     intake_service.discard_file(intake_service.get_item(items[0]).batch_file_id)
 
-    with pytest.raises(ConflictError, match="撤掉"):
+    with pytest.raises(NotFoundError):
         stub_recognition.recognize_item(items[0])
     assert stub.calls == []
 
@@ -1012,12 +1025,16 @@ def test_a_spreadsheet_row_uses_its_own_cell_as_the_evidence_and_calls_no_model(
     assert first.evidence["header"] == "supplier"
 
 
-def test_an_ambiguous_date_in_a_spreadsheet_cell_keeps_both_readings(
+def test_an_ambiguous_date_in_a_spreadsheet_cell_reads_as_month_first(
     intake_spreadsheet_service,
     intake_service: IntakeService,
     stub_recognition: IntakeRecognitionService,
 ) -> None:
-    """表格那一格解析不出来时回到原文：歧义就留两条，**不按系统地区猜**。"""
+    """表格那一格解析不出来时回到原文，按项目默认的月/日/年读（第 15 节）。
+
+    ⚠️ 默认读法与「系统地区」无关：它是写在代码里的一条产品决定，换一台机器、
+    换一个时区都不会变。
+    """
     batch_id, rows = upload_table(
         intake_spreadsheet_service, intake_service, "amb.csv", CSV_AMBIGUOUS_DATE
     )
@@ -1025,7 +1042,7 @@ def test_an_ambiguous_date_in_a_spreadsheet_cell_keeps_both_readings(
     results = stub_recognition.recognize_waiting(batch_id=batch_id)
 
     assert len(results) == 1
-    assert sorted(results[0].date_candidates) == ["2026-06-11", "2026-11-06"]
+    assert results[0].date_candidates == ("2026-06-11",)
     payload = results[0].item.recognition_payload or {}
     assert payload["fields"][FIELD_INVOICE_DATE]["ambiguous"] is True
     assert payload["fields"][FIELD_INVOICE_DATE]["raw_text"] == "6/11/2026"

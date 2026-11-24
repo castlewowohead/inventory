@@ -14,18 +14,19 @@ from dataclasses import dataclass
 from datetime import date
 from typing import Any, Mapping, Sequence
 
-from sqlalchemy import update
+from sqlalchemy import select, update
 
 from src.db import Database
 from src.errors import ConflictError, NotFoundError, ValidationError
 from src.models import (
-    INTAKE_FILE_STATUS_DISCARDED, SOURCE_NAME_MAX_LENGTH, IntakeItem,
+    INTAKE_FILE_STATUS_DISCARDED, SOURCE_NAME_MAX_LENGTH, IntakeBatchFile, IntakeDateGroup, IntakeItem,
     IntakeMove, IntakeMoveEntry, utcnow,
 )
-from src.repositories.intake import IntakeBatchRepository, IntakeItemRepository
+from src.repositories.intake import IntakeBatchRepository, IntakeItemRepository, _item_options
 from src.repositories.intake_moves import IntakeMoveRepository
 from src.services.ingredients import normalize_name
 from src.services.intake import IntakeGroupView, IntakeItemPage, IntakeItemView, MAX_ITEMS_PER_PAGE
+from src.services.intake_projection import ProjectedItem, project_items
 from src.services.validation import require_limit, require_offset, require_text
 
 
@@ -62,16 +63,55 @@ class IntakeMoveService:
         if IntakeBatchRepository(session).get(batch_id) is None:
             raise NotFoundError("找不到整理批次。", details={"batch_id": batch_id})
 
+    @staticmethod
+    def _pin_dates(session, batch_id: int, dates: set[date]) -> None:
+        if not dates:
+            return
+        existing = set(session.scalars(select(IntakeDateGroup.purchase_date).where(
+            IntakeDateGroup.batch_id == batch_id,
+            IntakeDateGroup.purchase_date.in_(dates))).all())
+        session.add_all(IntakeDateGroup(batch_id=batch_id, purchase_date=value)
+                        for value in dates - existing)
+
+    def create_date_group(self, batch_id: int, purchase_date: str) -> None:
+        value = self._date(purchase_date)
+        with self.database.unit_of_work() as session:
+            self._active_batch(session, batch_id)
+            self._pin_dates(session, batch_id, {value})
+
+    def delete_date_group(self, batch_id: int, purchase_date: str) -> None:
+        value = self._date(purchase_date)
+        with self.database.unit_of_work() as session:
+            self._active_batch(session, batch_id)
+            group = session.scalar(select(IntakeDateGroup).where(
+                IntakeDateGroup.batch_id == batch_id, IntakeDateGroup.purchase_date == value))
+            if group is None:
+                raise NotFoundError("找不到这个日期类别。")
+            if any(row.purchase_date == value for row in self._projected(session, batch_id)):
+                raise ConflictError("请先把这个日期里的内容移走，再删除类别。")
+            session.delete(group)
+
     def groups(self, batch_id: int, *, limit: int = 50, offset: int = 0) -> GroupPage:
         limit = require_limit(limit, max_limit=MAX_ITEMS_PER_PAGE)
         offset = require_offset(offset)
         with self.database.unit_of_work() as session:
             self._existing_batch(session, batch_id)
-            rows, total = IntakeMoveRepository(session).list_groups(batch_id, limit=limit, offset=offset)
+            repo = IntakeMoveRepository(session)
+            _, total = repo.list_groups(batch_id, limit=1, offset=0)
+            rows, _ = repo.list_groups(batch_id, limit=max(total, 1), offset=0)
+            grouped = [IntakeGroupView(purchase_date=row.purchase_date, source_name=row.source_name,
+                source_name_normalized=row.source_key, item_count=row.item_count) for row in rows]
+            dates = {row.purchase_date for row in grouped}
+            for value in session.scalars(select(IntakeDateGroup.purchase_date).where(
+                    IntakeDateGroup.batch_id == batch_id)).all():
+                if value not in dates:
+                    grouped.append(IntakeGroupView(purchase_date=value, source_name=None,
+                        source_name_normalized=None, item_count=0))
+            grouped.sort(key=lambda group: (
+                group.purchase_date is None, group.purchase_date or date.min,
+                group.source_name_normalized is None, group.source_name_normalized or ""))
             return GroupPage(
-                tuple(IntakeGroupView(purchase_date=row.purchase_date, source_name=row.source_name,
-                    source_name_normalized=row.source_key, item_count=row.item_count) for row in rows),
-                total, limit, offset,
+                tuple(grouped[offset:offset + limit]), len(grouped), limit, offset,
             )
 
     def group_items(self, batch_id: int, *, purchase_date: str | None, source_name: str | None,
@@ -86,6 +126,64 @@ class IntakeMoveService:
                 batch_id, purchase_date=parsed_date, source_key=source_key, limit=limit, offset=offset
             )
             return IntakeItemPage(tuple(IntakeItemView.of(item) for item in rows), total, limit, offset)
+
+    @staticmethod
+    def _projected(session, batch_id: int) -> list[ProjectedItem]:
+        rows = session.scalars(
+            select(IntakeItem).join(IntakeBatchFile, IntakeBatchFile.id == IntakeItem.batch_file_id)
+            .where(IntakeBatchFile.batch_id == batch_id,
+                   IntakeBatchFile.status != INTAKE_FILE_STATUS_DISCARDED)
+            .options(*_item_options())
+            .order_by(IntakeBatchFile.upload_order, IntakeItem.page_no,
+                      IntakeItem.row_no, IntakeItem.id)
+        ).unique().all()
+        return project_items(rows)
+
+    def suggested_groups(self, batch_id: int, *, limit: int = 50, offset: int = 0) -> GroupPage:
+        """The organizer's read-only projection; no suggestion becomes a decision."""
+        limit = require_limit(limit, max_limit=MAX_ITEMS_PER_PAGE)
+        offset = require_offset(offset)
+        with self.database.unit_of_work() as session:
+            self._existing_batch(session, batch_id)
+            grouped: dict[tuple[date | None, str | None], IntakeGroupView] = {}
+            for row in self._projected(session, batch_id):
+                key = row.purchase_date, row.source_key
+                prior = grouped.get(key)
+                grouped[key] = IntakeGroupView(
+                    purchase_date=row.purchase_date,
+                    source_name=prior.source_name if prior else row.source_name,
+                    source_name_normalized=row.source_key,
+                    item_count=(prior.item_count if prior else 0) + 1,
+                    suggested_count=(prior.suggested_count if prior else 0) + int(row.suggested),
+                )
+            for value in session.scalars(select(IntakeDateGroup.purchase_date).where(
+                    IntakeDateGroup.batch_id == batch_id)).all():
+                if not any(key[0] == value for key in grouped):
+                    grouped[(value, None)] = IntakeGroupView(
+                        purchase_date=value, source_name=None, source_name_normalized=None,
+                        item_count=0)
+            ordered = sorted(grouped.values(), key=lambda group: (
+                group.purchase_date is None, group.purchase_date or date.min,
+                group.source_name_normalized is None, group.source_name_normalized or "",
+            ))
+            return GroupPage(tuple(ordered[offset:offset + limit]), len(ordered), limit, offset)
+
+    def suggested_group_items(self, batch_id: int, *, purchase_date: str | None,
+                              source_name: str | None, limit: int = 50,
+                              offset: int = 0) -> IntakeItemPage:
+        limit = require_limit(limit, max_limit=MAX_ITEMS_PER_PAGE)
+        offset = require_offset(offset)
+        parsed_date = self._date(purchase_date) if purchase_date is not None else None
+        source_key = normalize_name(require_text(
+            source_name, field="source_name", max_length=SOURCE_NAME_MAX_LENGTH
+        )) if source_name is not None else None
+        with self.database.unit_of_work() as session:
+            self._existing_batch(session, batch_id)
+            selected = [row for row in self._projected(session, batch_id)
+                        if row.purchase_date == parsed_date and row.source_key == source_key]
+            page = selected[offset:offset + limit]
+            return IntakeItemPage(tuple(IntakeItemView.of(row.item) for row in page),
+                                  len(selected), limit, offset)
 
     @staticmethod
     def _date(raw: Any) -> date:
@@ -152,6 +250,14 @@ class IntakeMoveService:
                     raise ConflictError("内容版本已改变，请刷新后重试。", details={
                         "item_id": item.id, "expected_version": selected_item["version"], "current_version": item.version})
                 rows.append(item)
+            # Preserve a date header when the last content is moved away.
+            projected_before = {row.item.id: row.purchase_date
+                                for row in self._projected(session, batch_id)}
+            dates_to_pin = {projected_before[item.id] for item in rows
+                            if projected_before[item.id] is not None}
+            if target_date is not None:
+                dates_to_pin.add(target_date)
+            self._pin_dates(session, batch_id, dates_to_pin)
             operation = IntakeMove(batch_id=batch_id, request_key=request_key, request_signature=signature)
             session.add(operation)
             session.flush()
@@ -169,7 +275,9 @@ class IntakeMoveService:
                     new_date = new_source = None
                 if action in {"exclude", "include"}:
                     new_excluded = action == "exclude"
-                if (new_date, new_source, new_excluded) == (before[0], before[1], before[3]):
+                if (new_date, new_source, new_excluded) == (before[0], before[1], before[3]) and not (
+                    action == "clear" and item.decided_at is None
+                ):
                     continue
                 now = utcnow()
                 expected_version = item.version

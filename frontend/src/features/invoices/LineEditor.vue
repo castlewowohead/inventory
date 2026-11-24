@@ -651,13 +651,13 @@ watch(() => props.line.id, () => {
       <text v-if="actionNote" class="saved-note" role="status" aria-live="polite">{{ actionNote }}</text>
       <text v-if="actionError" class="error-text" role="alert">{{ actionError }}</text>
       <view v-if="mismatch" class="mismatch" role="alert">
-        <text class="emphasis">行金额与数量 × 单价不符</text>
-        <text>纸面行金额：{{ mismatch.line_amount ?? '未提供' }}</text>
+        <text class="emphasis">金额与数量 × 单价不符</text>
+        <text>纸面上的金额：{{ mismatch.line_amount ?? '未提供' }}</text>
         <text>数量 × 单价：{{ mismatch.expected ?? '未提供' }}</text>
         <text>差额：{{ mismatch.difference ?? '未提供' }}（允许误差 {{ mismatch.tolerance ?? '未提供' }}）</text>
-        <text>请对照原件核对。如果原件上的行金额确实如此，可以按这个金额入账。</text>
+        <text>请对照原件核对。如果原件上写的确实是这个数，可以按它入账。</text>
         <view class="primary-actions">
-          <button class="ui-button" :disabled="actionBusy" @click="confirmLine(true)">仍按行金额入账</button>
+          <button class="ui-button" :disabled="actionBusy" @click="confirmLine(true)">仍按纸面金额入账</button>
           <button class="ui-button secondary" :disabled="actionBusy" @click="mismatch = null">返回核对数字</button>
         </view>
       </view>

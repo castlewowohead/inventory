@@ -1,11 +1,10 @@
 <script setup lang="ts">
 import { computed, onUnmounted, ref } from 'vue'
 import {
-  ApiError, errorMessage, getPurchaseExport, userMessage,
+  ApiError, errorMessage, userMessage,
   type ImportOptions, type ImportPreview, type Invoice
 } from '../../shared/api'
 import { formatBytes } from '../../shared/format'
-import { downloadAttachment } from '../../shared/platform/download'
 import {
   isCancelledPick, pickSpreadsheet, type PickedFile
 } from '../../shared/platform/filePicker'
@@ -15,7 +14,7 @@ import { uploadOne, type UploadHandle } from '../../shared/platform/upload'
 const props = withDefaults(defineProps<{ batchId?: number | null; initialFile?: PickedFile | null }>(), {
   batchId: null, initialFile: null
 })
-const emit = defineEmits<{ created: [id: number]; openExisting: [id: number]; stored: []; close: [] }>()
+const emit = defineEmits<{ created: [id: number]; openExisting: [id: number]; stored: []; close: []; selectExport: [format: 'csv' | 'xlsx'] }>()
 const file = ref<PickedFile | null>(props.initialFile)
 const preview = ref<ImportPreview | null>(null)
 const previewValid = ref(false)
@@ -37,8 +36,6 @@ const mapping = ref<Record<string, string>>({})
 const mappingConfirmed = ref(false)
 const manualReview = ref(false)
 const exportFormat = ref<'csv' | 'xlsx'>('xlsx')
-const exporting = ref(false)
-const exportError = ref('')
 let active: UploadHandle<unknown> | null = null
 
 const fields = [
@@ -174,13 +171,7 @@ async function create() {
 }
 
 async function download() {
-  exporting.value = true
-  exportError.value = ''
-  try {
-    const response = await getPurchaseExport(exportFormat.value)
-    downloadAttachment(response, `purchase-details.${exportFormat.value}`)
-  } catch (error) { exportError.value = errorMessage(error) }
-  finally { exporting.value = false }
+  emit('selectExport', exportFormat.value)
 }
 
 async function close() {
@@ -247,7 +238,7 @@ onUnmounted(() => { stopGuard(); active?.abort() })
       </view>
     </template>
       <view v-if="failure" role="alert" class="error">{{ failure }} <button v-if="duplicateId && props.batchId === null" class="link" @click="openExisting">打开已导入的单据</button></view>
-    <view v-if="props.batchId === null" class="export"><text class="section-title">采购明细导出</text><text class="muted">包含全部已入账的采购明细，不含已撤销的记录。</text><view class="actions"><select v-model="exportFormat" aria-label="导出格式"><option value="xlsx">XLSX</option><option value="csv">CSV</option></select><button class="ui-button secondary" :disabled="exporting" @click="download">{{ exporting ? '正在下载…' : '下载明细' }}</button></view><text v-if="exportError" role="alert" class="error">{{ exportError }}</text></view>
+    <view v-if="props.batchId === null" class="export"><text class="section-title">采购明细导出</text><text class="muted">选择格式后，到下面的已完成单据列表勾选要导出的单据。</text><view class="actions"><select v-model="exportFormat" aria-label="导出格式"><option value="xlsx">XLSX</option><option value="csv">CSV</option></select><button class="ui-button secondary" @click="download">下载单据</button></view></view>
   </view>
 </template>
 

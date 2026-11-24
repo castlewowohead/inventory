@@ -441,17 +441,22 @@ def test_an_already_ingested_file_says_so_instead_of_splitting_again(
     assert repeat.items == ()
 
 
-def test_a_discarded_file_is_not_silently_split_again(
+def test_a_removed_file_is_not_silently_split_again(
     intake_ingest_service: IntakeIngestService,
     intake_service: IntakeService,
     batch_id: int,
 ) -> None:
-    """撤掉的文件不该被偷偷切回来——那是用户明确移出批次的东西。"""
-    outcome = intake_ingest_service.upload(batch_id, upload_of("gone.pdf", pdf_bytes(2)))
-    discarded = intake_service.discard_file(outcome.ref.id)
-    assert discarded.bytes_still_referenced is False
+    """移除掉的文件不该被偷偷切回来——它在这个批次里已经不存在了（第 16 节）。
 
-    with pytest.raises(ConflictError, match="撤掉"):
+    2026-11-24 起移除是**真删**：那条引用没了，所以再去切它是「找不到这个文件」，
+    而不是「这个文件被撤掉了」。队列里也不该剩下它。
+    """
+    outcome = intake_ingest_service.upload(batch_id, upload_of("gone.pdf", pdf_bytes(2)))
+    removed = intake_service.discard_file(outcome.ref.id)
+    assert removed.bytes_still_referenced is False
+    assert removed.removed_item_count == 2
+
+    with pytest.raises(NotFoundError):
         intake_ingest_service.ingest_file(outcome.ref.id)
 
     assert intake_ingest_service.ingest_waiting(batch_id=batch_id) == ()

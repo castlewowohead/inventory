@@ -72,6 +72,18 @@ const kind = computed<DocumentKind>(() =>
 
 const page = ref(1)
 const pageCount = ref(1)
+/** Review may link only selected pages of a larger PDF. */
+const reviewPages = computed<number[] | null>(() => {
+  const source = current.value?.intake
+  if (props.invoiceId === null || !source || source.kind !== 'page') return null
+  return [...new Set((props.sources ?? [])
+    .filter((entry) => entry.batch_file_id === source.batch_file_id && entry.page_no !== null)
+    .map((entry) => entry.page_no as number))].sort((a, b) => a - b)
+})
+const canPreviousPage = computed(() => reviewPages.value
+  ? reviewPages.value.some((value) => value < page.value) : page.value > 1)
+const canNextPage = computed(() => reviewPages.value
+  ? reviewPages.value.some((value) => value > page.value) : page.value < pageCount.value)
 const zoomIndex = ref(0)
 const zoom = computed(() => ZOOM_STEPS[zoomIndex.value])
 const rendered = ref<RenderedPage | null>(null)
@@ -135,7 +147,9 @@ async function render() {
         if (sequence !== renderSequence) return
       }
       pageCount.value = pdf?.pageCount ?? 1
-      if (page.value > pageCount.value) page.value = 1
+      if (reviewPages.value?.length) {
+        if (!reviewPages.value.includes(page.value)) page.value = reviewPages.value[0]
+      } else if (page.value > pageCount.value) page.value = 1
       const target = Math.min(PDF_MAX_WIDTH, Math.round(PDF_BASE_WIDTH * Math.min(zoom.value, 2.5)))
       const result = await pdf!.renderPage(page.value, target)
       if (sequence !== renderSequence) {
@@ -205,7 +219,11 @@ function selectFile(fileId: number) {
 }
 
 function changePage(delta: number) {
-  const next = page.value + delta
+  const pages = reviewPages.value
+  const next = pages
+    ? pages[pages.indexOf(page.value) + delta]
+    : page.value + delta
+  if (next === undefined) return
   if (next < 1 || next > pageCount.value) return
   page.value = next
   resetScroll()
@@ -252,7 +270,8 @@ watch(() => props.focus, (focus) => {
     currentFileId.value = focus.fileId
     moved = true
   }
-  if (focus.page !== null && focus.page >= 1 && focus.page !== page.value) {
+  if (focus.page !== null && focus.page >= 1 && focus.page !== page.value
+    && (!reviewPages.value || reviewPages.value.includes(focus.page))) {
     page.value = focus.page
     moved = true
   }
@@ -283,7 +302,7 @@ defineExpose({ reload: render })
         <text v-if="current" class="muted meta">
           <template v-if="current.intake">批次原件 · {{ current.intake.kind === 'page' ? `第 ${current.intake.page_no} 页` : `第 ${current.intake.row_no} 行` }}</template>
           <template v-else>第 {{ current.page_order }} 个文件 · {{ formatBytes(current.size) }}</template>
-          <template v-if="kind === 'pdf'"> · PDF 共 {{ pageCount }} 页</template>
+          <template v-if="kind === 'pdf'"> · {{ reviewPages ? `本次选中 ${reviewPages.length} 页` : `PDF 共 ${pageCount} 页` }}</template>
         </text>
       </view>
       <text v-if="isFake" class="demo-tag">演示识别结果</text>
@@ -300,16 +319,16 @@ defineExpose({ reload: render })
 
     <view class="toolbar">
       <view v-if="kind === 'pdf'" class="toolbar-group">
-        <button class="ui-button secondary small" :disabled="page <= 1" @click="changePage(-1)">上一页</button>
-        <text class="toolbar-text">{{ page }} / {{ pageCount }} 页</text>
-        <button class="ui-button secondary small" :disabled="page >= pageCount" @click="changePage(1)">下一页</button>
+        <button class="ui-button secondary small" :disabled="!canPreviousPage" @click="changePage(-1)">上一页</button>
+        <text class="toolbar-text">{{ reviewPages ? `第 ${page} 页 · 共选 ${reviewPages.length} 页` : `${page} / ${pageCount} 页` }}</text>
+        <button class="ui-button secondary small" :disabled="!canNextPage" @click="changePage(1)">下一页</button>
       </view>
       <view class="toolbar-group">
         <button class="ui-button secondary small" :disabled="zoomIndex === 0" @click="changeZoom(-1)">缩小</button>
         <text class="toolbar-text">{{ zoom === 1 ? '适应宽度' : `${zoom}×` }}</text>
         <button class="ui-button secondary small" :disabled="zoomIndex >= ZOOM_STEPS.length - 1" @click="changeZoom(1)">放大</button>
       </view>
-      <button v-if="current" class="ui-button secondary small" @click="downloadCurrent">下载原件</button>
+      <button v-if="current && (!reviewPages || reviewPages.length === pageCount)" class="ui-button secondary small" @click="downloadCurrent">下载原件</button>
     </view>
 
     <scroll-view class="canvas" scroll-x scroll-y :scroll-top="scrollTop" :scroll-left="scrollLeft"
