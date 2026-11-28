@@ -43,7 +43,7 @@ const paperSource = computed(() => {
   return field?.status === 'recognized' ? field.rawText?.trim() || null : null
 })
 /** 用户在这一页上点过「此来源正确」——只管这一次打开，不写库。 */
-const sourceChecked = ref(false)
+const sourceCheckedName = ref<string | null>(null)
 /**
  * 来源这一格也给「此来源正确 / 修改」那一对（2026-11-24 反馈，第 17 节 ⑤）。
  *
@@ -57,7 +57,8 @@ const sourceChecked = ref(false)
  * 核对」是假话。点「此来源正确」也不写库——库里本来就记着它已被确认，这一下只是
  * 「我看过了」，所以刷新之后会再出现一次。
  */
-const sourceReview = computed(() => props.canManage && !sourceChecked.value
+const sourceReview = computed(() => props.canManage && sourceCheckedName.value !== form.value.source_name.trim()
+  && !editingSuggestions.value.has('source_name')
   && suggestion('source_name') === null
   && paperSource.value !== null && form.value.source_name.trim() !== '')
 /** 纸面读的和填着的不是同一家——这一句才值得占一行。 */
@@ -71,17 +72,20 @@ function values(item: Invoice): HeaderForm {
     invoice_total: item.invoice_total ?? ''
   }
 }
-function reset(item: Invoice) {
+function reset(item: Invoice, preserveSourceCheck = false) {
+  const checkedSource = preserveSourceCheck && sourceCheckedName.value === (item.source_name ?? '').trim()
   form.value = values(item)
   baseline.value = values(item)
   editingSuggestions.value = new Set()
   fieldError.value = {}
   errorText.value = ''
-  sourceChecked.value = false
+  if (!checkedSource) sourceCheckedName.value = null
 }
 const dirty = computed(() => fields.some(({ key }) => form.value[key] !== baseline.value[key]) || editingSuggestions.value.size > 0)
 watch(() => props.invoice.id, () => reset(props.invoice), { immediate: true })
-watch(() => props.invoice, (item) => { if (!dirty.value) reset(item) })
+// Saving another header field replaces the invoice prop. Keep the user's source
+// check while the source itself has not changed; a different source needs review.
+watch(() => props.invoice, (item) => { if (!dirty.value) reset(item, true) })
 
 function suggestion(key: HeaderKey): string | null {
   if (!props.canManage || props.invoice.header_reviewed_fields.includes(key) || editingSuggestions.value.has(key)) return null
@@ -163,20 +167,23 @@ async function savePending(): Promise<boolean> {
 function accept(key: HeaderKey) {
   const value = suggestion(key)
   if (!value) return
+  const invoiceId = props.invoice.id
   // 纸上的总额印的是「$1,040.00」，这个框只收 `1040.00`。照单收下会存不进去，
   // 而失败只会在行那边显示成「请先检查并保存单据信息」（多文件计划 M12）。
   form.value[key] = key === 'invoice_total' ? plainAmount(value) : value
   editingSuggestions.value = new Set([...editingSuggestions.value, key])
-  void save([key])
+  void save([key]).then((ok) => {
+    if (ok && key === 'source_name' && props.invoice.id === invoiceId) sourceCheckedName.value = form.value.source_name.trim()
+  })
 }
 function edit(key: HeaderKey) {
   form.value[key] = ''
   editingSuggestions.value = new Set([...editingSuggestions.value, key])
-  if (key === 'source_name') sourceChecked.value = true
+  if (key === 'source_name') sourceCheckedName.value = null
 }
 /** 「此来源正确」：这一格的值已经在库里，点一下只是把这一对收起来。 */
 function confirmSource() {
-  sourceChecked.value = true
+  sourceCheckedName.value = form.value.source_name.trim()
 }
 function changeCurrency(value: string | number) {
   form.value.currency = ['USD', 'CNY'][Number(value)] ?? 'USD'

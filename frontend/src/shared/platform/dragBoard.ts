@@ -206,3 +206,50 @@ export function attachDragHandle(target: unknown, onPress: (event: unknown) => v
   element.addEventListener('pointerdown', handler)
   return () => element.removeEventListener('pointerdown', handler)
 }
+
+/** Long-press a floating tray's header to place it elsewhere in the viewport. */
+export function attachFloatingHandle(
+  target: unknown,
+  tray: unknown,
+  onPosition: (left: number, top: number) => void
+): () => void {
+  const handle = elementOf(target)
+  const panel = elementOf(tray)
+  if (!handle || !panel || !boardDragSupported()) return () => {}
+  let cleanupSession = () => {}
+  const down = (origin: PointerEvent) => {
+    if (!origin.isPrimary || (origin.pointerType === 'mouse' && origin.button !== 0)) return
+    cleanupSession()
+    const pointerId = origin.pointerId
+    const startX = origin.clientX
+    const startY = origin.clientY
+    const rect = panel.getBoundingClientRect()
+    let ready = false
+    const timer = window.setTimeout(() => { ready = true }, 320)
+    const finish = () => {
+      window.clearTimeout(timer)
+      window.removeEventListener('pointermove', move)
+      window.removeEventListener('pointerup', finishEvent)
+      window.removeEventListener('pointercancel', finishEvent)
+      cleanupSession = () => {}
+    }
+    const move = (event: PointerEvent) => {
+      if (event.pointerId !== pointerId) return
+      if (!ready) {
+        if (Math.abs(event.clientX - startX) > 8 || Math.abs(event.clientY - startY) > 8) finish()
+        return
+      }
+      event.preventDefault()
+      const left = Math.max(8, Math.min(window.innerWidth - rect.width - 8, rect.left + event.clientX - startX))
+      const top = Math.max(8, Math.min(window.innerHeight - Math.min(rect.height, window.innerHeight) - 8, rect.top + event.clientY - startY))
+      onPosition(left, top)
+    }
+    const finishEvent = (event: PointerEvent) => { if (event.pointerId === pointerId) finish() }
+    cleanupSession = finish
+    window.addEventListener('pointermove', move, { passive: false })
+    window.addEventListener('pointerup', finishEvent)
+    window.addEventListener('pointercancel', finishEvent)
+  }
+  handle.addEventListener('pointerdown', down)
+  return () => { cleanupSession(); handle.removeEventListener('pointerdown', down) }
+}

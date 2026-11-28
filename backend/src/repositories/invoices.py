@@ -139,6 +139,38 @@ class InvoiceRepository:
         )
         return list(self._session.scalars(statement).unique()), total
 
+    def month_index(
+        self, *, completed: bool | None, date_from: date | None,
+        date_to: date | None, order: str,
+    ) -> list[dict[str, int | str]]:
+        """Month boundaries in the same order and filter as the paged list.
+
+        Read only the two date columns, not files or lines. Offsets let the UI
+        jump to a month without loading every invoice into the browser.
+        """
+        conditions = [Invoice.voided_at.is_(None)]
+        if completed is True:
+            conditions.append(Invoice.completed_at.is_not(None))
+        elif completed is False:
+            conditions.append(Invoice.completed_at.is_(None))
+        if date_from is not None:
+            conditions.append(Invoice.invoice_date >= date_from)
+        if date_to is not None:
+            conditions.append(Invoice.invoice_date <= date_to)
+        rows = self._session.execute(
+            select(Invoice.invoice_date, Invoice.created_at)
+            .where(*conditions).order_by(*_list_ordering(order))
+        )
+        months: list[dict[str, int | str]] = []
+        for offset, (invoice_date, created_at) in enumerate(rows):
+            value = invoice_date if order == ORDER_BY_INVOICE_DATE else created_at
+            key = value.strftime("%Y-%m") if value is not None else "undated"
+            if months and months[-1]["key"] == key:
+                months[-1]["count"] = int(months[-1]["count"]) + 1
+            else:
+                months.append({"key": key, "offset": offset, "count": 1})
+        return months
+
     def add(self, invoice: Invoice) -> Invoice:
         self._session.add(invoice)
         self._session.flush()

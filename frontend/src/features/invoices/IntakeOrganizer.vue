@@ -46,7 +46,7 @@ import {
   type IntakeBatch, type IntakeGroup, type IntakeItem, type IntakeSource, type Invoice
 } from '../../shared/api'
 import { isNarrowViewport, watchViewport } from '../../shared/platform/viewport'
-import { boardDragSupported, cancelBoardDrag, startBoardDrag } from '../../shared/platform/dragBoard'
+import { attachFloatingHandle, boardDragSupported, cancelBoardDrag, startBoardDrag } from '../../shared/platform/dragBoard'
 import DateFieldInput from './DateFieldInput.vue'
 import IntakeCard from './IntakeCard.vue'
 import OriginalDocumentViewer from './OriginalDocumentViewer.vue'
@@ -178,7 +178,10 @@ const viewMenu = ref(false)
  * 项数不到。所以问服务端一次 `missing=recognition_failed`，只要 `total`。
  */
 const failedCount = ref(0)
-const pane = ref<'pending' | 'board'>('pending')
+const stickerOpen = ref(true)
+const stickerPosition = ref({ left: 12, top: 176 })
+const stickerGrip = ref<unknown>(null)
+const stickerPanel = ref<unknown>(null)
 const dragging = ref<{ count: number; x: number; y: number } | null>(null)
 const hoverKey = ref<string | null>(null)
 const canDrag = boardDragSupported()
@@ -187,6 +190,7 @@ let dragItems: IntakeItem[] = []
 let moveCounter = 0
 let stopped = false
 let stopViewport = () => {}
+let detachSticker = () => {}
 let poll: ReturnType<typeof setInterval> | null = null
 
 const board = computed(() => buildBoard(groups.value))
@@ -1058,8 +1062,19 @@ watch(() => props.active, (active) => {
   if (active && batch.value) void refresh()
 })
 
+function bindSticker() {
+  detachSticker()
+  detachSticker = narrow.value && stickerOpen.value
+    ? attachFloatingHandle(stickerGrip.value, stickerPanel.value, (left, top) => {
+      stickerPosition.value = { left, top }
+    })
+    : () => {}
+}
+watch([narrow, stickerOpen], bindSticker, { flush: 'post' })
+
 onMounted(() => {
   void boot()
+  bindSticker()
   stopViewport = watchViewport((value) => { narrow.value = value })
   // Only while splitting is still running: a finished batch is not re-read.
   poll = setInterval(() => {
@@ -1070,6 +1085,7 @@ onMounted(() => {
 onUnmounted(() => {
   stopped = true
   stopViewport()
+  detachSticker()
   cancelBoardDrag()
   if (poll) clearInterval(poll)
 })
@@ -1125,6 +1141,9 @@ onUnmounted(() => {
       <text>{{ lastMove.text }}</text>
       <button class="ui-button secondary" :disabled="moving" @click="undoLast">撤销这一步</button>
     </view>
+    <button v-if="narrow && batch && !stickerOpen" class="ui-card collapsed-sticker" :aria-expanded="false" @click="stickerOpen = true">
+      展开待归类（{{ board.pendingCount }}）
+    </button>
     <view v-if="conflict" class="ui-card notice conflict" role="alert">
       <text class="conflict-text">{{ conflict }}</text>
       <text class="muted">页面已经重新读取服务端的最新结果，请确认后再移动。</text>
@@ -1141,28 +1160,22 @@ onUnmounted(() => {
       <button class="ui-button" @click="emit('upload')">去上传文件</button>
     </view>
     <template v-else>
-      <view v-if="narrow" class="pane-switch" role="tablist">
-        <button class="pane-tab" :class="{ active: pane === 'pending' }" role="tab"
-          :aria-selected="pane === 'pending' ? 'true' : 'false'" @click="pane = 'pending'">
-          待归类 {{ board.pendingCount }}
-        </button>
-        <button class="pane-tab" :class="{ active: pane === 'board' }" role="tab"
-          :aria-selected="pane === 'board' ? 'true' : 'false'" @click="pane = 'board'">
-          日期分组 {{ board.dated.length }}
-        </button>
-      </view>
-
       <view class="layout" :class="{ narrow }">
-        <view v-if="!narrow || pane === 'pending'" class="ui-card column pending" :class="zoneClass(PENDING_ZONE)"
+        <view v-if="!narrow || stickerOpen" ref="stickerPanel" class="ui-card column pending" :class="[zoneClass(PENDING_ZONE), { 'floating-stickers': narrow }]"
+          :style="narrow ? { left: `${stickerPosition.left}px`, top: `${stickerPosition.top}px` } : undefined"
           :data-drop-key="dropKey(PENDING_ZONE)">
           <view class="column-head">
             <text class="section-title">待归类 · {{ board.pendingCount }} 项</text>
-            <button v-if="pendingBucket?.items.length" class="ui-button ghost small" @click="selectAllPending">
-              {{ pendingBucket.items.every(item => selectedIds.has(item.id)) ? '取消本页选择' : '选中本页' }}
-            </button>
+            <view class="pending-head-actions">
+              <button v-if="pendingBucket?.items.length" class="ui-button ghost small" @click="selectAllPending">
+                {{ pendingBucket.items.every(item => selectedIds.has(item.id)) ? '取消本页选择' : '选中本页' }}
+              </button>
+              <view v-if="narrow" ref="stickerGrip" class="sticker-grip" aria-label="长按移动待归类贴片">长按移动 ⠿</view>
+              <button v-if="narrow" class="ui-button ghost small" @click="stickerOpen = false">收起</button>
+            </view>
           </view>
           <text class="muted hint">
-            {{ narrow ? '先选中内容，再切到「日期分组」点目标组。' : canDrag ? '按住卡片右边的手柄拖动：拖到日期标题只定日期，拖到商家组同时定日期和商家。也可以选中后点目标组的按钮。' : '选中内容后点目标组的按钮完成归类。' }}
+            {{ narrow ? '长按顶部可移动贴片；按卡片右侧的拖动手柄可拖到分组，也可选中后点目标组。' : canDrag ? '按住卡片右边的手柄拖动：拖到日期标题只定日期，拖到商家组同时定日期和商家。也可以选中后点目标组的按钮。' : '选中内容后点目标组的按钮完成归类。' }}
           </text>
           <view v-if="pendingBucket?.error" class="warn-text" role="alert">{{ pendingBucket.error }}</view>
           <text v-if="pendingBucket?.loading && !pendingBucket.items.length" class="muted" role="status">正在读取…</text>
@@ -1173,6 +1186,7 @@ onUnmounted(() => {
           <view v-else class="cards">
             <IntakeCard v-for="item in pendingBucket.items" :key="item.id" :item="item"
               :selected="selectedIds.has(item.id)" :draggable="canDrag && canMove" :confirmable="canMove && !moving"
+              :compact="narrow"
               :proposed-date="false" :proposed-source="false" :start-problem="startProblem(item, null, null)"
               @toggle="toggle(item)" @preview="openPreview(item)" @menu="openCardMenu(item)"
               @drag="beginDrag(item, $event)" @confirm-date="confirmSuggestedDate(item, $event)"
@@ -1185,7 +1199,7 @@ onUnmounted(() => {
           </view>
         </view>
 
-        <view v-if="!narrow || pane === 'board'" class="column groups">
+        <view class="column groups">
           <view class="ui-card new-date">
             <text class="section-title">新建日期类别</text>
             <DateFieldInput v-model="newDate" label="新日期类别" :disabled="dateBusy || !canMove" />
@@ -1563,15 +1577,15 @@ onUnmounted(() => {
 .notice-line { padding: 0 4px; }
 .empty { display: flex; flex-direction: column; align-items: flex-start; gap: 10px; padding: 20px; }
 .empty-inline { padding: 8px 0; color: var(--muted); font-size: 13px; line-height: 1.6; }
-.pane-switch { display: flex; gap: 8px; }
-.pane-tab { flex: 1; min-height: 44px; margin: 0; padding: 10px; border: 1px solid var(--line); border-radius: 8px; background: #fff; color: var(--muted); font-size: 14px; font-weight: 650; cursor: pointer; }
-.pane-tab::after { border: 0; }
-.pane-tab.active { border-color: var(--green); background: #eef4ec; color: var(--ink); }
 .layout { display: grid; grid-template-columns: minmax(300px, 360px) 1fr; gap: 12px; align-items: start; }
 .layout.narrow { grid-template-columns: 1fr; }
 .column { min-width: 0; }
-.pending { display: flex; flex-direction: column; gap: 10px; padding: 16px; }
+.pending { position: sticky; top: 12px; max-height: calc(100vh - 24px); overflow-y: auto; display: flex; flex-direction: column; gap: 10px; padding: 16px; }
 .column-head { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px; }
+.pending-head-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 4px; }
+.collapsed-sticker { align-self: flex-start; min-height: 44px; margin: 0; padding: 10px 16px; border: 1px solid var(--green); border-radius: 9px; background: #eef6ef; color: var(--green); font-size: 14px; font-weight: 700; cursor: pointer; }
+.collapsed-sticker::after { border: 0; }
+.sticker-grip { min-height: 44px; display: flex; align-items: center; padding: 6px 10px; border: 1px dashed var(--green); border-radius: 8px; color: var(--green); font-size: 12px; font-weight: 650; cursor: grab; touch-action: none; user-select: none; }
 .section-title { font-size: 16px; font-weight: 650; }
 .hint { font-size: 12px; }
 .cards { display: flex; flex-direction: column; gap: 8px; }
@@ -1595,7 +1609,7 @@ onUnmounted(() => {
 .select-bar { position: fixed; left: 0; right: 0; bottom: 0; z-index: 12; display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 10px; padding: 12px 20px calc(12px + env(safe-area-inset-bottom)); border-top: 1px solid var(--line); background: #fff; }
 .select-count { font-size: 15px; font-weight: 650; }
 .select-actions { display: flex; flex-wrap: wrap; gap: 8px; }
-.overlay { position: fixed; inset: 0; z-index: 20; display: flex; align-items: center; justify-content: center; padding: 16px; background: rgba(23, 59, 46, .45); }
+.overlay { position: fixed; inset: 0; z-index: 20; display: flex; align-items: center; justify-content: center; padding: 16px; background: var(--dialog-scrim); }
 .sheet { width: min(100%, 420px); max-height: 86vh; overflow-y: auto; display: flex; flex-direction: column; gap: 10px; padding: 20px; }
 .sheet.wide { width: min(100%, 520px); }
 .sheet-title { font-size: 16px; font-weight: 700; overflow-wrap: anywhere; }
@@ -1614,5 +1628,11 @@ onUnmounted(() => {
   .head { padding: 16px; }
   .section { padding: 12px; }
   .group-actions { width: 100%; }
+  .pending.floating-stickers { position: fixed; z-index: 11; width: min(250px, calc(100vw - 28px)); max-height: min(64vh, 580px); padding: 10px; background: #fffef8; border-color: var(--green); box-shadow: 0 10px 28px rgba(23, 59, 46, .22); }
+  .floating-stickers .hint { display: none; }
+  .floating-stickers .column-head { position: sticky; top: -10px; z-index: 1; padding: 5px 0; background: #fffef8; }
+  .floating-stickers .section-title { font-size: 14px; }
+  .floating-stickers .pending-head-actions { width: 100%; justify-content: space-between; }
+  .floating-stickers .pending-head-actions .ui-button { min-height: 40px; }
 }
 </style>

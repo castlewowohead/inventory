@@ -8,7 +8,7 @@ import IntakeOrganizer from '../../features/invoices/IntakeOrganizer.vue'
 import IntakeLedger from '../../features/invoices/IntakeLedger.vue'
 import IngredientList from '../../features/ingredients/IngredientList.vue'
 import PriceWorkspace from '../../features/prices/PriceWorkspace.vue'
-import { ApiError, errorMessage, getCategories, getCurrentIntakeBatch, getHealth } from '../../shared/api'
+import { ApiError, errorMessage, getCategories, getCurrentIntakeBatch, getHealth, getIntakeBatch } from '../../shared/api'
 import { confirmLeave, pendingLeaveReason, watchPageUnload } from '../../shared/platform/leaveGuard'
 import { isCancelledPick, pickIntakeFiles, type PickedFile } from '../../shared/platform/filePicker'
 import { countLocalPages } from '../../shared/platform/documentPreview'
@@ -20,6 +20,7 @@ import {
 } from '../../shared/platform/workspaceNavigation'
 
 const location = ref<WorkspaceLocation>(readWorkspaceLocation())
+const boardRoutePending = ref(location.value.view === 'organize' || location.value.view === 'ledger')
 const seenOrganize = ref(location.value.view === 'organize')
 const seenLedger = ref(location.value.view === 'ledger')
 watch(() => location.value.view, (view) => {
@@ -37,7 +38,7 @@ const batchFiles = ref<PickedFile[]>([])
 const currentBatchId = ref<number | null>(null)
 const reviewQueue = ref<number[]>([])
 /**
- * Where the fill page was entered from, so 返回 and 完成单据 land back there.
+ * Where the fill page was entered from while its source batch is still open.
  *
  * 第 11 节 ⑤: the whole batch should be finishable from the organizing board,
  * so a draft opened from it must not drop the user in the invoice database on
@@ -51,6 +52,28 @@ let stopUnload = () => {}
 function go(next: WorkspaceLocation) {
   location.value = next
   writeWorkspaceLocation(next)
+}
+
+/** A finished batch is historical evidence; its classification board is no longer a destination. */
+async function openBatchId(batchId: number | null | undefined): Promise<number | null> {
+  if (batchId == null) return null
+  try { return (await getIntakeBatch(batchId)).status === 'open' ? batchId : null }
+  catch { return null }
+}
+
+function replaceClosedBoard() {
+  const next: WorkspaceLocation = { view: 'invoices', invoiceId: null }
+  location.value = next
+  writeWorkspaceLocation(next, true)
+  void invoiceList.value?.refresh()
+}
+
+async function verifyInitialBoard() {
+  const initial = location.value
+  if (initial.view !== 'organize' && initial.view !== 'ledger') return
+  const openId = await openBatchId(initial.batchId)
+  if (location.value === initial && openId === null) replaceClosedBoard()
+  boardRoutePending.value = false
 }
 
 /** Every view switch asks the components first; unsaved input is theirs to keep. */
@@ -133,11 +156,14 @@ function batchOpened(id: number) {
 async function openOrganize(id: number) {
   if (!await confirmLeave()) return
   batchFiles.value = []
+  if (await openBatchId(id) === null) { go({ view: 'invoices', invoiceId: null }); return }
   go({ view: 'organize', invoiceId: null, batchId: id })
 }
 
-function switchIntakeView(view: 'organize' | 'ledger') {
-  go({ view, invoiceId: null, batchId: location.value.batchId ?? currentBatchId.value })
+async function switchIntakeView(view: 'organize' | 'ledger') {
+  const batchId = await openBatchId(location.value.batchId ?? currentBatchId.value)
+  if (batchId === null) { go({ view: 'invoices', invoiceId: null }); return }
+  go({ view, invoiceId: null, batchId })
 }
 
 async function backToBatchUpload() {
@@ -188,12 +214,9 @@ async function switchReview(id: number) {
 
 async function backToInvoices(batchId: number | null) {
   if (!await confirmLeave()) return
-  if (batchId !== null) {
-    go({ view: 'organize', invoiceId: null, batchId })
-    return
-  }
-  if (reviewOrigin.value !== 'invoices') {
-    go({ view: reviewOrigin.value, invoiceId: null, batchId: currentBatchId.value })
+  const openId = await openBatchId(batchId)
+  if (openId !== null) {
+    go({ view: reviewOrigin.value === 'ledger' ? 'ledger' : 'organize', invoiceId: null, batchId: openId })
     return
   }
   go({ view: 'invoices', invoiceId: null })
@@ -206,22 +229,18 @@ async function backToInvoices(batchId: number | null) {
  * ⚠️ 不能只看 `reviewOrigin`：它是内存里的一个 ref，刷新一下就回到默认的
  * 「单据库」，从单据库点进来接着填的那一张也一样。于是填完一张就被丢回单据库，
  * 而第 11 节 ⑤ 说好的是整批在整理页里走完（2026-11-24 反馈，第 22 节）。
- * 还开着的那一批是 `/current` 那一个，所以这里只认它；已经收口的批次回单据库。
+ * 批次是否仍开放以服务端状态为准；已经收口的批次回单据库。
  */
-function completedInvoice(batchId: number | null) {
+async function completedInvoice(batchId: number | null) {
   const currentIndex = reviewQueue.value.indexOf(location.value.invoiceId ?? -1)
   if (currentIndex >= 0 && currentIndex + 1 < reviewQueue.value.length) {
     go({ view: 'review', invoiceId: reviewQueue.value[currentIndex + 1] })
     return
   }
   reviewQueue.value = []
-  // Came from the board: go back to it, with one more group finished.
-  if (reviewOrigin.value !== 'invoices') {
-    go({ view: reviewOrigin.value, invoiceId: null, batchId: currentBatchId.value })
-    return
-  }
-  if (batchId !== null && batchId === currentBatchId.value) {
-    go({ view: 'organize', invoiceId: null, batchId })
+  const openId = await openBatchId(batchId)
+  if (openId !== null) {
+    go({ view: reviewOrigin.value === 'ledger' ? 'ledger' : 'organize', invoiceId: null, batchId: openId })
     return
   }
   go({ view: 'invoices', invoiceId: null })
@@ -254,6 +273,10 @@ async function syncHistory() {
     writeWorkspaceLocation(current)
     return
   }
+  if ((next.view === 'organize' || next.view === 'ledger') && await openBatchId(next.batchId) === null) {
+    replaceClosedBoard()
+    return
+  }
   if (current.view === 'batch' && next.view !== 'batch') batchFiles.value = []
   location.value = next
   if (next.view === 'invoices') void invoiceList.value?.refresh()
@@ -278,10 +301,12 @@ async function checkConnection() {
 
 onMounted(() => {
   location.value = readWorkspaceLocation()
+  boardRoutePending.value = location.value.view === 'organize' || location.value.view === 'ledger'
   stopHistory = onWorkspaceHistoryChange(() => { void syncHistory() })
   stopUnload = watchPageUnload()
   void checkConnection()
   void readCurrentBatch()
+  void verifyInitialBoard()
 })
 onUnmounted(() => { stopHistory(); stopUnload() })
 </script>
@@ -313,7 +338,7 @@ onUnmounted(() => { stopHistory(); stopUnload() })
         </view>
         <InvoiceUpload v-if="location.view === 'upload'" mode="create" :initial-files="uploadFiles" :auto-start="true" @uploaded="finishedUpload" @open-existing="finishedUpload" @open-batch="openBatchFromLegacy" @close="goHome" />
         <IntakeBatchUpload v-if="location.view === 'batch'" :batch-id="location.batchId" :initial-files="batchFiles" @opened="batchOpened" @list="navigate('invoices')" @organize="openOrganize" />
-        <view v-if="location.view === 'organize' || location.view === 'ledger'" class="intake-views">
+        <view v-if="!boardRoutePending && (location.view === 'organize' || location.view === 'ledger')" class="intake-views">
           <IntakeOrganizer v-if="seenOrganize" v-show="location.view === 'organize'" :active="location.view === 'organize'" :batch-id="location.batchId" @opened="batchOpened" @upload="backToBatchUpload" @ledger="switchIntakeView('ledger')" @review="openReviewSelection" @finished="finishedOrganizing" />
           <IntakeLedger v-if="seenLedger" v-show="location.view === 'ledger'" :active="location.view === 'ledger'" :batch-id="location.batchId" @opened="batchOpened" @upload="backToBatchUpload" @cards="switchIntakeView('organize')" @review="openReview($event, 'ledger')" />
         </view>

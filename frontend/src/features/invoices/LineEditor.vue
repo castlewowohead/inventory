@@ -54,6 +54,7 @@ const MONEY_FIELDS = ['quantity', 'unit_price', 'line_amount'] as const
 
 const draft = ref<LineDraft>(draftOf(props.line))
 const newCategoryId = ref<number | null>(null)
+const newFoodNames = ref<{ name: string; name_zh: string | null }>({ name: draft.value.description, name_zh: null })
 const fieldErrors = ref<Partial<Record<DraftField, string>>>({})
 const saving = ref(false)
 const saveError = ref('')
@@ -149,6 +150,7 @@ function confirmLeaveLine(): Promise<boolean> {
       content: `第 ${props.line.line_no} 行改了 ${names}，还没有保存。先点「保存这一行」，或者放弃这些修改。`,
       confirmText: '放弃修改',
       cancelText: '留在本行',
+      confirmColor: '#9a3b2f',
       success: (result) => {
         if (result.confirm) draft.value = draftOf(props.line)
         resolve(Boolean(result.confirm))
@@ -251,12 +253,18 @@ async function confirmLine(acceptMismatch = false) {
       actionError.value = '请先填写这行的采购单位，首次入账时会作为食材的默认单位。'
       return
     }
-    if (!stored.food_item && stored.line_kind === 'purchase' && name && name.length <= 100) {
+    const foodName = newFoodNames.value.name.trim()
+    const foodNameZh = newFoodNames.value.name_zh?.trim() || null
+    if (!stored.food_item && stored.line_kind === 'purchase' && !foodName) {
+      actionError.value = '请填写新食材名称。'
+      return
+    }
+    if (!stored.food_item && stored.line_kind === 'purchase' && foodName.length <= 100) {
       try {
-        const page = await getFoodItems(`?q=${encodeURIComponent(name)}&limit=20`)
+        const page = await getFoodItems(`?q=${encodeURIComponent(foodName)}&limit=20`)
         const normalized = (value: string) => value.normalize('NFKC').trim().replace(/\s+/g, ' ').toLowerCase()
-        const exact = page.items.find((item) => normalized(item.name) === normalized(name)
-          || (item.name_zh && normalized(item.name_zh) === normalized(name)))
+        const exact = page.items.find((item) => normalized(item.name) === normalized(foodName)
+          || (item.name_zh && normalized(item.name_zh) === normalized(foodName)))
         existingFoodId = exact?.id ?? null
       } catch (error) {
         actionError.value = `查找已有食材失败：${errorMessage(error)}。请重试确认。`
@@ -272,7 +280,8 @@ async function confirmLine(acceptMismatch = false) {
       ...(stored.food_item || existingFoodId ? { food_item_id: stored.food_item?.id ?? existingFoodId }
         : stored.line_kind === 'adjustment' ? { food_item_id: null }
           : { new_food_item: {
-            name,
+            name: foodName,
+            name_zh: foodNameZh,
             category_id: newCategoryId.value as number,
             use_purchase_unit_as_base: true as const
           } }),
@@ -363,6 +372,7 @@ async function unconfirmLine() {
     title: '修改这行入库记录？',
     content: `第 ${props.line.line_no} 行原来的入库记录会撤销并保留历史。修改后请重新确认这一行入库。`,
     confirmText: '继续修改', cancelText: '取消',
+    confirmColor: '#176b4d',
     success: (result) => resolve(Boolean(result.confirm)), fail: () => resolve(false)
   }))
   if (!ok) return
@@ -439,6 +449,7 @@ async function removeLine() {
       title: '删掉这一行？',
       content: `第 ${props.line.line_no} 行是手工加的，删掉后不会留下记录。识别出来的行不能删——那种请标成「跳过」。`,
       confirmText: '删掉这一行', cancelText: '不删',
+      confirmColor: '#9a3b2f',
       success: (result) => resolve(Boolean(result.confirm)),
       fail: () => resolve(false)
     })
@@ -461,6 +472,7 @@ async function removeRecognizedLine() {
       title: '移除多余行？',
       content: `确定移除第 ${props.line.line_no} 行？`,
       confirmText: '移除这一行', cancelText: '保留',
+      confirmColor: '#9a3b2f',
       success: (result) => resolve(Boolean(result.confirm)),
       fail: () => resolve(false)
     })
@@ -475,6 +487,7 @@ async function removeRecognizedLine() {
 watch(() => props.line.id, () => {
   draft.value = draftOf(props.line)
   newCategoryId.value = null
+  newFoodNames.value = { name: draft.value.description, name_zh: null }
   dismissed.value = new Set()
   activeCandidate.value = candidateFields.find((key) => suggestion(key)) ?? null
   focusField.value = null
@@ -621,6 +634,7 @@ watch(() => props.line.id, () => {
         @choose="patch({ food_item_id: $event }, '已选定食材并保存。')"
         @clear="patch({ food_item_id: null }, '已取消这一行的食材。')"
         @category-change="newCategoryId = $event"
+        @name-change="newFoodNames = $event"
       />
       <view v-else-if="line.food_item" class="chosen-readonly">
         <text class="field-label">{{ FIELD_LABEL.food_item_id }}</text>

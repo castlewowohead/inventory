@@ -1210,6 +1210,26 @@ class InvoiceService:
                 offset=clean_offset,
             )
 
+    def invoice_months(
+        self, *, completed: bool | None = None, date_from: Any = None,
+        date_to: Any = None, order: Any = ORDER_BY_CREATED_AT,
+    ) -> list[dict[str, int | str]]:
+        """Month jump positions for the same visible invoice list."""
+        parsed_from = _filter_date(date_from, field="date_from")
+        parsed_to = _filter_date(date_to, field="date_to")
+        if parsed_from and parsed_to and parsed_from > parsed_to:
+            raise ValidationError("开始日期不能晚于结束日期。", details={"field": "date_from"})
+        if order not in LIST_ORDERS:
+            raise ValidationError(
+                f"order 只能是 {' 或 '.join(sorted(LIST_ORDERS))}，收到 {order!r}。",
+                details={"field": "order"},
+            )
+        with self._database.unit_of_work() as session:
+            return InvoiceRepository(session).month_index(
+                completed=completed, date_from=parsed_from,
+                date_to=parsed_to, order=order,
+            )
+
     def match_candidates_for(
         self, description: str, *, source_name: str | None = None
     ) -> tuple[MatchCandidateView, ...]:
@@ -1903,6 +1923,16 @@ class InvoiceService:
             if type(use_line_unit) is not bool:
                 raise ValidationError("use_purchase_unit_as_base 必须是布尔值。")
             if use_line_unit:
+                # The invoice description stays intact on the purchase record.
+                # A first-time food item has separate English/Chinese name slots.
+                # Reuse the same conservative script/packaging splitter as OCR
+                # auto-creation when a client sends the raw bilingual description.
+                raw_name = payload.get("name")
+                if isinstance(raw_name, str) and not payload.get("name_zh"):
+                    keywords = matching.extract_keywords(raw_name)
+                    if keywords.name and keywords.name_zh:
+                        payload["name"] = keywords.name
+                        payload["name_zh"] = keywords.name_zh
                 name = payload.get("name")
                 if isinstance(name, str) and name.strip():
                     normalized = normalize_name(name)

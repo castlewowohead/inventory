@@ -1039,3 +1039,111 @@ if ((field === 'quantity' || field === 'unit_price' || field === 'line_amount')
 - **修改文件**：`backend/src/repositories/intake.py`、`backend/src/api/intake.py`、`backend/tests/test_intake_service.py`、`test_intake_api.py`、`test_intake_reviews.py`、`backend/tools/smoke_multifiles_s11.mjs`、`frontend/src/pages/workspace/index.vue`、两份 README、本节与 `impl_record.md`。无迁移，不改批次 #1/#2 的数据库行。
 - **自动化**：后端定向 `79 passed`；前端 `typecheck`、`build:h5` 退出码 0。新测试验证空批次不占 `/current`、有待处理文件后可恢复、较新的空批次不会挡住较旧的非空批次、最后一个文件撤下后恢复入口消失。隔离 Edge 无头脚本先创建空批次，再完成另一个批次；`passed: true`，末尾 `/current` 为 404、首页无「接着整理」。
 - **本机服务**：确认无排队/运行中的提取任务后重启本仓库 5000 服务。重启后 `/health=ok`、`/current=404`；#1 仍为 `open` 且文件数 0，#2 仍为 `closed`、5 项、未完成 0。没有替用户改动或删除这两个批次。
+
+## 27. 2026-11-28 单据库增加图标视图与原件缩略预览
+
+单据库工具栏右侧新增「列表 / 图标」切换，待处理和已完成页签共用。列表维持现有排版；图标视图以网格展示同一批单据，仍能打开详情、重命名、删除和勾选导出。排序、时间范围与服务端分页不因展示方式变化。文件轮廓和类型标记区分表格（CSV/XLSX）、PDF、图片（JPG/PNG/HEIC）；PDF 预览关联内容的实际页，图片显示原件，表格显示导入时留下的原始单元格。无法解码或没有可展示证据时给出占位说明，点击卡片仍可进详情。浏览器内按可见区域加载，离开视图时释放临时图片 URL。
+
+### 验证记录（2026-11-28；隔离 SQLite + Edge 无头浏览器，Fake 识别器）
+
+- **修改文件**：`frontend/src/features/invoices/InvoiceList.vue`、新增 `InvoiceIconPreview.vue`、`backend/tools/smoke_invoice_ledger_browser.mjs`、`frontend/README.md`、本节与 `backend/docs/impl_record.md`。无数据库迁移或 API 改动。
+- **验证**：`npm.cmd --prefix frontend run typecheck`、`npm.cmd --prefix frontend run build:h5` 均退出码 0；`node backend/tools/smoke_invoice_ledger_browser.mjs` 最终 `passed: true`。脚本实点「图标」与「列表」切换，核对 PDF 第 4 页渲染成图片、有效 PNG 渲染成图片、CSV 原始单元格出现「鸡胸肉」，并继续跑原有排序、筛选、导出、拆并单据流程。首轮因烟测静态服务器未给 `.mjs` worker 正确 MIME，PDF 预览失败；补齐 MIME 后通过。这是烟测服务器配置，不是产品接口变更。
+- **边界**：本轮 CSV/XLSX 都用相同的原始单元格证据路径，但浏览器只实测 CSV；XLSX 已有后端原始单元格保存测试，本轮未用 XLSX 实点图标。HEIC 预览取决于当前浏览器解码能力，App 真机未测。大图与大 PDF 仍需读取原始字节后在浏览器生成缩略图，列表外的卡片通过可见区域加载减少同时请求；本轮未做大批量性能测试，也没有真实 OCR 调用。
+
+## 28. 2026-11-28 图标视图反馈：整卡文件轮廓与可读局部预览
+
+用户反馈图标视图的白色外卡片与里面的文件框重复占位，原件缩到整页后字太小。现在整张卡片直接承载文件类型外轮廓：PDF 是红色折角纸，表格是绿色平边纸，图片是蓝色相框；里面不再有第二层文件边框。PDF/图片缩略图改为在浏览器绘制顶部局部裁切，按原先整页适配尺寸约 3.2 倍放大；若原件特别狭长，还会放大到足以填满预览窗口。裁切允许只看到原件的一部分，点击仍进入完整原件所在的单据详情。CSV/XLSX 原始单元格每行变高、字号变大，减少同屏列数。
+
+### 验证记录（2026-11-28；隔离 SQLite + Edge 无头浏览器，Fake 识别器）
+
+- **修改文件**：`frontend/src/features/invoices/InvoiceList.vue`、`InvoiceIconPreview.vue`、新增 `invoiceIcon.ts`、`frontend/src/shared/platform/documentPreview.ts`、`backend/tools/smoke_invoice_ledger_browser.mjs`、`frontend/README.md`、本节与 `backend/docs/impl_record.md`。无迁移或 API 变更，原件字节不变。
+- **验证**：`npm.cmd --prefix frontend run typecheck`、`npm.cmd --prefix frontend run build:h5` 退出码 0；`node backend/tools/smoke_invoice_ledger_browser.mjs` 返回 `passed: true`。浏览器断言 PDF 类型边框在外卡片、内层边框宽度为 0；PDF/PNG 缩略图和 CSV 原始单元格继续渲染，列表/图标切换以及既有排序、筛选、导出、拆并流程通过。另用 `node backend/tools/smoke_invoice_ledger_browser.mjs --visual` 在隔离库把仓库现有真实图片 `backend/samples/real/1.png` 作为原件显示，并截取仅保存在 Git 忽略目录 `backend/var/icon-preview-visual.png` 的本地截图：目视确认外卡片为蓝色图片轮廓、内框消失，预览显示放大的收据上半部，商品行文字明显大于上一版整张缩小图。此视觉核对没有调用 OCR，也没有把客户原件或截图加入 Git。
+- **边界**：浏览器烟测的 PDF 是合成空白页，能验证放大裁切生成与渲染，不能证明所有真实 PDF 版式中的文字都清晰；局部预览固定优先显示页面上部，正文靠下的原件需要点详情查看。未在 App 真机验证，也未做大文件批量性能测量。
+
+## 29. 2026-11-28 图标预览比例回调
+
+用户实看整卡外轮廓后确认外框合适，但 3.2 倍预览把商家抬头和表格两侧裁得太多。预览比例调为 **1.85 倍整页适配**；仍显示页面上部局部，但保留更多左右内容。外卡片、表格预览、原件接口和详情入口不变。
+
+### 验证记录（2026-11-28；隔离 SQLite + Edge 无头浏览器）
+
+- **修改文件**：`frontend/src/shared/platform/documentPreview.ts` 的默认裁切比例、`frontend/README.md`、本节与 `backend/docs/impl_record.md`。无迁移或 API 变更。
+- **验证**：`npm.cmd --prefix frontend run typecheck`、`npm.cmd --prefix frontend run build:h5` 退出码 0；`node backend/tools/smoke_invoice_ledger_browser.mjs --visual` 返回 `passed: true`。用仓库现有图片 `backend/samples/real/1.png` 在浏览器图标卡中生成截图并目视核对：上部收据仍放大，左右和下方可见范围比 3.2 倍版本增加。截图只保存在 Git 忽略的 `backend/var/icon-preview-visual.png`，没有真实 OCR 调用。
+- **边界**：比例基于图标卡片和现有图片的可见性权衡；不同版式的文字大小仍随原件质量变化，完整内容可从详情查看。真实 PDF 字体清晰度与 App 真机未在本轮实测。
+
+## 30. 2026-11-28 图片类型改紫色、图标视图默认打开
+
+用户认为蓝色文件外框容易让人联想到 Word。图片（JPG/PNG/HEIC）外框及顶边改为紫色系；PDF 仍用红色，CSV/XLSX 仍用绿色。单据库首次进入时默认「图标」视图，两个页签都可随时切换回「列表」；排序、筛选、导出和原件预览行为不变。
+
+### 验证记录（2026-11-28；隔离 SQLite + Edge 无头浏览器）
+
+- **修改文件**：`frontend/src/features/invoices/InvoiceList.vue`、`backend/tools/smoke_invoice_ledger_browser.mjs`、`frontend/README.md`、本节与 `backend/docs/impl_record.md`。无迁移或 API 变更。
+- **验证**：`npm.cmd --prefix frontend run typecheck`、`npm.cmd --prefix frontend run build:h5` 退出码 0；`node backend/tools/smoke_invoice_ledger_browser.mjs` 和 `... --visual` 均 `passed: true`。浏览器核对首次进入为图标、图片卡片边框为 `rgb(118, 80, 164)`，然后切列表继续验证原有单据库流程；`--visual` 模式用仓库现有图片生成 Git 忽略目录中的截图，目视核对紫色外框。没有真实 OCR 调用。
+- **边界**：视图选择目前是组件内状态，页面重新打开时恢复默认图标；没有把用户上次选择持久化到浏览器或账号。App 真机未测。
+
+## 31. 2026-11-28 单据库移除列表展示
+
+用户对比两种展示后认为，列表卡片占满整行却只显示少量文字，图标卡片能直接展示原件且同屏可见更多单据。单据库因此统一使用图标卡片，不再显示「列表 / 图标」切换。待处理与已完成页签、排序、日期筛选、分页、原件预览、打开详情、重命名、删除和勾选导出继续使用已有路径。图标卡片补充非零的「待核对」与「已跳过」数量，保留列表中对例外情况的提示。
+
+### 验证记录（2026-11-28；隔离 SQLite + Edge 无头浏览器）
+
+- **修改文件**：`frontend/src/features/invoices/InvoiceList.vue`、`backend/tools/smoke_invoice_ledger_browser.mjs`、`frontend/README.md`、本节和本地实施记录 `backend/docs/impl_record.md`。无迁移、API 或 OCR 改动。
+- **验证**：`npm.cmd --prefix frontend run typecheck`、`npm.cmd --prefix frontend run build:h5` 退出码 0；`node backend/tools/smoke_invoice_ledger_browser.mjs` 返回 `passed: true`。浏览器核对待处理和已完成页签均为图标卡片、切换控件与旧列表卡片均不存在；按录入时间和按采购日期的排序、日期范围筛选、PDF/图片/CSV 原件预览、已完成单据勾选导出、拆并单据流程通过。新卡片对一张待核对单据显示「待核对 1」，对两张跳过一行后完成的单据显示「已跳过 1」。`git diff --check` 退出码 0，只有现有 LF/CRLF 提示。
+- **边界**：本轮使用 Fake 识别器与隔离库，没有真实 OCR 调用；浏览器只跑桌面宽度，窄屏触摸与 App 真机未测。此前列表展示中的创建日期不再出现在卡片上，已完成页签仍可按创建时间排序；原件页码在预览上可见，完整出处可进详情查看。
+
+## 32. 2026-11-28 图标卡片突出单据发生日期
+
+图标卡片右上角的日期来自 `invoice.invoice_date`，与已完成页签按收据日期排序、日期范围筛选使用的日期一致，是单据发生日期，不是创建日期。用户确认这是最重要的信息之一，要求放大并醒目显示。右上角日期由灰色 12px 改为深色 18px 粗体，数字等宽便于纵向扫视；窄屏原为 10px，改为 15px，保留标题行的换行能力。
+
+### 验证记录（2026-11-28；隔离 SQLite + Edge 无头浏览器）
+
+- **修改文件**：`frontend/src/features/invoices/InvoiceList.vue`、`backend/tools/smoke_invoice_ledger_browser.mjs`、`frontend/README.md`、本节与本地 `backend/docs/impl_record.md`。无迁移、API 或 OCR 改动。
+- **验证**：`npm.cmd --prefix frontend run typecheck`、`npm.cmd --prefix frontend run build:h5` 退出码 0；`node backend/tools/smoke_invoice_ledger_browser.mjs` 与 `... --visual` 都返回 `passed: true`。浏览器确认右上角显示测试单据的 `2026-07-02`，实际计算字号至少 18px、字重至少 700、颜色与卡片标题一致；390px 窄屏实际计算字号至少 15px，日期没有越出卡片。`--visual` 截图保存在 Git 忽略的 `backend/var/icon-preview-visual.png`；目视可见桌面日期在状态标签旁清晰突出。
+- **边界**：本轮没有真实 OCR 调用；窄屏只检查布局和计算样式，没有用真实触摸点击；App 真机未测。
+
+## 33. 2026-11-28 图标卡片精简与批次收口后的返回路径
+
+用户在真实界面看到图标卡片下方的「已跳过 N」和预览右上角的「第 N 页」，认为这两项不需要占据卡片空间。卡片现在只在有待核对行时显示非零数量，不展示已跳过行数；预览只显示文件类型，不显示页码或表格行号。PDF 缩略图仍读取该单据实际关联的页，完整页码和行状态在单据详情及原件记录中保留。
+
+用户从单据库打开已完成单据时，左上角曾因单据带有 `intake_sources` 而显示「返回分类页面」，点击后进入已收口批次的只读分类页。现在返回目标由批次的服务端状态决定：批次 `open` 时仍能回分类页或财务表格；批次 `closed`、不可读取或没有批次来源时回单据库。完成单据后的自动回程也核对同一状态。已收口批次的 `?view=organize` / `?view=ledger` 历史链接在加载时重定向到单据库，浏览器历史导航也受同一规则约束；服务端保留原件和历史记录，不删除批次数据。
+
+### 验证记录（2026-11-28；隔离 SQLite + Edge 无头浏览器）
+
+- **修改文件**：`frontend/src/features/invoices/InvoiceList.vue`、`InvoiceIconPreview.vue`、`InvoiceDetail.vue`、`CompletedInvoiceView.vue`、`frontend/src/pages/workspace/index.vue`、`backend/tools/smoke_invoice_ledger_browser.mjs`、`smoke_multifiles_s11.mjs`、`frontend/README.md`、本节与本地 `backend/docs/impl_record.md`。无迁移、API、OCR 或采购记录改动。
+- **验证**：`npm.cmd --prefix frontend run typecheck`、`npm.cmd --prefix frontend run build:h5` 退出码 0。`node backend/tools/smoke_invoice_ledger_browser.mjs` 与 `... --visual` 返回 `passed: true`，已完成图标卡片不含「已跳过」且预览无页码，PDF 按关联页的缩略路径仍渲染；Git 忽略目录中的桌面截图也目视确认两项文字已移除。`node backend/tools/smoke_multifiles_s11.mjs` 返回 `passed: true`：开放批次的草稿仍可「返回分类页面」；收口后从单据库点击已完成图标卡片，左上角显示「返回单据」，点击落回单据库；已收口卡片整理和财务表格的直接链接均转到单据库。窄屏整理页的布局检查已移到收口之前执行，横向溢出 0px。
+- **边界**：本轮全部使用隔离库与 Fake 识别器，没有真实 OCR 或用户批次写入；App 真机和跨设备导航未测。批次状态读取失败时返回单据库，避免把不确定状态误当作仍可整理。
+
+## 34. 2026-11-28 图标卡片改显总金额、原件默认展开、待归类随屏幕停留
+
+单据库图标卡片不再展示纸面单号，原位置显示已填写的单据总金额及币种；未填写总金额时留空，`0` 仍显示为明确金额。已完成详情也去掉日期旁的单号。已完成单据的原件在详情中默认以内嵌区域展开，可自行收起、再次展开；表格导入的原始文件下载入口也随同一区域的展开状态显示。
+
+桌面整理页的待归类栏使用视口内停留和栏内滚动。窄屏下日期分组常驻页面，待归类内容改为独立卡片组成的浮动贴片：页面滚动时贴片留在视口内，长按贴片顶部可以移动其屏幕位置，卡片自身的拖动手柄仍负责归组。贴片可收起；收起后的「展开待归类」留在撤销提示与日期分组之间的普通页面位置，随页面自然滚动。点选后点目标组的操作继续可用。
+
+### 验证记录（2026-11-28；隔离 SQLite + Edge 无头浏览器，Fake 识别器）
+
+- **修改文件**：`frontend/src/features/invoices/InvoiceList.vue`、`CompletedInvoiceView.vue`、`IntakeOrganizer.vue`、`IntakeCard.vue`、`frontend/src/shared/platform/dragBoard.ts`、两份浏览器烟测脚本、`frontend/README.md`、本节与 `backend/docs/impl_record.md`。没有数据库迁移或 API 改动。
+- **验证**：`npm.cmd --prefix frontend run typecheck` 和 `npm.cmd --prefix frontend run build:h5` 退出码 0；`node backend/tools/smoke_invoice_ledger_browser.mjs` 返回 `passed: true`，验证单号消失、已填总金额出现、未填总金额留空、已完成原件默认展开且可收起再展开；`node backend/tools/smoke_multifiles_s11.mjs` 返回 `passed: true`，验证 390px 宽度无横向溢出、贴片固定在视口、可收起再展开，并用模拟长按指针事件验证可移动位置；`node backend/tools/smoke_multifiles_browser.mjs` 返回 `passed: true`，验证原有卡片拖回待归类仍可用。`git diff --check` 退出码 0，只有工作树已有的换行格式提示。
+- **边界**：本轮没有真实 OCR 或真实用户数据写入。移动贴片的长按在 Edge 的移动视口中用指针事件验证，尚未在 App 真机或实际触摸屏上验证；表格导入仍以下载原始文件供核对。
+
+## 35. 2026-11-28 首次入账食材的中英文名称与来源确认状态
+
+首次入账的新食材不再直接把中英混合的整条商品描述当作标准名。填表页从同一商品行拆出英文主名和中文翻译，分别显示为可修改的输入框；例如 `Pork Spare Rib Cube 靓排粒` 建为英文名 `Pork Spare Rib Cube`、中文翻译 `靓排粒`。用户在确认入账前可核对、修改或清空中文翻译。拆分只依据文字和现有关键词规则，无法证明中英文语义相同，因此这一步不调用额外 LLM，也不等待后台翻译任务；商品描述原文仍保存在单据行与采购记录中。首次入账时后端也会拆分直接传入的中英混合原始名称；英文标准名完全相同时复用已有食材，只有中文名碰撞时交给用户处理，不擅自认定两者为同物。
+
+单据信息里的「此来源正确」只代表本次打开详情时已看过来源。此前保存其它字段会刷新 `invoice` 对象并清空这个本地标记，按钮再次出现。现在同一张单据且来源文字未变化时保留该标记；来源确实变化、切换单据或重新打开详情时才重新要求核对。
+
+### 验证记录（2026-11-28；隔离 SQLite + Edge 无头浏览器，Fake 识别器）
+
+- **修改文件**：`backend/src/services/invoices.py`、`backend/tests/test_invoices_service.py`、`frontend/src/features/invoices/FoodItemMatcher.vue`、`LineEditor.vue`、`InvoiceHeaderEditor.vue`、`backend/tools/smoke_multifiles_s11.mjs`、`frontend/README.md`、本节与 `backend/docs/impl_record.md`。无数据库迁移、API 路由或 OCR 提示词改动。
+- **验证**：后端定向 `test_invoices_service.py` + `test_extraction_service.py` 为 **144 passed**；前端 `typecheck`、`build:h5` 退出码 0。浏览器烟测 `node backend/tools/smoke_multifiles_s11.mjs` 返回 `passed: true`：实填中英混合商品，确认前两个输入框分别显示英文与中文；确认后 API 中 `food_item.name` / `name_zh` 分别为上述两值，单据行仍保留完整原文。浏览器还先点「此来源正确」、再点另一字段的「此数据正确」并等该字段保存，来源按钮没有重现。后端新增回归核对直接传混合名称时的拆分、已存在英文名的复用，以及仅中文名相同而英文名不同时拒绝猜测。
+- **边界**：中英语义是否等价仍需用户在填表时核对，单靠文字脚本无法判断；若两种文字指不同食材，应修改或清空中文翻译。本轮无真实 OCR、新模型调用、用户真实批次写入或 App 真机验证。
+
+## 36. 2026-11-28 单据库月份时间轴与提示框视觉统一
+
+图标单据库按月份分段：待处理按录入月份；已完成默认按单据发生月份，切到创建时间排序后按录入月份。每月有独立标题和分隔线。右侧固定时间轴显示当前筛选范围内的所有月份，选中的月份线条加长；点击某月可定位到该月在当前页的标题，或先跳到该月所在分页再滚动。时间轴只读取月份、数量和分页起始位置，单据卡片仍按原有每页 20 张加载；排序、日期范围筛选和导出不改变数据口径。
+
+H5 中离开、删除、撤销等系统式确认提示框改用工作台的白底、深绿文字、圆角按钮和绿色或错误色动作文字；其它业务浮层的遮罩统一为同一深绿色。确认含义、按钮文案和原有操作守卫不变。
+
+### 验证记录（2026-11-28；隔离 SQLite + Edge 无头浏览器）
+
+- **修改文件**：后端 `src/repositories/invoices.py`、`src/services/invoices.py`、`src/api/invoices.py`、相关测试与路由清单；前端 `InvoiceList.vue`、`shared/api/index.ts`、`shared/styles/tokens.css`、各确认框调用和浮层遮罩样式；`backend/tools/smoke_invoice_ledger_browser.mjs`、两份 README、本节与 `impl_record.md`。新增只读 `GET /api/invoices/months`，无迁移、OCR 或采购记录写入变更。
+- **验证**：后端完整测试 **1459 passed**；前端 `typecheck`、`build:h5` 退出码 0。`smoke_invoice_ledger_browser.mjs` 返回 `passed: true`：验证 7 月、5 月分段和时间轴点击；在隔离库补 21 条明确标为合成的 6 月单据后，5 月落在 `offset=22`，点击右侧月份仍跳到对应分页和卡片；390px 视口时间轴可见且无横向溢出。浏览器计算样式核对确认框为白底、深绿标题、绿色主操作和圆角。`smoke_multifiles_s11.mjs` 同样 `passed: true`，旧填表与批次路径未受影响。
+- **边界**：测试未调用真实 OCR、未写用户数据库；固定时间轴在 H5 浏览器验证，App 真机未测。浏览器刷新／关闭标签页的系统提示无法由页面重绘，仍保持浏览器原生样式。真实大库月份索引和卡片预览的性能未测；索引只取日期字段，卡片继续分页读取。

@@ -4,12 +4,12 @@ import { errorMessage, getIntakeItemOriginal, getInvoiceFileContent, getPurchase
 import { downloadAttachment } from '../../shared/platform/download'
 import OriginalDocumentViewer from './OriginalDocumentViewer.vue'
 
-const props = defineProps<{ invoice: Invoice }>()
+const props = defineProps<{ invoice: Invoice; returnToBoard: boolean }>()
 const emit = defineEmits<{ back: []; openExisting: [id: number]; currencyChanged: [invoice: Invoice]; reopened: [invoice: Invoice] }>()
 const purchases = ref<Record<number, Purchase>>({})
 const failedIds = ref<number[]>([])
 const loading = ref(false)
-const originalOpen = ref(false)
+const originalExpanded = ref(true)
 const downloadError = ref('')
 const editingCurrency = ref(false)
 const currencyChoice = ref<'USD' | 'CNY'>('USD')
@@ -152,7 +152,7 @@ async function reopenForEditing() {
 
 <template>
   <view class="receipt-page">
-    <button class="back-link" @click="emit('back')">← {{ invoice.intake_sources.length ? '返回分类页面' : '返回单据' }}</button>
+    <button class="back-link" @click="emit('back')">← {{ returnToBoard ? '返回分类页面' : '返回单据' }}</button>
     <view class="receipt ui-card">
       <view class="receipt-header">
         <view class="supplier-block">
@@ -161,7 +161,6 @@ async function reopenForEditing() {
           <text class="supplier">{{ invoice.source_name || '采购来源待填' }}</text>
           <view class="metadata">
             <text>日期 {{ invoice.invoice_date || '待填' }}</text>
-            <text>单号 {{ invoice.invoice_number || '待填' }}</text>
           </view>
         </view>
         <view class="total-block">
@@ -185,10 +184,14 @@ async function reopenForEditing() {
         <text>已入账 <strong>{{ invoice.reconciliation.confirmed_count }}</strong> 行</text>
         <text>已跳过 <strong>{{ invoice.reconciliation.skipped_count }}</strong> 行</text>
         <text>原件 <strong>{{ fileCount }}</strong> 份</text>
-        <button v-if="fileCount && invoice.entry_source !== 'import'" class="original-button" @click="originalOpen = true">查看原件 ↗</button>
+        <button v-if="fileCount" class="original-button" :aria-expanded="originalExpanded" @click="originalExpanded = !originalExpanded">{{ originalExpanded ? '收起原件 ↑' : '展开原件 ↓' }}</button>
       </view>
 
-      <view v-if="invoice.entry_source === 'import' && fileCount" class="import-files">
+      <view v-if="originalExpanded && fileCount && invoice.entry_source !== 'import'" class="inline-original">
+        <OriginalDocumentViewer :invoice-id="invoice.id" :files="invoice.files" :sources="invoice.intake_sources" :is-fake="invoice.recognition.is_fake" :focus="null" :visible="originalExpanded" />
+      </view>
+
+      <view v-if="originalExpanded && invoice.entry_source === 'import' && fileCount" class="import-files">
         <button v-for="file in invoice.files" :key="file.id" class="ui-button secondary" @click="downloadOriginal(file.id, file.original_name)">下载原始表格 · {{ file.original_name }}</button>
         <button v-for="source in invoice.intake_sources" :key="source.item_id" class="ui-button secondary" @click="downloadIntakeOriginal(source.batch_id, source.item_id, source.original_name)">下载原始表格 · {{ source.original_name }} · 第 {{ source.row_no }} 行</button>
         <text v-if="downloadError" class="load-error" role="alert">{{ downloadError }}</text>
@@ -240,12 +243,6 @@ async function reopenForEditing() {
       </view>
     </view>
 
-    <view v-if="originalOpen" class="original-overlay" @click.self="originalOpen = false" @keydown.esc="originalOpen = false">
-      <view class="original-drawer" role="dialog" aria-modal="true" aria-label="单据原件">
-        <view class="drawer-head"><text>单据原件</text><button class="ui-button secondary" @click="originalOpen = false">关闭</button></view>
-        <OriginalDocumentViewer :invoice-id="invoice.id" :files="invoice.files" :sources="invoice.intake_sources" :is-fake="invoice.recognition.is_fake" :focus="null" :visible="true" />
-      </view>
-    </view>
   </view>
 </template>
 
@@ -278,6 +275,7 @@ async function reopenForEditing() {
 .summary-bar { display: flex; align-items: center; flex-wrap: wrap; gap: 10px 28px; min-height: 60px; padding: 10px 36px; background: #edf5ed; color: var(--ink); font-size: 15px; }
 .summary-bar strong { font-size: 18px; }
 .original-button { margin: 0 0 0 auto; padding: 8px 0; border: 0; background: transparent; color: var(--green); font-size: 16px; font-weight: 700; cursor: pointer; }
+.inline-original { height: min(72vh, 760px); min-height: 420px; margin: 20px 36px 0; overflow: hidden; border: 1px solid var(--line); border-radius: 8px; }
 .import-files { display: flex; flex-wrap: wrap; gap: 8px; padding: 20px 36px 0; }
 .import-files .ui-button { max-width: 100%; overflow-wrap: anywhere; }
 .reconciliation-alert, .revision-note, .load-error { margin: 20px 36px 0; padding: 11px 14px; border-radius: 7px; background: #fff4df; color: #704007; font-size: 14px; line-height: 1.5; }
@@ -309,11 +307,6 @@ async function reopenForEditing() {
 .footer-label { color: var(--muted); font-size: 14px; }
 .footer-value { font-size: 23px; font-weight: 700; }
 .completed-date { margin-left: auto; color: var(--muted); font-size: 14px; }
-.original-overlay { position: fixed; z-index: 200; inset: 0; display: flex; justify-content: flex-end; background: rgba(16, 31, 22, .5); }
-.original-drawer { display: flex; flex-direction: column; width: min(740px, 100vw); height: 100%; padding: 18px; background: var(--surface); box-shadow: -10px 0 30px rgba(0, 0, 0, .12); }
-.drawer-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex: none; margin-bottom: 12px; font-size: 20px; font-weight: 700; }
-.original-drawer :deep(.viewer) { min-height: 0; flex: 1; }
-.original-drawer :deep(.canvas) { min-height: 0; }
 @media (max-width: 700px) {
   .receipt-header { flex-direction: column; gap: 20px; padding: 22px 20px; }
   .total-block { align-items: flex-start; text-align: left; }
@@ -321,6 +314,7 @@ async function reopenForEditing() {
   .badges { justify-content: flex-start; margin: 0 0 4px; }
   .summary-bar { padding: 12px 20px; gap: 8px 17px; }
   .original-button { margin-left: 0; }
+  .inline-original { height: min(62vh, 620px); min-height: 380px; margin: 16px 20px 0; }
   .items-heading { padding: 24px 20px 12px; }
   .table-head { display: none; }
   .item-list { padding: 0 20px; }
@@ -335,6 +329,5 @@ async function reopenForEditing() {
   .skipped-section { margin: 24px 20px 0; }
   .receipt-footer { margin: 24px 20px 0; padding: 20px 0 24px; gap: 20px 32px; }
   .completed-date { margin-left: 0; width: 100%; }
-  .original-drawer { padding: 12px; }
 }
 </style>

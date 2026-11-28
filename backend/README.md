@@ -651,6 +651,7 @@ GET /api/purchases?kind=all              # 对账：各行相加应等于单据�
 | --- | --- | --- |
 | POST | `/api/invoices` | 上传文件并建草稿（**multipart**，字段名 `files`，可重复；`recognize=false` 则只存不识别） |
 | GET | `/api/invoices` | 单据列表；`completed=false` 就是待办清单，另有 `source` / `date_from` / `date_to` / `order`（`created_at` 默认 / `invoice_date`）/ `include_voided` / `limit` / `offset` |
+| GET | `/api/invoices/months` | 单据库月份时间轴索引；按 `completed`、`date_from`、`date_to`、`order` 返回每月 `key`、`offset`、`count`，与列表排序和分页一致，不读取原件或明细 |
 | GET | `/api/invoices/<id>` | 详情：文件、行、每个待确认行的匹配候选、对账结果、可能重复的单据 |
 | PATCH | `/api/invoices/<id>` | 改单据头（来源、单号、日期、币种、总额，全部可空） |
 | DELETE | `/api/invoices/<id>` | **作废**整张单据；有已确认行时须提交当前 `confirmed_line_ids`，返回 200 |

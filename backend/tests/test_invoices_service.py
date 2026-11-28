@@ -784,6 +784,64 @@ def test_first_purchase_uses_its_unit_when_creating_food_item(
     assert ingredient_service.search_food_items(query=f"First {unit}").items[0].base_unit == expected
 
 
+def test_first_purchase_splits_bilingual_description_into_food_names(
+    invoice_service: InvoiceService, ingredient_service: IngredientService,
+) -> None:
+    invoice = draft(invoice_service)
+    line_id = invoice.lines[0].id
+    invoice_service.update_line(
+        invoice.id, line_id, description="Pork Spare Rib Cube 靓排粒", purchase_unit="lbs."
+    )
+
+    outcome = invoice_service.confirm_lines(invoice.id, options=[ConfirmOption(
+        line_id=line_id,
+        new_food_item={"name": "Pork Spare Rib Cube 靓排粒", "category_id": 1,
+                       "use_purchase_unit_as_base": True},
+    )])
+
+    assert outcome.results[0].ok is True
+    line = invoice_service.get_invoice(invoice.id).lines[0]
+    assert line.description == "Pork Spare Rib Cube 靓排粒"
+    assert line.food_item.name == "Pork Spare Rib Cube"
+    assert line.food_item.name_zh == "靓排粒"
+    assert ingredient_service.search_food_items(query="靓排粒").items[0].id == line.food_item.id
+
+
+def test_bilingual_first_purchase_reuses_existing_english_food_name(
+    invoice_service: InvoiceService, ingredient_service: IngredientService,
+) -> None:
+    existing = ingredient_service.create_food_item(
+        name="Pork Spare Rib Cube", name_zh="靓排粒", category_id=1, base_unit="lb"
+    )
+    invoice = draft(invoice_service)
+    outcome = invoice_service.confirm_lines(invoice.id, options=[ConfirmOption(
+        line_id=invoice.lines[0].id,
+        new_food_item={"name": "Pork Spare Rib Cube 靓排粒", "category_id": 1,
+                       "use_purchase_unit_as_base": True},
+    )])
+    assert outcome.results[0].ok is True
+    assert invoice_service.get_invoice(invoice.id).lines[0].food_item.id == existing.id
+    assert ingredient_service.search_food_items(query="Pork Spare Rib Cube").total == 1
+
+
+def test_bilingual_first_purchase_does_not_guess_from_chinese_name_alone(
+    invoice_service: InvoiceService, ingredient_service: IngredientService,
+) -> None:
+    existing = ingredient_service.create_food_item(
+        name="Different Food", name_zh="靓排粒", category_id=1, base_unit="lb"
+    )
+    invoice = draft(invoice_service)
+    outcome = invoice_service.confirm_lines(invoice.id, options=[ConfirmOption(
+        line_id=invoice.lines[0].id,
+        new_food_item={"name": "Pork Spare Rib Cube 靓排粒", "category_id": 1,
+                       "use_purchase_unit_as_base": True},
+    )])
+    assert outcome.results[0].ok is False
+    assert outcome.results[0].error_code == "conflict"
+    assert outcome.results[0].error_details["existing"]["id"] == existing.id
+    assert invoice_service.get_invoice(invoice.id).lines[0].status == "pending"
+
+
 def test_first_purchase_reuses_exact_existing_food_without_category(
     invoice_service: InvoiceService, food_item: FoodItemView,
 ) -> None:
@@ -1885,6 +1943,34 @@ def test_the_list_can_filter_by_source(invoice_service: InvoiceService) -> None:
     page = invoice_service.search_invoices(source="costco ", limit=50)
 
     assert [item.id for item in page.items] == [first.id]
+
+
+def test_month_index_matches_completed_list_order_and_range(
+    invoice_service: InvoiceService, food_item: FoodItemView,
+) -> None:
+    first = draft(invoice_service)
+    second = invoice_service.create_invoice([upload(content=OTHER_PHOTO, name="b.png")])
+    for invoice, day in ((first, "2026-05-22"), (second, "2026-06-03")):
+        invoice_service.update_invoice(invoice.id, invoice_date=day)
+        invoice_service.update_line(
+            invoice.id, invoice.lines[1].id, status="skipped", skip_reason="不采购"
+        )
+        invoice_service.confirm_lines(invoice.id, options=[ConfirmOption(
+            line_id=invoice.lines[0].id, food_item_id=food_item.id
+        )])
+        invoice_service.complete_invoice(invoice.id)
+
+    months = invoice_service.invoice_months(completed=True, order="invoice_date")
+    assert months == [
+        {"key": "2026-06", "offset": 0, "count": 1},
+        {"key": "2026-05", "offset": 1, "count": 1},
+    ]
+    assert [row.id for row in invoice_service.search_invoices(
+        completed=True, order="invoice_date"
+    ).items] == [second.id, first.id]
+    assert invoice_service.invoice_months(
+        completed=True, order="invoice_date", date_from="2026-06-01"
+    ) == [{"key": "2026-06", "offset": 0, "count": 1}]
 
 
 def test_pagination_reports_the_full_total(invoice_service: InvoiceService) -> None:

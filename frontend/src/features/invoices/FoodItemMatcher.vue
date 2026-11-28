@@ -18,6 +18,7 @@ const emit = defineEmits<{
   choose: [id: number]
   clear: []
   categoryChange: [id: number | null]
+  nameChange: [names: { name: string; name_zh: string | null }]
 }>()
 
 const categories = ref<Category[]>([])
@@ -33,7 +34,37 @@ const lookupBusy = ref(false)
 const lookupError = ref('')
 const found = ref<MatchCandidate[]>([])
 const sourceOverride = ref('')
+const newFoodName = ref('')
+const newFoodNameZh = ref('')
+const bilingual = computed(() => Boolean(initialNames(props.description).name_zh))
 let lookupSequence = 0
+
+function initialNames(description: string) {
+  const raw = description.trim()
+  if (!/\p{Script=Han}/u.test(raw) || !/\p{Script=Latin}/u.test(raw)) {
+    return { name: raw, name_zh: '' }
+  }
+  const chinese = (raw.match(/\p{Script=Han}+/gu) ?? []).join('')
+  const english = raw.replace(/\p{Script=Han}+/gu, ' ')
+    .replace(/\b\d+(?:[.x×]\d+)*\b/gi, ' ')
+    .replace(/[^\p{Script=Latin}\s]/gu, ' ')
+    .replace(/\b(?:lbs?|kg|oz|each)\b/gi, ' ')
+    .replace(/\b[A-Za-z]\b/g, ' ')
+    .replace(/\s+/g, ' ').trim()
+  if (!english) return { name: chinese || raw, name_zh: '' }
+  return { name: english, name_zh: chinese }
+}
+
+function publishNames() {
+  emit('nameChange', { name: newFoodName.value.trim(), name_zh: newFoodNameZh.value.trim() || null })
+}
+
+watch([() => props.line.id, () => props.description], () => {
+  const names = initialNames(props.description)
+  newFoodName.value = names.name
+  newFoodNameZh.value = names.name_zh
+  publishNames()
+}, { immediate: true })
 
 const categoryLabel = computed(() => {
   const category = categories.value.find((item) => item.id === categoryId.value)
@@ -132,7 +163,16 @@ watch(() => props.line.id, () => {
       <button class="ui-button secondary" :disabled="busy" @click="emit('clear')">更换食材</button>
     </view>
     <view v-else-if="line.line_kind === 'purchase'" class="first-item">
-      <text class="muted small">首次入账这种商品时，会用本行的商品名称和采购单位创建食材；这里只需选分类。</text>
+      <text class="muted small">首次入账这种商品时，会用下方名称和本行采购单位创建食材。商品原文仍保留在采购记录中。</text>
+      <text v-if="bilingual" class="muted small">已将同一商品行中的英文和中文分开。请核对两者是否指同一种食材；不一致时修改或清空中文翻译。</text>
+      <view class="category-field">
+        <text class="field-label">食材名称 *</text>
+        <input v-model="newFoodName" class="ui-input" aria-label="新食材名称" :disabled="busy" @input="publishNames" />
+      </view>
+      <view v-if="bilingual || newFoodNameZh" class="category-field">
+        <text class="field-label">中文翻译</text>
+        <input v-model="newFoodNameZh" class="ui-input" aria-label="新食材中文翻译" :disabled="busy" @input="publishNames" />
+      </view>
       <text v-if="suggestedCategory" class="muted small">系统建议分类：{{ suggestedCategory.name_zh || suggestedCategory.name }}，请核对后选择。</text>
       <view class="category-field">
         <text class="field-label">分类 *</text>
@@ -211,7 +251,7 @@ watch(() => props.line.id, () => {
 .lookup-actions .ui-button { flex: 1 1 auto; padding: 10px 12px; font-size: 14px; }
 .lookup-result { padding-top: 10px; border-top: 1px solid var(--line); }
 .error-text { color: var(--error); font-size: 13px; }
-.picker-overlay { position: fixed; z-index: 30; inset: 0; display: flex; align-items: center; justify-content: center; padding: 24px; background: #0d2c22a6; }
+.picker-overlay { position: fixed; z-index: 30; inset: 0; display: flex; align-items: center; justify-content: center; padding: 24px; background: var(--dialog-scrim); }
 .picker-panel { width: min(100%, 480px); max-height: 90vh; overflow: auto; padding: 24px; }
 @media (max-width: 899px) { .picker-overlay { align-items: end; padding: 0; }.picker-panel { width: 100%; max-height: 85vh; border-radius: 16px 16px 0 0; } }
 </style>

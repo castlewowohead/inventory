@@ -135,6 +135,7 @@ def test_app_exposes_only_the_implemented_routes(app: Flask) -> None:
         "/api/purchases/<int:purchase_id>",
         "/api/purchases/<int:purchase_id>/revisions",
         "/api/invoices",
+        "/api/invoices/months",
         "/api/invoices/match",
         "/api/invoices/<int:invoice_id>",
         "/api/invoices/<int:invoice_id>/complete",

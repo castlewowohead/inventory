@@ -46,6 +46,9 @@ export const mergeFoodItems = (targetId: number, sourceIds: number[]) =>
   apiRequest<MergePlan>(`/api/food-items/${targetId}/merge`, { method: 'POST', data: { source_ids: sourceIds } })
 export const getInvoices = (query = '') =>
   apiRequest<Page<Invoice>>(`/api/invoices${query}`)
+export interface InvoiceMonth { key: string; offset: number; count: number }
+export const getInvoiceMonths = (query = '') =>
+  apiRequest<{ months: InvoiceMonth[] }>(`/api/invoices/months${query}`)
 export const getInvoice = (id: number) =>
   apiRequest<Invoice>(`/api/invoices/${id}`)
 export const getPurchase = (id: number) =>

@@ -317,7 +317,7 @@ td button { display: block; margin: 0 0 5px; }
 .message { padding: 9px; background: #e6f1e9; margin: 8px 0; }
 .message.error { background: #fff1e7; }
 .mobile-note { padding: 20px; background: #fff7e9; }
-.overlay { position: fixed; inset: 0; z-index: 20; background: #0009; display: grid; place-items: center; padding: 16px; }
+.overlay { position: fixed; inset: 0; z-index: 20; background: var(--dialog-scrim); display: grid; place-items: center; padding: 16px; }
 .preview-card { width: min(100%, 980px); height: min(90vh, 900px); display: flex; flex-direction: column; padding: 14px; gap: 8px; }
 .preview-head { justify-content: space-between; }
 .viewer { flex: 1; min-height: 0; }

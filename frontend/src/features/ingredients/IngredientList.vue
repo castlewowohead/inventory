@@ -383,7 +383,7 @@ onUnmounted(() => {
 .pagination { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; font-size: 14px; color: var(--muted); }
 .text-button { display: inline-flex; min-height: 44px; align-items: center; padding: 8px; margin: 0; border: 0; background: transparent; color: var(--green); cursor: pointer; }
 .text-button::after { border: 0; }
-.detail-overlay { position: fixed; z-index: 30; inset: 0; display: flex; align-items: center; justify-content: center; padding: 24px; background: #0d2c22a6; }
+.detail-overlay { position: fixed; z-index: 30; inset: 0; display: flex; align-items: center; justify-content: center; padding: 24px; background: var(--dialog-scrim); }
 .detail-panel { width: min(100%, 480px); max-height: 90vh; overflow: auto; padding: 24px; }
 .merge-dialog { width: min(100%, 680px); }
 .detail-top { display: flex; justify-content: space-between; align-items: center; }

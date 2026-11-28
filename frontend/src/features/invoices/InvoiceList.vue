@@ -11,18 +11,22 @@
  *    清单：刚录进来的在最前，不分类、不筛，因为还没做完的东西本来就该按「什么时候
  *    进来的」排队。「已完成」是翻历史：那时才需要按采购日期排、按时间范围找。
  */
-import { computed, onMounted, ref } from 'vue'
-import { errorMessage, exportSelectedInvoices, getInvoices, updateInvoice, voidInvoice, type Invoice } from '../../shared/api'
+import { computed, nextTick, onMounted, onUnmounted, ref } from 'vue'
+import { errorMessage, exportSelectedInvoices, getInvoiceMonths, getInvoices, updateInvoice, voidInvoice, type Invoice, type InvoiceMonth } from '../../shared/api'
 import { confirmLeave } from '../../shared/platform/leaveGuard'
 import { downloadAttachment } from '../../shared/platform/download'
 import DateFieldInput from './DateFieldInput.vue'
 import InvoiceUpload from './InvoiceUpload.vue'
+import InvoiceIconPreview from './InvoiceIconPreview.vue'
+import { invoiceIconKind } from './invoiceIcon'
 import SpreadsheetImport from './SpreadsheetImport.vue'
 import { isCalendarDay, rangeLabel, rangeQuery } from './invoiceRange'
 
 const emit = defineEmits<{ open: [id: number]; openBatch: [] }>()
 const selected = ref<'pending' | 'completed'>('pending')
 const items = ref<Invoice[]>([])
+const months = ref<InvoiceMonth[]>([])
+const activeMonth = ref('')
 const total = ref(0)
 const offset = ref(0)
 const limit = 20
@@ -57,6 +61,7 @@ const rangeOpen = ref(false)
 const rangeFrom = ref('')
 const rangeTo = ref('')
 let requestSequence = 0
+let monthJumpLockUntil = 0
 
 /** 筛选和排序只在「已完成」里出现，见组件顶部第 2 条。 */
 const showFilters = computed(() => selected.value === 'completed')
@@ -72,64 +77,36 @@ const statusLabel: Record<Invoice['status'], string> = {
   draft: '草稿', in_review: '审核中', ready_to_complete: '待完成', completed: '已完成', voided: '已作废'
 }
 
-/**
- * 这张单据的原件来自哪里。
- *
- * ⚠️ 批次来的单据，原件挂在整理内容（`intake_sources`）上而不是 `files` 上，所以
- * 只数 `files.length` 会把一份有五页原件的单据显示成「0 个原件」。
- *
- * ⚠️ 只写**出处**（哪个文件的第几页 / 第几行），不写**张数**：「1 个原件」没有回答任何
- * 问题，点进详情就看得到。手工上传的单据因此在列表卡片上不写这一段。
- */
-function originLabel(invoice: Invoice): string {
-  const sources = invoice.intake_sources
-  if (sources.length) {
-    const names = new Set(sources.map((source) => source.original_name))
-    const name = names.size === 1 ? sources[0].original_name : `${names.size} 个文件`
-    if (sources[0].kind === 'row') {
-      const rows = sources.map((source) => source.row_no).filter((value) => value !== null)
-      return rows.length === 1 ? `${name} 第 ${rows[0]} 行` : `${name} ${sources.length} 行`
-    }
-    const pages = sources.map((source) => source.page_no).filter((value) => value !== null)
-    if (names.size === 1 && pages.length === 1) return `${name} 第 ${pages[0]} 页`
-    return `${name} ${sources.length} 页`
+function monthOf(invoice: Invoice): string {
+  const value = selected.value === 'completed' && sortKey.value === 'invoice_date'
+    ? invoice.invoice_date : invoice.uploaded_at
+  return value?.slice(0, 7) || 'undated'
+}
+function monthLabel(key: string): string {
+  if (key === 'undated') return '日期待填'
+  const [year, month] = key.split('-')
+  return `${year} 年 ${Number(month)} 月`
+}
+const pageMonths = computed(() => {
+  const groups: { key: string; items: Invoice[] }[] = []
+  for (const invoice of items.value) {
+    const key = monthOf(invoice)
+    const last = groups[groups.length - 1]
+    if (last?.key === key) last.items.push(invoice)
+    else groups.push({ key, items: [invoice] })
   }
-  if (invoice.entry_source === 'import') return '表格导入'
-  return ''
-}
+  return groups
+})
 
-/** `2026-11-23T08:12:30+00:00` → `2026-11-23`：录进系统的那一天。 */
-function createdDay(value: string): string {
-  return /^\d{4}-\d{2}-\d{2}/.exec(value ?? '')?.[0] ?? value
-}
-
-/**
- * 卡片第二行：只写还有信息量的数字。
- *
- * ⚠️ 「待核对 0 · 已入账 2」在**已完成**卡片上恒为噪音：收口本来就要求没有待核对行
- * （`complete_invoice` 缺待办检查会 409），已入账行数点进详情就是正文本身。所以按值写——
- * 待办数只在真有待办时出现（已完成卡片因此永远看不到它），跳过数只在真跳过时出现。
- */
-/**
- * 卡片第二行：这张单据在**纸面**上的身份与原件出处。
- *
- * ⚠️ 不写 `invoice.id`。那是库里的主键，只用在 URL（`?view=review&invoice=27`）、
- * 接口和日志里；卡片要回答的是「这是哪张纸」，答案是纸面单号与它在哪个文件第几页。
- */
-function paperLabel(invoice: Invoice): string {
-  const parts: string[] = []
-  if (invoice.invoice_number) parts.push(`单号 ${invoice.invoice_number}`)
-  const origin = originLabel(invoice)
-  if (origin) parts.push(origin)
-  return parts.join(' · ')
-}
-
-function countsLabel(invoice: Invoice): string {
-  const parts: string[] = []
-  if (invoice.reconciliation.pending_count) parts.push(`待核对 ${invoice.reconciliation.pending_count}`)
-  if (invoice.reconciliation.skipped_count) parts.push(`已跳过 ${invoice.reconciliation.skipped_count}`)
-  parts.push(`创建于 ${createdDay(invoice.uploaded_at)}`)
-  return parts.join(' · ')
+function totalLabel(invoice: Invoice): string {
+  if (invoice.invoice_total === null) return ''
+  const negative = invoice.invoice_total.startsWith('-')
+  const amount = (negative ? invoice.invoice_total.slice(1) : invoice.invoice_total)
+    .replace(/\B(?=(\d{3})+(?!\d))/g, ',')
+  const sign = negative ? '−' : ''
+  if (invoice.currency === 'USD') return `${sign}$${amount}`
+  if (invoice.currency === 'CNY') return `${sign}¥${amount}`
+  return `${sign}${invoice.currency ? `${invoice.currency} ` : ''}${amount}`
 }
 
 function buildQuery(): string {
@@ -138,22 +115,54 @@ function buildQuery(): string {
   return `${base}&order=${sortKey.value}` + rangeQuery(rangeFrom.value, rangeTo.value)
 }
 
+function buildMonthQuery(): string {
+  const base = `?completed=${selected.value === 'completed'}&order=${showFilters.value ? sortKey.value : 'created_at'}`
+  return showFilters.value ? base + rangeQuery(rangeFrom.value, rangeTo.value) : base
+}
+
 async function load() {
   const sequence = ++requestSequence
   state.value = 'loading'
   failure.value = ''
   try {
-    const page = await getInvoices(buildQuery())
+    const [page, index] = await Promise.all([getInvoices(buildQuery()), getInvoiceMonths(buildMonthQuery())])
     if (sequence !== requestSequence) return
     items.value = page.items
+    months.value = index.months
+    activeMonth.value = page.items.length ? monthOf(page.items[0]!) : ''
     total.value = page.total
     state.value = 'ready'
   } catch (error) {
     if (sequence !== requestSequence) return
     items.value = []
+    months.value = []
     state.value = 'error'
     failure.value = errorMessage(error)
   }
+}
+
+async function jumpToMonth(month: InvoiceMonth) {
+  const pageHasMonth = pageMonths.value.some((group) => group.key === month.key)
+  if (!pageHasMonth) {
+    offset.value = month.offset
+    await load()
+  }
+  await nextTick()
+  activeMonth.value = month.key
+  monthJumpLockUntil = Date.now() + 450
+  uni.pageScrollTo({ selector: `#invoice-month-${month.key}`, duration: 240 })
+}
+
+function syncActiveMonth() {
+  // #ifdef H5
+  if (Date.now() < monthJumpLockUntil) return
+  const headings = Array.from(document.querySelectorAll<HTMLElement>('.month-section[data-month-key]'))
+  let visible = headings[0]
+  for (const heading of headings) {
+    if (heading.getBoundingClientRect().top <= window.innerHeight * 0.3) visible = heading
+  }
+  if (visible?.dataset.monthKey) activeMonth.value = visible.dataset.monthKey
+  // #endif
 }
 
 function selectTab(tab: 'pending' | 'completed') {
@@ -288,6 +297,7 @@ async function removeInvoice(invoice: Invoice) {
     title: '删除这张单据',
     content: `${name}会连同上传的原件一起删掉。同一个文件之后可以重新上传。`,
     confirmText: '删除', cancelText: '取消',
+    confirmColor: '#9a3b2f',
     success: (result) => resolve(Boolean(result.confirm)), fail: () => resolve(false)
   }))
   if (!confirmed) return
@@ -297,6 +307,7 @@ async function removeInvoice(invoice: Invoice) {
       title: '确认移除已入账数据',
       content: `这张单据有 ${bookedIds.length} 行已经入账。确认删除后，这些采购记录会作废，不再计入价格统计；原件也会删除。是否确认移除？`,
       confirmText: '确认移除', cancelText: '保留单据',
+      confirmColor: '#9a3b2f',
       success: (result) => resolve(Boolean(result.confirm)), fail: () => resolve(false)
     }))
     if (!confirmedBooked) return
@@ -336,7 +347,17 @@ async function toggleUpload() {
   importing.value = false
 }
 
-onMounted(() => void load())
+onMounted(() => {
+  void load()
+  // #ifdef H5
+  window.addEventListener('scroll', syncActiveMonth, { passive: true })
+  // #endif
+})
+onUnmounted(() => {
+  // #ifdef H5
+  window.removeEventListener('scroll', syncActiveMonth)
+  // #endif
+})
 defineExpose({ refresh: load, showCompleted, showUpload })
 </script>
 
@@ -362,8 +383,8 @@ defineExpose({ refresh: load, showCompleted, showUpload })
       <text v-if="exportError" class="card-error" role="alert">{{ exportError }}</text>
     </view>
 
-    <!-- 排序与筛选只在「已完成」出现：待办清单按录入次序排队就够了。 -->
-    <view v-if="showFilters" class="filter-bar" role="group" aria-label="排序与筛选">
+    <!-- 已完成页签保留排序和日期筛选。 -->
+    <view v-if="showFilters" class="list-toolbar" role="group" aria-label="单据筛选工具栏">
       <view class="sort">
         <button class="sort-toggle" :aria-expanded="sortMenuOpen" @click="sortMenuOpen = !sortMenuOpen">
           {{ SORT_LABEL[sortKey] }}<text class="caret" aria-hidden="true">▾</text>
@@ -398,40 +419,52 @@ defineExpose({ refresh: load, showCompleted, showUpload })
       <button v-else-if="selected === 'pending' && !uploading" class="ui-button" @click="uploading = true">上传单据</button>
       <text v-else-if="selected === 'completed'" class="muted">完成审核的单据会显示在这里。</text>
     </view>
-    <template v-else>
-      <!-- id 不再出现在卡片文字里；浏览器实跑仍要认出每张卡片是哪一条，所以留在 data 上。 -->
-      <view v-for="invoice in items" :key="invoice.id" class="ui-card invoice-card" :data-invoice-id="invoice.id">
-        <button v-if="exportMode" class="export-check" role="checkbox"
-          :aria-label="invoice.status === 'completed' ? `导出${invoice.source_name || '单据'}${invoice.invoice_number ? `（单号 ${invoice.invoice_number}）` : ''}` : '待处理单据不能导出'"
-          :aria-checked="selectedInvoiceIds.includes(invoice.id)"
-          :disabled="invoice.status !== 'completed'"
-          :title="invoice.status === 'completed' ? '勾选导出这张单据' : '待处理单据不能导出'"
-          @click="toggleExport(invoice)"><text class="export-box" aria-hidden="true">{{ selectedInvoiceIds.includes(invoice.id) ? '✓' : '' }}</text></button>
-        <view class="card-main">
+    <view v-else class="month-layout" aria-label="按月份排列的单据">
+      <view class="month-stream">
+      <view v-for="group in pageMonths" :id="`invoice-month-${group.key}`" :key="group.key" class="month-section" :data-month-key="group.key">
+        <view class="month-heading"><text>{{ monthLabel(group.key) }}</text><view aria-hidden="true"></view></view>
+        <view class="icon-grid" aria-label="单据">
+      <view v-for="invoice in group.items" :key="invoice.id" class="ui-card icon-card" :class="`icon-${invoiceIconKind(invoice)}`" :data-invoice-id="invoice.id">
+        <view class="icon-heading">
+          <button v-if="exportMode" class="export-check" role="checkbox"
+            :aria-label="invoice.status === 'completed' ? `导出${invoice.source_name || '单据'}` : '待处理单据不能导出'"
+            :aria-checked="selectedInvoiceIds.includes(invoice.id)" :disabled="invoice.status !== 'completed'"
+            @click="toggleExport(invoice)"><text class="export-box" aria-hidden="true">{{ selectedInvoiceIds.includes(invoice.id) ? '✓' : '' }}</text></button>
           <text class="card-tag">{{ statusLabel[invoice.status] }}</text>
-          <view class="title-row">
-            <text class="card-title">{{ invoice.source_name || '来源待填' }}</text>
-            <button v-if="renamingId !== invoice.id" class="rename-button" @click="startRename(invoice)">重命名</button>
-          </view>
-          <view v-if="renamingId === invoice.id" class="rename-form">
+          <text class="icon-date">{{ invoice.invoice_date || '日期待填' }}</text>
+        </view>
+        <button class="icon-open" :aria-label="`查看${invoice.source_name || '单据'}的详情`" @click="emit('open', invoice.id)">
+          <InvoiceIconPreview :invoice="invoice" />
+        </button>
+        <view class="icon-details">
+          <text class="icon-title" :title="invoice.source_name || '来源待填'">{{ invoice.source_name || '来源待填' }}</text>
+          <text v-if="invoice.invoice_total !== null" class="icon-subtitle" :title="`总金额 ${totalLabel(invoice)}`">总金额 {{ totalLabel(invoice) }}</text>
+          <text v-if="invoice.reconciliation.pending_count" class="icon-review-note">待核对 {{ invoice.reconciliation.pending_count }}</text>
+          <view v-if="renamingId === invoice.id" class="icon-rename">
             <input v-model="renameText" class="ui-input" aria-label="单据来源名称" placeholder="输入单据名称" maxlength="120" @confirm="saveRename(invoice.id)" />
             <button class="ui-button" :disabled="renamingBusy" @click="saveRename(invoice.id)">保存</button>
             <button class="ui-button secondary" :disabled="renamingBusy" @click="renamingId = null">取消</button>
             <text v-if="invoice.status === 'completed'" class="muted rename-note">已入账采购记录的来源名称不会随之改变。</text>
             <text v-if="renameError" class="card-error" role="alert">{{ renameError }}</text>
           </view>
-          <text class="invoice-date">单据发生日期：{{ invoice.invoice_date || '待填' }}</text>
-          <text v-if="paperLabel(invoice)" class="muted">{{ paperLabel(invoice) }}</text>
-          <text class="counts">{{ countsLabel(invoice) }}</text>
-        </view>
-        <view class="card-actions">
-          <button class="ui-button secondary" @click="emit('open', invoice.id)">查看详情</button>
-          <button class="ui-button ghost danger" :disabled="deletingId === invoice.id"
-            @click="removeInvoice(invoice)">{{ deletingId === invoice.id ? '删除中…' : '删除' }}</button>
+          <view v-else class="icon-actions">
+            <button @click="emit('open', invoice.id)">查看详情</button>
+            <button @click="startRename(invoice)">重命名</button>
+            <button class="danger" :disabled="deletingId === invoice.id" @click="removeInvoice(invoice)">{{ deletingId === invoice.id ? '删除中…' : '删除' }}</button>
+          </view>
           <text v-if="deleteError[invoice.id]" class="card-error" role="alert">{{ deleteError[invoice.id] }}</text>
         </view>
       </view>
-    </template>
+        </view>
+      </view>
+      </view>
+      <view v-if="months.length" class="month-rail" role="navigation" aria-label="月份时间轴">
+        <button v-for="month in months" :key="month.key" class="month-tick"
+          :class="{ active: activeMonth === month.key }" :aria-label="`跳到 ${monthLabel(month.key)}，${month.count} 张单据`"
+          :aria-current="activeMonth === month.key ? 'location' : undefined" :title="`${monthLabel(month.key)} · ${month.count} 张`"
+          @click="jumpToMonth(month)"><text class="tick-line" aria-hidden="true"></text><text class="tick-label">{{ monthLabel(month.key) }}</text></button>
+      </view>
+    </view>
     <view v-if="state === 'ready' && total > 0" class="pagination">
       <text>{{ pageLabel }}</text>
       <view class="page-actions"><button class="ui-button secondary" :disabled="offset === 0" @click="changePage(-1)">上一页</button><button class="ui-button secondary" :disabled="offset + items.length >= total" @click="changePage(1)">下一页</button></view>
@@ -452,7 +485,7 @@ defineExpose({ refresh: load, showCompleted, showUpload })
 .export-bar > text:first-child { flex: 1 1 260px; }
 .export-bar .card-error { flex-basis: 100%; }
 
-.filter-bar { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; margin-bottom: -6px; }
+.list-toolbar { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; margin-bottom: -6px; }
 .sort { position: relative; }
 .sort-toggle { min-height: 40px; margin: 0; padding: 7px 14px; display: flex; align-items: center; gap: 8px; border: 1px solid var(--line); border-radius: 8px; background: #fff; color: var(--ink); font-size: 14px; font-weight: 650; cursor: pointer; }
 .sort-toggle::after { border: 0; }
@@ -469,29 +502,56 @@ defineExpose({ refresh: load, showCompleted, showUpload })
 .range-note { flex-basis: 100%; font-size: 13px; }
 
 .state-card { min-height: 140px; display: flex; align-items: center; justify-content: center; flex-direction: column; gap: 12px; padding: 24px; border: 1px dashed var(--line); border-radius: 9px; text-align: center; }
-.invoice-card { display: flex; align-items: center; justify-content: space-between; gap: 20px; padding: 20px 24px; }
+.month-layout { position: relative; padding-right: 125px; }
+.month-stream { display: flex; flex-direction: column; gap: 30px; }
+.month-section { scroll-margin-top: 24px; }
+.month-heading { display: flex; align-items: center; gap: 16px; margin: 0 0 16px; color: var(--ink); font-size: 18px; font-weight: 700; }
+.month-heading > view { flex: 1; border-top: 1px solid var(--line); }
+.month-rail { position: fixed; z-index: 10; top: 50%; right: max(14px, calc((100vw - 1440px) / 2 + 10px)); transform: translateY(-50%); display: flex; flex-direction: column; align-items: flex-end; max-height: 70vh; overflow-y: auto; padding: 8px 2px; border-right: 2px solid var(--line); background: color-mix(in srgb, var(--canvas) 88%, transparent); }
+.month-tick { display: flex; align-items: center; justify-content: flex-end; gap: 7px; width: 115px; min-height: 36px; margin: 0; padding: 4px 0; border: 0; background: transparent; color: var(--muted); cursor: pointer; }
+.month-tick::after { border: 0; }
+.tick-line { display: block; width: 18px; height: 3px; border-radius: 3px; background: var(--muted); transition: width .15s ease, background .15s ease; }
+.tick-label { order: -1; visibility: hidden; white-space: nowrap; font-size: 12px; }
+.month-tick.active { color: var(--green); }
+.month-tick.active .tick-line, .month-tick:hover .tick-line, .month-tick:focus-visible .tick-line { width: 34px; background: var(--green); }
+.month-tick.active .tick-label, .month-tick:hover .tick-label, .month-tick:focus-visible .tick-label { visibility: visible; }
+.icon-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: 18px; align-items: stretch; }
+.icon-card { --type-color: #60726b; position: relative; min-width: 0; padding: 14px; display: flex; flex-direction: column; gap: 9px; overflow: hidden; border: 2px solid var(--type-color); border-radius: 11px; background: #fff; color: var(--type-color); }
+.icon-card.icon-pdf { --type-color: #ba4f42; border-radius: 11px 35px 11px 11px; background: #fff9f7; }
+.icon-card.icon-pdf::after { content: ''; position: absolute; top: -2px; right: -2px; width: 26px; height: 26px; border-left: 2px solid var(--type-color); border-bottom: 2px solid var(--type-color); border-radius: 0 0 0 6px; background: #fff; pointer-events: none; }
+.icon-card.icon-table { --type-color: #25805d; border-radius: 7px; background: #f6fbf7; }
+.icon-card.icon-photo { --type-color: #7650a4; border-radius: 14px; background: #faf7ff; }
+.icon-card.icon-table::before, .icon-card.icon-photo::before { content: ''; position: absolute; top: 0; left: 0; right: 0; height: 6px; background: var(--type-color); }
+.icon-card.icon-photo::before { background: linear-gradient(90deg, #7650a4 35%, #b89bd6 35%); }
+.icon-heading { min-height: 30px; display: flex; align-items: center; gap: 7px; }
+.icon-pdf .icon-heading { padding-right: 24px; }
+.icon-heading .export-check { width: 30px; min-width: 30px; height: 30px; min-height: 30px; }
+.icon-date { margin-left: auto; color: var(--ink); font-size: 18px; font-weight: 700; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.icon-open { display: block; width: 100%; min-height: 0; margin: 0; padding: 0; border: 0; background: transparent; text-align: left; cursor: pointer; }
+.icon-open::after { border: 0; }
+.icon-open:focus-visible { outline: 3px solid var(--green); outline-offset: 3px; border-radius: 11px; }
+.icon-details { min-width: 0; display: flex; flex: 1; flex-direction: column; gap: 4px; }
+.icon-title { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; color: var(--ink); font-size: 16px; font-weight: 700; }
+.icon-subtitle { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; color: var(--muted); font-size: 12px; }
+.icon-review-note { color: var(--warning); font-size: 12px; }
+.icon-actions { display: flex; flex-wrap: wrap; gap: 6px; margin-top: auto; padding-top: 6px; }
+.icon-actions button { min-height: 35px; margin: 0; padding: 4px 7px; border: 0; background: transparent; color: var(--green); font-size: 12px; cursor: pointer; }
+.icon-actions button::after { border: 0; }
+.icon-actions .danger { color: var(--error); }
+.icon-rename { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 6px; }
+.icon-rename .ui-input { width: 100%; }
+.icon-rename .ui-button { min-height: 35px; padding: 4px 10px; font-size: 12px; }
 .export-check { flex: none; display: grid; place-items: center; width: 44px; min-width: 44px; height: 44px; min-height: 44px; margin: 0; padding: 0; border: 0; background: transparent; cursor: pointer; }
 .export-check::after { border: 0; }
 .export-check:disabled { opacity: .45; cursor: not-allowed; }
 .export-box { display: grid; place-items: center; width: 22px; height: 22px; border: 2px solid var(--green); border-radius: 4px; background: #fff; color: #fff; font-size: 16px; line-height: 1; }
 .export-check[aria-checked="true"] .export-box { background: var(--green); }
-.card-main { min-width: 0; display: flex; flex-direction: column; align-items: flex-start; gap: 7px; }
 .card-tag { padding: 4px 8px; border-radius: 5px; color: var(--warning); background: #fff5e9; font-size: 12px; font-weight: 700; }
-.card-title { overflow-wrap: anywhere; font-size: 18px; font-weight: 650; }
-/* 日期是这张卡片最该先看到的事实，所以用正文色而不是 .muted 的灰。 */
-.invoice-date { font-size: 15px; font-weight: 650; }
-.title-row { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; }
-.rename-button { min-height: 44px; margin: 0; padding: 6px 8px; border: 0; background: transparent; color: var(--green); font-size: 13px; cursor: pointer; }
-.rename-button::after { border: 0; }
-.rename-form { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; max-width: 100%; }
-.rename-form .ui-input { width: min(300px, 100%); }
 .rename-note { flex-basis: 100%; font-size: 12px; }
-.counts { font-size: 13px; }
-.card-actions { flex: none; display: flex; flex-direction: column; align-items: stretch; gap: 8px; max-width: 220px; }
-.card-actions .ui-button.danger { color: var(--error); }
 .card-error { color: var(--error); font-size: 13px; line-height: 1.5; }
 .pagination { display: flex; align-items: center; justify-content: space-between; gap: 12px; color: var(--muted); font-size: 14px; }
 .page-actions { display: flex; gap: 8px; }
 .page-actions .ui-button { min-width: 84px; }
-@media (max-width: 899px) { .page-heading { align-items: start; flex-direction: column; }.heading-actions { width: 100%; }.heading-actions .ui-button { flex: 1; padding: 8px; font-size: 12px; }.page-title { font-size: 26px; }.invoice-card { align-items: stretch; flex-direction: column; padding: 18px; }.invoice-card .ui-button { width: 100%; }.card-actions { max-width: none; } }
+@media (max-width: 899px) { .page-heading { align-items: start; flex-direction: column; }.heading-actions { width: 100%; }.heading-actions .ui-button { flex: 1; padding: 8px; font-size: 12px; }.page-title { font-size: 26px; } }
+@media (max-width: 540px) { .month-layout { padding-right: 46px; }.month-rail { right: 4px; }.month-tick { width: 42px; }.tick-label { display: none; }.icon-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }.icon-card { padding: 8px; }.icon-heading { flex-wrap: wrap; }.icon-date { font-size: 15px; }.icon-actions button { padding: 4px; }.icon-open :deep(.document) { height: 190px; } }
 </style>

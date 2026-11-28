@@ -17,6 +17,7 @@ import net from 'node:net'
 import { spawn, spawnSync } from 'node:child_process'
 
 const root = process.cwd()
+const visual = process.argv.includes('--visual')
 const backend = path.join(root, 'backend')
 const frontend = path.join(root, 'frontend', 'dist', 'build', 'h5')
 const python = path.join(backend, '.venv', 'Scripts', 'python.exe')
@@ -63,7 +64,7 @@ function start(command, args, cwd = root, extraEnv = env) {
   return child
 }
 function staticServer() {
-  const types = { '.html': 'text/html', '.js': 'text/javascript', '.css': 'text/css',
+  const types = { '.html': 'text/html', '.js': 'text/javascript', '.mjs': 'text/javascript', '.css': 'text/css',
     '.json': 'application/json', '.svg': 'image/svg+xml', '.png': 'image/png',
     '.woff2': 'font/woff2', '.wasm': 'application/wasm' }
   const server = http.createServer((request, response) => {
@@ -211,42 +212,66 @@ c.commit()`, db, JSON.stringify(items.map((item, index) => [item.id, numbers[ind
   cdp = new Cdp(socket)
   await cdp.send('Runtime.enable')
   await waitUntil(async () => (await cdp.eval('document.body.innerText')).includes('WORKSPACE / 单据'), 'ledger page')
+  await waitUntil(async () => cdp.eval(`document.querySelectorAll('.icon-card').length >= 4`), 'default icon view')
+  assert(!(await cdp.eval(`!!document.querySelector('.view-switch, .invoice-card')`)),
+    '单据库只保留图标卡片，不显示视图切换')
+  assert(await cdp.eval(`(() => {
+    const card = document.querySelector('[data-invoice-id="${july.invoice_ids[0]}"]')
+    const date = card?.querySelector('.icon-date')
+    const title = card?.querySelector('.icon-title')
+    if (!date || !title) return false
+    const style = getComputedStyle(date)
+    return date.textContent.trim() === '2026-07-02'
+      && parseFloat(style.fontSize) >= 18
+      && Number(style.fontWeight) >= 700
+      && style.color === getComputedStyle(title).color
+  })()`), '单据发生日期在图标卡片右上角以大号深色粗体显示')
+  await cdp.send('Emulation.setDeviceMetricsOverride', {
+    width: 390, height: 844, deviceScaleFactor: 1, mobile: true,
+  })
+  assert(await cdp.eval(`[...document.querySelectorAll('.icon-card')].every((card) => {
+    const date = card.querySelector('.icon-date')
+    const bounds = card.getBoundingClientRect()
+    const dateBounds = date.getBoundingClientRect()
+    return parseFloat(getComputedStyle(date).fontSize) >= 15
+      && dateBounds.left >= bounds.left
+      && dateBounds.right <= bounds.right + 1
+  })`), '390px 窄屏日期保持至少 15px 且不越出卡片')
+  await cdp.send('Emulation.clearDeviceMetricsOverride')
 
-
-  // ② 待处理页签：卡片 UI、没有筛选条、按录入时间倒序。
+  // ② 待处理页签：图标卡片、没有筛选条、按录入时间倒序。
   const pendingCards = await waitUntil(async () => {
-    const cards = await cdp.eval(`[...document.querySelectorAll('.invoice-card')]
+    const cards = await cdp.eval(`[...document.querySelectorAll('.icon-card')]
       .map((card) => card.dataset.invoiceId + '|' + card.innerText.replace(/\\s+/g, ' ').trim())`)
     return cards.length >= 4 ? cards : null
   }, 'pending cards')
   assert(!(await cdp.eval(`!!document.querySelector('.filter-bar')`)),
     '待处理页签不该有排序/筛选条')
-  // 卡片上不再印 `单据 #id`（第 13 节），所以认卡片靠 data-invoice-id。
+  // 卡片上不印库里的 id，测试靠 data-invoice-id 认卡片。
   const idOf = (text) => Number(text.split('|')[0])
   assert(pendingCards.map(idOf).join() === [undated.id, ...july.invoice_ids, ...june.invoice_ids]
     .sort((a, b) => b - a).join(),
     `待处理按录入时间倒序：${JSON.stringify(pendingCards.map(idOf))}`)
 
-  // ③ 原件出处：批次来的单据指到文件与页；张数、「文件单据」、已入账行数都不再写（第 13 节）。
+  // ③ 图标卡片显示日期、已填写的总金额和有待办时的计数。
   const allPending = pendingCards.join(' | ')
-  assert(allPending.includes('four.pdf 第 3 页'), `单页应指到页码：${allPending}`)
-  assert(allPending.includes('four.pdf 2 页'), `两页合一张应显示 2 页：${allPending}`)
-  assert(allPending.includes('单号 A-1'), `有单号的应显示单号：${allPending}`)
-  assert(!allPending.includes('个原件'), `卡片只写出处、不写张数：${allPending}`)
+  assert(!allPending.includes('单号'), `图标卡片不展示单号：${allPending}`)
+  assert(allPending.includes('总金额 $120.00'), `已填写总金额的卡片应显示金额：${allPending}`)
   assert(!allPending.includes('单据 #'), `卡片不再印库里的单据 id：${allPending}`)
-  assert(allPending.includes('单据发生日期：2026-07-02'), `日期自成一行并带标签：${allPending}`)
-  assert(allPending.includes('单据发生日期：待填'), `没有日期的说「待填」：${allPending}`)
-  assert(!allPending.includes('文件单据'), `卡片不再写「文件单据」：${allPending}`)
+  assert(allPending.includes('2026-07-02'), `卡片显示单据日期：${allPending}`)
+  assert(allPending.includes('日期待填'), `没有日期的说「日期待填」：${allPending}`)
   assert(!allPending.includes('已入账'), `卡片不再写已入账行数：${allPending}`)
   assert(!allPending.includes('待核对 0'), `没有待办就不写待核对：${allPending}`)
   const undatedCard = pendingCards.find((text) => idOf(text) === undated.id)
   assert(undatedCard.includes('待核对 1'), `有待办的卡片仍要写出来：${undatedCard}`)
-  assert(allPending.includes('创建于'), `卡片应显示录入日期：${allPending}`)
+  assert(!undatedCard.includes('总金额'), `未填写总金额的卡片留空：${undatedCard}`)
 
   // ④ 已完成页签：两种排序必须给出不同的次序，否则其中一个是摆设。
   //    为此让「录入次序」与「采购日期次序」故意相反。
   const mayForm = new FormData()
-  mayForm.append('files', new Blob([Buffer.from('\x89PNG\r\n\x1a\n may')], { type: 'image/png' }), 'may.png')
+  const sampleImage = visual ? fs.readFileSync(path.join(backend, 'samples', 'real', '1.png'))
+    : Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+j6WQAAAAASUVORK5CYII=', 'base64')
+  mayForm.append('files', new Blob([sampleImage], { type: 'image/png' }), 'may.png')
   mayForm.append('recognize', 'false')
   const may = await api('/api/invoices', { method: 'POST', body: mayForm })
   await api(`/api/invoices/${may.id}`, json('PATCH', {
@@ -259,8 +284,9 @@ c.commit()`, db, JSON.stringify(items.map((item, index) => [item.id, numbers[ind
   // 录入次序：may 最后建，july 比它早；采购日期次序：july(07-02) 在 may(05-01) 前。
   await cdp.send('Page.navigate', { url: 'http://127.0.0.1:5322/?view=invoices' })
   await waitUntil(async () => (await cdp.eval('document.body.innerText')).includes('WORKSPACE / 单据'), 'ledger again')
+  await waitUntil(async () => cdp.eval(`document.querySelectorAll('.icon-card').length > 0`), 'default icon view again')
   await cdp.eval(clickByText('已完成'))
-  const readCards = async () => cdp.eval(`[...document.querySelectorAll('.invoice-card')]
+  const readCards = async () => cdp.eval(`[...document.querySelectorAll('.icon-card')]
     .map((card) => card.dataset.invoiceId + '|' + card.innerText.replace(/\\s+/g, ' ').trim())`)
   const byDate = await waitUntil(async () => {
     const cards = await readCards()
@@ -268,19 +294,60 @@ c.commit()`, db, JSON.stringify(items.map((item, index) => [item.id, numbers[ind
   }, 'completed tab')
   assert((await cdp.eval(`document.querySelector('.sort-toggle').innerText`)).includes('按收据日期排序'),
     '已完成默认按收据日期排序')
-  // 第 13 节：用户看的就是这张卡片。两张都是「跳过 1 行后收口」，所以跳过数要在、其余不在。
+  // 跳过行留在单据详情中，图标卡片不显示这项次要信息。
   const completedText = (await readCards()).join(' | ')
-  assert(completedText.includes('已跳过 1'), `跳过数非 0 时要显示：${completedText}`)
+  assert(!completedText.includes('已跳过'), `图标卡片不显示已跳过行数：${completedText}`)
   assert(!completedText.includes('待核对'), `已完成卡片不写待核对：${completedText}`)
   assert(!completedText.includes('已入账'), `已完成卡片不写已入账：${completedText}`)
-  assert(!completedText.includes('文件单据') && !completedText.includes('个原件'),
-    `已完成卡片不写「文件单据」和原件张数：${completedText}`)
-  assert(completedText.includes('创建于'), `已完成卡片仍写创建日期：${completedText}`)
   assert(!completedText.includes('单据 #'), `已完成卡片也不印单据 id：${completedText}`)
-  assert(completedText.includes('单据发生日期：2026-07-02'), `已完成卡片的日期行：${completedText}`)
+  assert(completedText.includes('2026-07-02'), `已完成卡片显示单据日期：${completedText}`)
+  assert(!completedText.includes('单号'), `已完成卡片也不展示单号：${completedText}`)
   assert(byDate.join() === [july.invoice_ids[0], may.id].join(),
     `按收据日期：07-02 在 05-01 前，得到 ${JSON.stringify(byDate)}`)
+  const monthHeadings = await cdp.eval(`[...document.querySelectorAll('.month-heading')]
+    .map((node) => node.innerText.replace(/\s+/g, ' ').trim())`)
+  assert(monthHeadings.join('|') === '2026 年 7 月|2026 年 5 月',
+    `已完成单据应按采购月份分段：${JSON.stringify(monthHeadings)}`)
+  const monthIndex = await api('/api/invoices/months?completed=true&order=invoice_date')
+  assert(monthIndex.months.map((month) => month.key).join() === '2026-07,2026-05'
+    && monthIndex.months[1].offset === 1,
+    `月份索引应覆盖全部页并给出跳转位置：${JSON.stringify(monthIndex)}`)
+  await cdp.eval(`document.querySelector('[aria-label^="跳到 2026 年 5 月"]').click()`)
+  await waitUntil(async () => cdp.eval(`document.querySelector('[data-month-key="2026-05"]')
+    ?.getBoundingClientRect().top < innerHeight`), 'timeline scrolls to May')
+  assert(await cdp.eval(`document.querySelector('[aria-label^="跳到 2026 年 5 月"]')
+    ?.getAttribute('aria-current') === 'location'`), '时间轴选中五月时线条变长')
+  await cdp.send('Emulation.setDeviceMetricsOverride', {
+    width: 390, height: 844, deviceScaleFactor: 1, mobile: true,
+  })
+  assert(await cdp.eval(`document.documentElement.scrollWidth <= innerWidth + 1
+    && document.querySelectorAll('.month-tick').length === 2`),
+    '390px 窄屏月份时间轴应可见且没有横向溢出')
+  await cdp.send('Emulation.clearDeviceMetricsOverride')
 
+  // PDF 展示实际原件页的缩略图；坏 PNG 保留明确占位。
+  await waitUntil(async () => cdp.eval(`!!document.querySelector('.icon-pdf .document-image')`),
+    'PDF original thumbnail')
+  assert(await cdp.eval(`!document.querySelector('.icon-card .document-page')`),
+    '图标卡片不显示原件页码')
+  assert(await cdp.eval(`!!document.querySelector('.icon-photo')`), '图片有独立外轮廓')
+  assert(await cdp.eval(`getComputedStyle(document.querySelector('.icon-photo')).borderTopColor === 'rgb(118, 80, 164)'`),
+    '图片外框改为紫色，区别于 Word 常见的蓝色')
+  await waitUntil(async () => cdp.eval(`!!document.querySelector('.icon-photo .document-image')`),
+    'image original thumbnail')
+  assert(await cdp.eval(`(() => {
+    const card = document.querySelector('.icon-pdf')
+    const inner = card.querySelector('.document')
+    return getComputedStyle(card).borderTopWidth === '2px'
+      && getComputedStyle(inner).borderTopWidth === '0px'
+  })()`), '文件类型外轮廓应在整张卡片上，不再嵌套第二个边框')
+  if (visual) {
+    const shot = await cdp.send('Page.captureScreenshot', { format: 'png', captureBeyondViewport: false })
+    const output = path.join(backend, 'var', 'icon-preview-visual.png')
+    fs.mkdirSync(path.dirname(output), { recursive: true })
+    fs.writeFileSync(output, Buffer.from(shot.data, 'base64'))
+    console.log(`VISUAL SCREENSHOT ${output}`)
+  }
   await cdp.eval(`document.querySelector('.sort-toggle').click()`)
   await waitUntil(async () => cdp.eval(`!!document.querySelector('.sort-menu')`), 'sort menu')
   await cdp.eval(clickByText('按创建时间排序', '.sort-item'))
@@ -324,7 +391,7 @@ c.commit()`, db, JSON.stringify(items.map((item, index) => [item.id, numbers[ind
   assert(await cdp.eval(`document.querySelector('[data-invoice-id="${may.id}"] .export-check').getAttribute('aria-checked')`) === 'true',
     '勾选一张已完成单据')
   await cdp.eval(clickByText('待处理'))
-  await waitUntil(async () => cdp.eval(`document.querySelectorAll('.invoice-card').length > 0
+  await waitUntil(async () => cdp.eval(`document.querySelectorAll('.icon-card').length > 0
     && [...document.querySelectorAll('.export-check')].every((node) => node.hasAttribute('disabled'))`), 'pending export disabled')
   assert((await cdp.eval(`document.querySelector('.export-bar').innerText`)).includes('已选 1 张'),
     '换页签后已勾选的单据不丢')
@@ -348,6 +415,14 @@ c.commit()`, db, JSON.stringify(items.map((item, index) => [item.id, numbers[ind
     .find((node) => node.textContent.includes('拆出选中的 1 页')).click()`)
   // uni.showModal 在 H5 下渲染成 .uni-modal，确认键是 .uni-modal__btn_primary。
   await waitUntil(async () => cdp.eval(`!!document.querySelector('.uni-modal__btn_primary')`), 'confirm modal')
+  assert(await cdp.eval(`(() => { const dialog = document.querySelector('.uni-modal')
+    const title = dialog?.querySelector('.uni-modal__title')
+    const action = dialog?.querySelector('.uni-modal__btn_primary')
+    return getComputedStyle(dialog).backgroundColor === 'rgb(255, 255, 255)'
+      && getComputedStyle(title).color === 'rgb(23, 59, 46)'
+      && getComputedStyle(action).color === 'rgb(23, 107, 77)'
+      && parseFloat(getComputedStyle(action).borderRadius) >= 8 })()`),
+    '确认提示框应使用工作台的白、深绿和绿色操作样式')
   await cdp.eval(`document.querySelector('.uni-modal__btn_primary').click()`)
   const afterSplit = await waitUntil(async () => {
     const page = await api(`/api/invoices?completed=false&limit=50&date_from=2026-06-06&date_to=2026-06-06`)
@@ -369,6 +444,52 @@ c.commit()`, db, JSON.stringify(items.map((item, index) => [item.id, numbers[ind
   assert(mergedBack.target_invoice_id === twoPageId, `合并回原草稿：${JSON.stringify(mergedBack)}`)
   const reunited = await api(`/api/invoices/${twoPageId}`)
   assert(reunited.intake_sources.length === 2, `两页回到一张：${JSON.stringify(reunited.intake_sources)}`)
+
+  // CSV 的缩略图展示保留下来的原始单元格，而不是编辑后的采购字段。
+  const csvForm = new FormData()
+  csvForm.append('file', new Blob(['商品描述,数量,单位,单价,金额,采购日期,采购来源\n鸡胸肉,2,lb,6.35,12.70,2026-10-01,Costco\n'],
+    { type: 'text/csv' }), 'sample.csv')
+  csvForm.append('options', '{}')
+  const imported = await api('/api/imports', { method: 'POST', body: csvForm })
+  await cdp.send('Page.navigate', { url: 'http://127.0.0.1:5322/?view=invoices' })
+  await waitUntil(async () => cdp.eval(`!!document.querySelector('.icon-table')`), 'default icon view with CSV')
+  await waitUntil(async () => cdp.eval(`!!document.querySelector('.icon-table .sheet-cell')`), 'CSV source cells')
+  assert((await cdp.eval(`document.querySelector('[data-invoice-id="${imported.id}"]').innerText`)).includes('鸡胸肉'),
+    'CSV 图标显示原始单元格内容')
+
+  await cdp.eval(clickByText('已完成'))
+  await waitUntil(async () => cdp.eval(`!!document.querySelector('.icon-card[data-invoice-id="${july.invoice_ids[0]}"]')`),
+    'completed card for original preview')
+  await cdp.eval(`document.querySelector('.icon-card[data-invoice-id="${july.invoice_ids[0]}"] .icon-open').click()`)
+  await waitUntil(async () => cdp.eval(`!!document.querySelector('.receipt-page .inline-original .viewer')`),
+    'completed original visible by default')
+  assert(await cdp.eval(`document.querySelector('.inline-original').getBoundingClientRect().height > 350`),
+    '已完成单据默认展开原件')
+  assert(await cdp.eval(`!document.querySelector('.receipt-page .metadata').innerText.includes('单号')`),
+    '已完成详情不展示单号')
+  await cdp.eval(`document.querySelector('.original-button').click()`)
+  assert(await cdp.eval(`!document.querySelector('.inline-original')`), '原件可收起')
+  await cdp.eval(`document.querySelector('.original-button').click()`)
+  assert(await cdp.eval(`!!document.querySelector('.inline-original .viewer')`), '原件可再次展开')
+
+  // A month beyond the first 20 records must still be present on the rail.
+  // These are synthetic rows in this disposable SQLite only; no OCR or user data.
+  runPython(['-c', `import sqlite3,sys
+db=sqlite3.connect(sys.argv[1])
+db.executemany("INSERT INTO invoices (entry_source,header_reviewed_fields,created_at,updated_at,completed_at,invoice_date,source_name) VALUES ('invoice','[]','2026-06-15 00:00:00','2026-06-15 00:00:00','2026-06-15 00:00:00','2026-06-15',?)", [(f'Synthetic June {i}',) for i in range(21)])
+db.commit()
+db.close()`, db])
+  await cdp.send('Page.navigate', { url: 'http://127.0.0.1:5322/?view=invoices' })
+  await waitUntil(async () => cdp.eval(`!!document.querySelector('.tabs')`), 'ledger for long month index')
+  await cdp.eval(clickByText('已完成'))
+  await waitUntil(async () => cdp.eval(`!!document.querySelector('[aria-label^="跳到 2026 年 5 月"]')`), 'May month across pages')
+  const manyMonths = await api('/api/invoices/months?completed=true&order=invoice_date')
+  assert(manyMonths.months.find((month) => month.key === '2026-05')?.offset === 22,
+    `五月应位于首批 20 张之外：${JSON.stringify(manyMonths.months)}`)
+  await cdp.eval(`document.querySelector('[aria-label^="跳到 2026 年 5 月"]').click()`)
+  await waitUntil(async () => cdp.eval(`!!document.querySelector('[data-invoice-id="${may.id}"]')`), 'May invoice after cross-page jump')
+  assert((await cdp.eval(`document.querySelector('.pagination')?.innerText`)).includes('23–23 / 23'),
+    '跨页跳月后分页位置应指向该月的首张单据')
 
   console.log(JSON.stringify({ passed: true, batch_id: batch.id,
     june_invoice_ids: june.invoice_ids, july_invoice_ids: july.invoice_ids,

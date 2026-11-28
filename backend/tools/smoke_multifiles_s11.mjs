@@ -468,11 +468,10 @@ try {
   assert(findings.withdraw_button.below_resume, '撤回填表在「继续填表」下面')
   assert(findings.withdraw_button.more_on_the_right, '「更多」在撤回填表右边、同一行')
   // 窄屏也要放得下这两个按钮：卡片正文该让位，而不是把页面撑出横向滚动。
-  // ⚠️ 390px 下整理页是双 pane，这张卡片在「日期分组」那一边，先切过去。
+  // 390px 下日期分组与浮动待归类贴片同时可见。
   await cdp.send('Emulation.setDeviceMetricsOverride', {
     width: 390, height: 844, deviceScaleFactor: 2, mobile: true })
   await sleep(400)
-  await cdp.click('日期分组')
   await waitUntil(async () => cdp.eval(`!!${withdrawButton}`), '窄屏上的撤回填表按钮')
   findings.withdraw_button_narrow = await cdp.eval(`(() => {
     const node = ${withdrawButton}
@@ -558,11 +557,18 @@ try {
       node.value = value;
       node.dispatchEvent(new Event('input', { bubbles: true }));
       node.dispatchEvent(new Event('change', { bubbles: true })); };
-    set('商品名称', 'Smoke Rice'); set('数量', '2'); set('采购单位', 'lb');
+    set('商品名称', 'Pork Spare Rib Cube 靓排粒'); set('数量', '2'); set('采购单位', 'lb');
     set('单价', '3.00'); set('金额', '6.00'); return true })()`)
   await waitUntil(async () => (await cdp.text()).includes('保存这一行'), 'line is dirty')
   await cdp.click('保存这一行')
   await waitUntil(async () => (await cdp.text()).includes('没有未保存的修改'), 'line saved')
+  findings.bilingual_food_preview = await cdp.eval(`(() => {
+    const read = (label) => { const found = document.querySelector('[aria-label="' + label + '"]');
+      return found?.tagName === 'INPUT' ? found.value : found?.querySelector('input')?.value }
+    return { name: read('新食材名称'), chinese: read('新食材中文翻译') } })()`)
+  assert(findings.bilingual_food_preview.name === 'Pork Spare Rib Cube'
+    && findings.bilingual_food_preview.chinese === '靓排粒',
+    `新食材应先分开显示中英文供核对：${JSON.stringify(findings.bilingual_food_preview)}`)
   await cdp.eval(`document.querySelector('.category-field .select-button').click()`)
   await waitUntil(() => cdp.eval(`!!document.querySelector('.category-menu .option')`), 'category menu')
   const category = await cdp.eval(`(() => { const option = document.querySelector('.category-menu .option');
@@ -573,6 +579,11 @@ try {
     return invoice.reconciliation.pending_count === 0
   }, `line booked; editor says: ${await cdp.eval(`[...document.querySelectorAll('.error-text,.saved-note')]
     .map((node) => node.innerText).join(' | ')`)}`)
+  const bilingualLine = (await api(`/api/invoices/${refilled}`)).data.lines.find((line) => line.description === 'Pork Spare Rib Cube 靓排粒')
+  assert(bilingualLine?.food_item?.name === 'Pork Spare Rib Cube'
+    && bilingualLine.food_item.name_zh === '靓排粒',
+    `入账后食材主名和中文翻译要分开，采购描述要保留原文：${JSON.stringify(bilingualLine?.food_item)}`)
+  findings.bilingual_food_saved = { name: bilingualLine.food_item.name, chinese: bilingualLine.food_item.name_zh }
   await cdp.click('检查原件并完成单据')
   await waitUntil(async () => (await cdp.text()).includes('我已检查原件有无漏行'),
     `closeout form; section says: ${await cdp.eval(`document.querySelector('[aria-label="完成单据"]')?.innerText ?? ''`)}`)
@@ -941,6 +952,23 @@ try {
     `那堆证据该没了：${JSON.stringify(findings.source_review)}`)
   assert(findings.source_review.text.includes('Hudson Street Provisions'),
     `纸面读的和填着的不一样时，那一个值要说出来：${JSON.stringify(findings.source_review)}`)
+  await cdp.eval(`(() => { const field = [...document.querySelectorAll('.header-card .field')]
+    .find((node) => node.innerText.startsWith('来源'))
+    ;[...field.querySelectorAll('button,uni-button')]
+      .find((node) => node.innerText.trim() === '此来源正确').click() })()`)
+  await waitUntil(async () => !(await cdp.eval(`document.querySelector('.header-card .field')?.innerText.includes('此来源正确')`)),
+    'source check hidden after confirmation')
+  const otherConfirm = await cdp.eval(`(() => {
+    const fields = [...document.querySelectorAll('.header-card .field')]
+    const button = fields.flatMap((field) => [...field.querySelectorAll('button,uni-button')])
+      .find((node) => node.innerText.trim() === '此数据正确')
+    if (button) button.click()
+    return Boolean(button) })()`)
+  assert(otherConfirm, '合成单据需要另一个待确认字段以复现来源按钮重现问题')
+  await waitUntil(async () => (await api(`/api/invoices/${deletableId}`)).data.header_reviewed_fields.includes('invoice_number'),
+    'another header field is stored')
+  findings.source_check_stays_hidden = !(await cdp.eval(`document.querySelector('.header-card .field')?.innerText.includes('此来源正确')`))
+  assert(findings.source_check_stays_hidden, '确认其它字段后不能再次要求确认来源')
 
   findings.delete_entry = await cdp.eval(`(() => {
     const bar = document.querySelector('.detail-heading')
@@ -1096,6 +1124,55 @@ try {
     `它是绿的：${JSON.stringify(findings.finish_ready)}`)
   assert(findings.finish_ready.note.includes('全部填完了'),
     `按得动的时候也该说一句它会做什么：${JSON.stringify(findings.finish_ready)}`)
+  // 收口前检查窄屏整理页；收口后不应再进入这张分类页面。
+  await cdp.send('Emulation.setDeviceMetricsOverride', {
+    width: 390, height: 844, deviceScaleFactor: 2, mobile: true })
+  await cdp.go(`http://127.0.0.1:${WEB}/`)
+  await waitUntil(async () => (await cdp.text()).includes('上传单据'), 'narrow home')
+  const narrowHome = await cdp.eval('document.documentElement.scrollWidth - document.documentElement.clientWidth')
+  await cdp.go(`http://127.0.0.1:${WEB}/?view=organize&batch=${batch.id}`)
+  await waitUntil(async () => (await cdp.text()).includes('待归类'), 'narrow open board')
+  await waitUntil(() => cdp.eval(`!!document.querySelector('.new-date .date-field')`), 'narrow date field')
+  assert(await cdp.eval(`(() => {
+    const tray = document.querySelector('.floating-stickers')
+    return !!tray && getComputedStyle(tray).position === 'fixed'
+      && !!document.querySelector('.new-date')
+  })()`), '移动端贴片固定在视口内，日期分组同时可见')
+  const stickerTop = await cdp.eval(`document.querySelector('.floating-stickers').getBoundingClientRect().top`)
+  await cdp.eval(`window.scrollTo(0, 700)`)
+  await sleep(150)
+  assert(Math.abs((await cdp.eval(`document.querySelector('.floating-stickers').getBoundingClientRect().top`)) - stickerTop) < 2,
+    '移动端滚动时贴片留在视口内')
+  await cdp.eval(`([...document.querySelectorAll('.floating-stickers .column-head button,.floating-stickers .column-head uni-button')].at(-1)).click()`)
+  assert(await cdp.eval(`!document.querySelector('.floating-stickers') && !!document.querySelector('.collapsed-sticker')`),
+    '贴片收起后变成普通页面中的待归类入口')
+  await cdp.eval(`document.querySelector('.collapsed-sticker').click()`)
+  assert(await cdp.eval(`!!document.querySelector('.floating-stickers')`), '点击收起入口后重新展开贴片')
+  const stickerBeforeDrag = await cdp.eval(`document.querySelector('.floating-stickers').getBoundingClientRect().left`)
+  await cdp.eval(`(() => {
+    const grip = document.querySelector('.sticker-grip')
+    const point = grip.getBoundingClientRect()
+    grip.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true, pointerId: 91,
+      pointerType: 'touch', isPrimary: true, clientX: point.left + 20, clientY: point.top + 20 }))
+  })()`)
+  await sleep(380)
+  await cdp.eval(`(() => {
+    const point = document.querySelector('.sticker-grip').getBoundingClientRect()
+    window.dispatchEvent(new PointerEvent('pointermove', { bubbles: true, pointerId: 91,
+      pointerType: 'touch', isPrimary: true, clientX: point.left + 56, clientY: point.top + 20 }))
+    window.dispatchEvent(new PointerEvent('pointerup', { bubbles: true, pointerId: 91,
+      pointerType: 'touch', isPrimary: true, clientX: point.left + 56, clientY: point.top + 20 }))
+  })()`)
+  assert((await cdp.eval(`document.querySelector('.floating-stickers').getBoundingClientRect().left`)) > stickerBeforeDrag + 20,
+    '长按贴片顶部后可改变屏幕位置')
+  const narrowBoard = await cdp.eval('document.documentElement.scrollWidth - document.documentElement.clientWidth')
+  assert(narrowHome <= 0 && narrowBoard <= 0,
+    `horizontal overflow at 390px: home ${narrowHome}, board ${narrowBoard}`)
+  findings.narrow = { width: 390, home_overflow: narrowHome, board_overflow: narrowBoard,
+    date_boxes: await cdp.eval(`document.querySelectorAll('.new-date .date-field input').length`) }
+  await cdp.send('Emulation.clearDeviceMetricsOverride')
+  await cdp.go(`http://127.0.0.1:${WEB}/?view=organize&batch=${batch.id}`)
+  await waitUntil(async () => (await cdp.text()).includes('确认完成所有填写'), 'desktop open board')
   await cdp.click('确认完成所有填写')
   await waitUntil(async () => (await cdp.eval('location.search')).includes('view=invoices'),
     `点完该落到单据库，得到 ${await cdp.eval('location.search')}`)
@@ -1111,6 +1188,19 @@ try {
     `收口之后 /current 该是 404：${noCurrent.status}`)
   assert((await api(`/api/intake-batches/${batch.id}`)).data.status === 'closed',
     '这一批在服务端是已结束')
+  const completedSource = (await api(`/api/intake-batches/${batch.id}/items?limit=200`)).data.items
+    .find((item) => item.review_invoice_id)
+  assert(completedSource, '收口批次应有可从单据库打开的已完成单据')
+  await waitUntil(() => cdp.eval(`!!document.querySelector('[data-invoice-id="${completedSource.review_invoice_id}"] .icon-open')`),
+    'completed invoice icon after close')
+  await cdp.eval(`document.querySelector('[data-invoice-id="${completedSource.review_invoice_id}"] .icon-open').click()`)
+  const closedReceiptBack = await waitUntil(() => cdp.eval(`document.querySelector('.receipt-page .back-link')?.textContent.trim()`),
+    'completed invoice receipt back link')
+  assert(closedReceiptBack === '← 返回单据',
+    `收口后已完成单据只能返回单据库：${closedReceiptBack}`)
+  await cdp.click('返回单据')
+  await waitUntil(async () => (await cdp.eval('location.search')).includes('view=invoices'),
+    'completed invoice returns to library')
   // 首页那个「接着整理」靠的就是 /current，所以它必须跟着消失。
   await cdp.go(`http://127.0.0.1:${WEB}/`)
   await waitUntil(async () => (await cdp.text()).includes('上传单据'), 'home again')
@@ -1119,21 +1209,14 @@ try {
   assert(!findings.resume_gone.home_has_resume,
     `首页不该再有「接着整理」：${JSON.stringify(findings.resume_gone)}`)
 
-  // 窄屏：新按钮不能把卡片撑出横向滚动，日期仍是三个格子。
-  await cdp.send('Emulation.setDeviceMetricsOverride', {
-    width: 390, height: 844, deviceScaleFactor: 2, mobile: true })
-  await cdp.go(`http://127.0.0.1:${WEB}/`)
-  await waitUntil(async () => (await cdp.text()).includes('上传单据'), 'narrow home')
-  const narrowHome = await cdp.eval('document.documentElement.scrollWidth - document.documentElement.clientWidth')
+  // 已收口的历史链接也应回单据库，不能重新打开分类页面。
   await cdp.go(`http://127.0.0.1:${WEB}/?view=organize&batch=${batch.id}`)
-  await waitUntil(async () => (await cdp.text()).includes('待归类'), 'narrow board')
-  await cdp.eval(`([...document.querySelectorAll('.pane-tab')].find((node) => node.textContent.includes('日期分组'))).click()`)
-  await waitUntil(() => cdp.eval(`!!document.querySelector('.new-date .date-field')`), 'narrow date field')
-  const narrowBoard = await cdp.eval('document.documentElement.scrollWidth - document.documentElement.clientWidth')
-  assert(narrowHome <= 0 && narrowBoard <= 0,
-    `horizontal overflow at 390px: home ${narrowHome}, board ${narrowBoard}`)
-  findings.narrow = { width: 390, home_overflow: narrowHome, board_overflow: narrowBoard,
-    date_boxes: await cdp.eval(`document.querySelectorAll('.new-date .date-field input').length`) }
+  await waitUntil(async () => (await cdp.eval('location.search')).includes('view=invoices'),
+    'closed board URL redirects to invoice library')
+  assert(!(await cdp.text()).includes('返回分类页面'), '已结束的分类页面不再渲染')
+  await cdp.go(`http://127.0.0.1:${WEB}/?view=ledger&batch=${batch.id}`)
+  await waitUntil(async () => (await cdp.eval('location.search')).includes('view=invoices'),
+    'closed ledger URL redirects to invoice library')
 
   console.log(JSON.stringify({ passed: true, ...findings }, null, 2))
 } finally {

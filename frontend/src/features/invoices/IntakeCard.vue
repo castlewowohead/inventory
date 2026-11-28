@@ -33,6 +33,7 @@ const props = defineProps<{
   proposedSource: boolean
   /** False on platforms without pointer dragging; the grip is then left out. */
   draggable: boolean
+  compact?: boolean
   /**
    * Why this one card cannot start a form on its own, or `''` when it can.
    *
@@ -130,7 +131,7 @@ onUnmounted(() => detachGrip())
 </script>
 
 <template>
-  <view class="card" :class="{ selected, 'handed-off': handedOff }">
+  <view class="card" :class="{ selected, 'handed-off': handedOff, compact }">
     <button class="pick" :aria-pressed="selected ? 'true' : 'false'"
       :aria-label="`${selected ? '取消选中' : '选中'} ${item.original_name} ${cardLocation(item)}`"
       @click="emit('toggle')"><text class="box">{{ selected ? '✓' : '' }}</text></button>
@@ -197,6 +198,10 @@ onUnmounted(() => detachGrip())
 
 <style scoped>
 .card { display: flex; align-items: flex-start; gap: 10px; padding: 10px; border: 1px solid var(--line); border-radius: 8px; background: #fff; }
+.card.compact { flex-wrap: wrap; gap: 4px 6px; border-radius: 12px; box-shadow: 0 3px 10px rgba(23, 59, 46, .12); }
+.card.compact .card-main { flex: 1 1 calc(100% - 54px); }
+.card.compact .card-side { width: 100%; max-width: none; align-items: flex-end; }
+.card.compact .side-row { width: 100%; }
 .card.selected { border-color: var(--green); box-shadow: inset 0 0 0 1px var(--green); background: #f3f8f3; }
 /* 44px 的是**点击区**，看得见的方框只有 22px：原来整块 44px 都画成边框，
    大得不像勾选框，倒像一个空按钮（2026-11-24 反馈，第 13 节 ④）。 */

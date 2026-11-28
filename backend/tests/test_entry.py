@@ -147,6 +147,7 @@ def test_entry_registers_only_the_implemented_routes(
         "/api/purchases/<int:purchase_id>",
         "/api/purchases/<int:purchase_id>/revisions",
         "/api/invoices",
+        "/api/invoices/months",
         "/api/invoices/match",
         "/api/invoices/<int:invoice_id>",
         "/api/invoices/<int:invoice_id>/complete",

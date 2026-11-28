@@ -195,6 +195,17 @@ def search_invoices() -> tuple[Response, int]:
     return jsonify(invoice_page_payload(page)), 200
 
 
+@invoices_bp.get("/invoices/months")
+def invoice_months() -> tuple[Response, int]:
+    months = service().invoice_months(
+        completed=query_bool(request.args, "completed"),
+        date_from=query_text(request.args, "date_from"),
+        date_to=query_text(request.args, "date_to"),
+        order=query_text(request.args, "order") or ORDER_BY_CREATED_AT,
+    )
+    return jsonify({"months": months}), 200
+
+
 @invoices_bp.get("/invoices/match")
 def match_description() -> tuple[Response, int]:
     """问「这句原始商品描述以前确认到哪个食材」。

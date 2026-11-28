@@ -164,6 +164,40 @@ export async function renderImage(
   )
 }
 
+/**
+ * A legible card preview: draw a moderate enlargement of the page's upper
+ * portion into a fixed frame. The original RenderedPage remains the caller's
+ * responsibility; this returns a separate small bitmap URL to release.
+ */
+export async function cropReadablePreview(
+  page: RenderedPage, width = 700, height = 600, zoom = 1.85
+): Promise<RenderedPage> {
+  // #ifdef H5
+  const image = new Image()
+  image.src = page.url
+  await image.decode()
+  const sourceWidth = image.naturalWidth || page.width
+  const sourceHeight = image.naturalHeight || page.height
+  if (!sourceWidth || !sourceHeight) throw new PreviewUnavailableError('原件没有可预览的图像内容。')
+  const fit = Math.min(width / sourceWidth, height / sourceHeight)
+  const cover = Math.max(width / sourceWidth, height / sourceHeight)
+  const scale = Math.max(fit * zoom, cover)
+  const cropWidth = Math.min(sourceWidth, width / scale)
+  const cropHeight = Math.min(sourceHeight, height / scale)
+  const canvas = window.document.createElement('canvas')
+  canvas.width = width
+  canvas.height = height
+  const context = canvas.getContext('2d')
+  if (!context) throw new PreviewUnavailableError('浏览器没有可用的 canvas 2d 上下文。')
+  context.fillStyle = '#fff'
+  context.fillRect(0, 0, width, height)
+  context.drawImage(image, (sourceWidth - cropWidth) / 2, 0, cropWidth, cropHeight, 0, 0, width, height)
+  const url = await canvasToUrl(canvas)
+  return { url, width, height, release: () => URL.revokeObjectURL(url) }
+  // #endif
+  throw new PreviewUnavailableError('当前设备暂时无法生成原件缩略图。')
+}
+
 /** Opens a PDF and keeps it open so page switching does not re-parse the file. */
 export async function openPdf(bytes: ArrayBuffer): Promise<PdfDocument> {
   // #ifdef H5

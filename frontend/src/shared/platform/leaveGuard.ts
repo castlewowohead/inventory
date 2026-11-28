@@ -56,6 +56,7 @@ export function confirmLeave(): Promise<boolean> {
       content: reason,
       confirmText: '仍要离开',
       cancelText: '留在本页',
+      confirmColor: '#9a3b2f',
       success: (result) => {
         const leave = Boolean(result.confirm)
         if (leave) discardAll()

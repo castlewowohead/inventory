@@ -260,7 +260,7 @@ onUnmounted(() => { stopped = true; stopGuard(); active?.abort(); if (poll) clea
 .row-actions { display:flex; flex-wrap:wrap; align-items:center; gap:8px; }
 /* 红的：它真的会把这份文件的内容和分类删掉（第 16 节）。确认仍在对话框里问一次。 */
 .ui-button.danger { border-color:var(--error); background:var(--error); color:#fff; }
-.overlay { position:fixed; inset:0; z-index:20; display:flex; align-items:center; justify-content:center; padding:16px; background:rgba(23,59,46,.45); }
+.overlay { position:fixed; inset:0; z-index:20; display:flex; align-items:center; justify-content:center; padding:16px; background:var(--dialog-scrim); }
 .sheet { width:min(100%, 420px); max-height:86vh; overflow-y:auto; display:flex; flex-direction:column; gap:10px; padding:20px; }
 .sheet-title { font-size:16px; font-weight:700; overflow-wrap:anywhere; }
 .sheet-actions { display:flex; flex-wrap:wrap; gap:10px; margin-top:4px; }

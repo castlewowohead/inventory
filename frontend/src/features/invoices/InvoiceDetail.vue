@@ -18,7 +18,7 @@
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import {
   addInvoiceLine, ApiError, completeInvoice, deleteInvoiceFile, errorMessage, getInvoice,
-  getInvoiceFileContent, getInvoices,
+  getInvoiceFileContent, getInvoices, getIntakeBatch,
   getIntakeItemOriginal, reassignIntakeReviewContents,
   startExtraction, voidInvoice,
   type ExtractionJob, type Invoice, type InvoiceLine
@@ -40,14 +40,24 @@ const emit = defineEmits<{ back: [batchId: number | null]; saved: []; completed:
 /**
  * 这张单据的那几页来自哪一批；手工上传的单据没有出处，返回 null。
  *
- * 填完之后该回哪里，由**这张单据自己**说了算：只看「从哪进来的」那个内存状态，
- * 刷新一下就丢了（第 22 节）。
+ * 它只标识出处；是否还能返回分类页还要核对批次状态。
  */
 function sourceBatchId(item: Invoice | null): number | null {
   return item?.intake_sources[0]?.batch_id ?? null
 }
-function returnFromInvoice() { emit('back', sourceBatchId(invoice.value)) }
 const invoice = ref<Invoice | null>(null)
+const returnBatchId = ref<number | null>(null)
+watch(() => sourceBatchId(invoice.value), async (batchId, _previous, onCleanup) => {
+  returnBatchId.value = null
+  if (batchId === null) return
+  let active = true
+  onCleanup(() => { active = false })
+  try {
+    const batch = await getIntakeBatch(batchId)
+    if (active && batch.status === 'open') returnBatchId.value = batchId
+  } catch { /* If the batch cannot be checked, the invoice library is a safe return target. */ }
+}, { immediate: true })
+function returnFromInvoice() { emit('back', returnBatchId.value) }
 const state = ref<'loading' | 'ready' | 'error'>('loading')
 const failure = ref('')
 const saving = ref(false)
@@ -431,7 +441,7 @@ async function mergeIntoTarget() {
 
 function confirmAction(title: string, content: string): Promise<boolean> {
   return new Promise((resolve) => uni.showModal({
-    title, content, confirmText: '继续', cancelText: '取消',
+    title, content, confirmText: '继续', cancelText: '取消', confirmColor: '#176b4d',
     success: (result) => resolve(Boolean(result.confirm)), fail: () => resolve(false)
   }))
 }
@@ -525,7 +535,6 @@ async function removeFile(fileId: number, name: string) {
 async function cancelInvoice() {
   if (!await prepareAction() || !invoice.value) return
   const id = invoice.value.id
-  const batchId = sourceBatchId(invoice.value)
   const onBoard = invoice.value.intake_sources.length
   if (!await confirmAction('删除本张单据', onBoard
     ? `是否清空数据，并彻底移除本张单据？这张单据填过的内容会清空，它在整理页上的 ${onBoard} 项内容也会一并移除；重新上传同一份文件会当作全新的一份。`
@@ -552,7 +561,7 @@ async function cancelInvoice() {
     actionBusy.value = false
   }
   // 回到来的地方（整理页或单据库）。
-  if (removed) emit('back', batchId)
+  if (removed) emit('back', returnBatchId.value)
 }
 
 function locatePending(item: Invoice, numbers?: unknown) {
@@ -692,10 +701,10 @@ watch(() => props.invoiceId, () => {
 </script>
 
 <template>
-  <CompletedInvoiceView v-if="invoice && state === 'ready' && invoice.status === 'completed'" :invoice="invoice" @back="returnFromInvoice" @open-existing="emit('openExisting', $event)" @currency-changed="applyStoredInvoice($event, false)" @reopened="applyStoredInvoice($event, false)" />
+  <CompletedInvoiceView v-if="invoice && state === 'ready' && invoice.status === 'completed'" :invoice="invoice" :return-to-board="returnBatchId !== null" @back="returnFromInvoice" @open-existing="emit('openExisting', $event)" @currency-changed="applyStoredInvoice($event, false)" @reopened="applyStoredInvoice($event, false)" />
   <view v-else class="detail-layout" :class="{ narrow }">
     <view class="detail-heading">
-      <view class="heading-primary"><button class="back-link" @click="returnFromInvoice">← {{ sourceBatchId(invoice) !== null ? '返回分类页面' : '返回单据' }}</button><text class="page-title">单据{{ invoice ? ` #${invoice.id}` : '' }}</text></view>
+      <view class="heading-primary"><button class="back-link" @click="returnFromInvoice">← {{ returnBatchId !== null ? '返回分类页面' : '返回单据' }}</button><text class="page-title">单据{{ invoice ? ` #${invoice.id}` : '' }}</text></view>
       <!-- 右上角只有这一个动作（第 17 节 ④）。原来是一个「单据更多操作」菜单，
            里面混着重新提取、识别记录和删除拍坏文件——那三样都是对着原件做的事，
            已经搬到下面「原件文件」那一折里，这里不再留第二个入口。 -->
@@ -731,7 +740,7 @@ watch(() => props.invoiceId, () => {
           <view v-if="waitingLong" class="wait-escape">
             <text>先去忙别的，识别完会留在待办里。</text>
             <view class="escape-actions">
-              <button class="ui-button secondary" @click="returnFromInvoice">{{ sourceBatchId(invoice) !== null ? '返回分类页面' : '返回单据列表' }}</button>
+              <button class="ui-button secondary" @click="returnFromInvoice">{{ returnBatchId !== null ? '返回分类页面' : '返回单据列表' }}</button>
               <button class="ui-button secondary" @click="originalOnly = true">只看原件</button>
               <button class="ui-button ghost" @click="extractionStatus?.refresh()">刷新识别状态</button>
             </view>
